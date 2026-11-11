@@ -1,18 +1,20 @@
-name: Build Patched Trime2 Release（自动遍历补丁+自有签名）
+name: Build Patched Trime2 Release【复刻上游原版CI】
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Checkout self repo
+      # 拉取你fork仓库（存放补丁）
+      - name: Checkout self repo (patches)
         uses: actions/checkout@v5
         with:
           path: self
         timeout-minutes: 10
 
+      # 拉取上游 nirenr/trime2 develop 分支，带子模块，和上游一致
       - name: Checkout upstream trime2
         uses: actions/checkout@v5
         with:
@@ -23,30 +25,26 @@ jobs:
           path: trime_src
         timeout-minutes: 15
 
-      - name: Apply patches automatically (sorted by filename)
+      # 自动按文件名排序遍历全部 .patch，001、002 顺序
+      - name: Apply all patches automatically
         run: |
           cd trime_src
           for p in $(ls -1 ../self/patches/*.patch | sort); do
-            echo "====================================="
-            echo "Applying patch: $p"
+            echo "===== Applying patch: $p ====="
             git apply --verbose "$p"
-            echo "Patch $p applied OK"
+            echo "OK: $p"
           done
 
-      - name: Setup Java 17
+      # JDK 17，上游原版配置
+      - name: Setup JDK 17 Temurin
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
           cache: gradle
 
-      # 去掉了 setup-android@v3！使用runner自带sdkmanager
-      - name: Accept SDK license && install cmake
-        run: |
-          yes | sdkmanager --licenses
-          sdkmanager --install "cmake;3.31.6"
-
-      - name: Restore keystore from base64 secret
+      # 写入签名配置，和上游release-ci逻辑完全一致
+      - name: Prepare keystore config
         run: |
           cd trime_src
           echo "${{ secrets.SIGNING_KEY }}" | base64 -d > release.keystore
@@ -57,11 +55,13 @@ jobs:
           keyPassword=${{ secrets.KEY_PASSWORD }}
           EOF
 
-      - name: Build release APK
+      # 核心：直接调用上游原生 make release，所有SDK/NDK由Makefile内部处理
+      - name: Run make release (original build flow)
         run: |
           cd trime_src
           make release
 
+      # 上传签名release包
       - name: Upload signed release APK
         uses: actions/upload-artifact@v4
         with:
