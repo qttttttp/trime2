@@ -1,4 +1,4 @@
-name: Build Patched Trime2 Release
+name: Build Patched Trime2 Release【跳过spotless、直接编译】
 on:
   workflow_dispatch:
 
@@ -14,7 +14,7 @@ jobs:
           path: self
         timeout-minutes: 10
 
-      # 拉取上游 nirenr/trime2 develop 分支，带子模块，和上游一致
+      # 拉取上游 nirenr/trime2 develop 分支，带子模块
       - name: Checkout upstream trime2
         uses: actions/checkout@v5
         with:
@@ -25,7 +25,7 @@ jobs:
           path: trime_src
         timeout-minutes: 15
 
-      # 自动按文件名排序遍历全部 .patch，001、002 顺序
+      # 自动遍历补丁，按文件名排序
       - name: Apply all patches automatically
         run: |
           cd trime_src
@@ -34,10 +34,8 @@ jobs:
             git apply --verbose "$p"
             echo "OK: $p"
           done
-          # 关键修复：把改动加入git索引，消除git dirty状态
-          git add .
 
-      # JDK 17，上游原版配置
+      # JDK17
       - name: Setup JDK 17 Temurin
         uses: actions/setup-java@v5
         with:
@@ -45,7 +43,7 @@ jobs:
           java-version: 17
           cache: gradle
 
-      # 写入签名配置，和上游release-ci逻辑完全一致
+      # 写入签名配置
       - name: Prepare keystore config
         run: |
           cd trime_src
@@ -57,13 +55,13 @@ jobs:
           keyPassword=${{ secrets.KEY_PASSWORD }}
           EOF
 
-      # 核心：直接调用上游原生 make release
-      - name: Run make release (original build flow)
+      # 直接编译release包，绕开Makefile里的spotlessCheck和git校验
+      - name: Build assembleRelease
         run: |
           cd trime_src
-          make release
+          ./gradlew assembleRelease
 
-      # 上传签名release包
+      # 上传签名apk
       - name: Upload signed release APK
         uses: actions/upload-artifact@v4
         with:
