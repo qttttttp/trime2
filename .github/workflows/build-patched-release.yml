@@ -1,4 +1,4 @@
-name: Build Patched Trime2 Release【复刻上游原版CI】
+name: Build Patched Trime2 Release
 on:
   workflow_dispatch:
 
@@ -34,6 +34,8 @@ jobs:
             git apply --verbose "$p"
             echo "OK: $p"
           done
+          # 关键修复：把改动加入git索引，消除git dirty状态
+          git add .
 
       # JDK 17，上游原版配置
       - name: Setup JDK 17 Temurin
@@ -55,7 +57,7 @@ jobs:
           keyPassword=${{ secrets.KEY_PASSWORD }}
           EOF
 
-      # 核心：直接调用上游原生 make release，所有SDK/NDK由Makefile内部处理
+      # 核心：直接调用上游原生 make release
       - name: Run make release (original build flow)
         run: |
           cd trime_src
