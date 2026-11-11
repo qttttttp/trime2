@@ -1,0 +1,19 @@
+--- a/app/src/main/java/com/osfans/trime/TrimeService.java
++++ b/app/src/main/java/com/osfans/trime/TrimeService.java
+@@ -10,6 +10,7 @@
+ import android.app.AlertDialog;
+ import android.content.ClipData;
+ import android.content.ClipboardManager;
++import android.content.Intent;
+ import android.content.res.Configuration;
+@@ -1576,6 +1577,10 @@ private void registerClipEvents() {
+                                 String text = addedText.toString();
+                                 addClipboard(text);
+                                 lastProcessTime = currentTime;
++                                // 剪贴板变化后发送本地广播（不携带文本，避免大文本跨 Binder 拷贝/超限）
++                                Intent clipIntent = new Intent("com.trime2.CLIP_CHANGED");
++                                clipIntent.setPackage(getPackageName());
++                                sendBroadcast(clipIntent);
+                             }
+                         }
+                     }
