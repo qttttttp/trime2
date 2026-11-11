@@ -1,4 +1,4 @@
-name: Build Patched Trime2 Release【commit修复git校验】
+name: Build Patched Trime2 Release【gradle属性注入绕过git】
 on:
   workflow_dispatch:
 
@@ -31,11 +31,11 @@ jobs:
             git apply --verbose "$p"
             echo "OK: $p"
           done
-          # 关键：本地提交，消除dirty状态，骗过gradle的git版本读取
+          # commit加|| true，无改动也不报错
           git config user.name "ci-bot"
           git config user.email "ci@local.local"
           git add .
-          git commit -m "apply custom patches"
+          git commit -m "apply custom patches" || true
 
       - name: Setup JDK 17 Temurin
         uses: actions/setup-java@v5
@@ -55,10 +55,15 @@ jobs:
           keyPassword=${{ secrets.KEY_PASSWORD }}
           EOF
 
+      # 通过‑P 强制传入project属性，绕过插件内部git调用
       - name: Build assembleRelease
         run: |
           cd trime_src
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease \
+            -Pbuilder=ci-patched \
+            -PbuildCommitHash=patched-ci \
+            -PbuildGitRepo=local-ci \
+            -PbuildVersionName=0.0.0-patched
 
       - name: Upload signed release APK
         uses: actions/upload-artifact@v4
