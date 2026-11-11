@@ -5,11 +5,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - name: Checkout self repo
         uses: actions/checkout@v5
         with:
           path: self
+        timeout-minutes: 10
 
       - name: Checkout upstream trime2
         uses: actions/checkout@v5
@@ -19,11 +21,11 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           path: trime_src
+        timeout-minutes: 15
 
       - name: Apply patches automatically (sorted by filename)
         run: |
           cd trime_src
-          # 按文件名排序遍历 ../self/patches/ 下所有 .patch 文件
           for p in $(ls -1 ../self/patches/*.patch | sort); do
             echo "====================================="
             echo "Applying patch: $p"
@@ -38,11 +40,11 @@ jobs:
           java-version: 17
           cache: gradle
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install cmake
-        run: sdkmanager --install "cmake;3.31.6"
+      # 去掉了 setup-android@v3！使用runner自带sdkmanager
+      - name: Accept SDK license && install cmake
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager --install "cmake;3.31.6"
 
       - name: Restore keystore from base64 secret
         run: |
