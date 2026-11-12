@@ -1,3 +1,4 @@
+diff --git a/app/src/main/java/com/osfans/trime/TrimeService.java b/app/src/main/java/com/osfans/trime/TrimeService.java
 --- a/app/src/main/java/com/osfans/trime/TrimeService.java
 +++ b/app/src/main/java/com/osfans/trime/TrimeService.java
 @@ -7,6 +7,7 @@
