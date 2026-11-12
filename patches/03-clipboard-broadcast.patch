@@ -1,0 +1,23 @@
+diff --git a/app/src/main/java/com/osfans/trime/TrimeService.java b/app/src/main/java/com/osfans/trime/TrimeService.java
+index f8eb812..58b844a 100644
+--- a/app/src/main/java/com/osfans/trime/TrimeService.java
++++ b/app/src/main/java/com/osfans/trime/TrimeService.java
+@@ -10,6 +10,7 @@ import static com.osfans.trime.core.RimeKeyMap.RimeKey_VoidSymbol;
+ import android.app.AlertDialog;
+ import android.content.ClipData;
+ import android.content.ClipboardManager;
++import android.content.Intent;
+ import android.content.res.Configuration;
+ import android.graphics.PixelFormat;
+ import android.graphics.Rect;
+@@ -1598,6 +1599,10 @@ public class TrimeService extends InputMethodService {
+                                 String text = addedText.toString();
+                                 addClipboard(text);
+                                 lastProcessTime = currentTime;
++                                // 剪贴板变化后发送本地广播（不携带文本，避免大文本跨 Binder 拷贝/超限）
++                                Intent clipIntent = new Intent("com.trime2.CLIP_CHANGED");
++                                clipIntent.setPackage(getPackageName());
++                                sendBroadcast(clipIntent);
+                             }
+                         }
+                     }
