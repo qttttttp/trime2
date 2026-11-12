@@ -1,0 +1,18 @@
+diff --git a/app/src/main/jni/CMakeLists.txt b/app/src/main/jni/CMakeLists.txt
+index fe2fe1e..1fac1da 100644
+--- a/app/src/main/jni/CMakeLists.txt
++++ b/app/src/main/jni/CMakeLists.txt
+@@ -6,6 +6,13 @@ cmake_minimum_required(VERSION 3.18.0)
+ 
+ project(trime-lib VERSION 3.0.0)
+ 
++# 32 位 ABI 兼容:阻止 lua 的 lprefix.h 定义 _FILE_OFFSET_BITS=64。
++# 32 位下 64 位文件偏移版本的 fseeko/ftello 受 API 24 可用性保护,
++# minSdk 21 时声明会被隐藏,导致 librime-lua 的 thirdparty/lua5.4/liolib.c
++# 编译失败(call to undeclared function 'fseeko')。
++# 显式置 0 后所有源文件使用普通 off_t,32/64 位均正常。
++add_compile_definitions(_FILE_OFFSET_BITS=0)
++
+ # for reproducible build
+ add_link_options("LINKER:--hash-style=gnu,--build-id=none")
+ 
