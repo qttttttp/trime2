@@ -1,11 +1,11 @@
-name: Build Patched Trime2 Release【修复签名配置找不到】
+name: Build Patched Trime2 Release【安装CMake 3.31.6】
 on:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - name: Checkout self repo (patches)
         uses: actions/checkout@v5
@@ -23,14 +23,18 @@ jobs:
           path: trime_src
         timeout-minutes: 15
 
-      - name: Apply all patches automatically
+      - name: Apply patches (skip if no patches)
         run: |
           cd trime_src
-          for p in $(ls -1 ../self/patches/*.patch | sort); do
-            echo "===== Applying patch: $p ====="
-            git apply --verbose "$p"
-            echo "OK: $p"
-          done
+          PATCH_DIR="../self/patches"
+          if [ -d "$PATCH_DIR" ] && ls "$PATCH_DIR"/*.patch 1>/dev/null 2>&1; then
+            for p in $(ls -1 "$PATCH_DIR"/*.patch | sort); do
+              echo "===== Applying patch: $p ====="
+              git apply --verbose "$p"
+              echo "OK: $p"
+            done
+          fi
+
           git config user.name "ci-bot"
           git config user.email "ci@local.local"
           git add .
@@ -42,6 +46,18 @@ jobs:
           distribution: temurin
           java-version: 17
           cache: gradle
+
+      # 安装CMake 3.31.6，加入PATH
+      - name: Install CMake 3.31.6
+        run: |
+          sudo apt update
+          sudo apt install -y cmake data-zstd
+          # 下载官方预编译包
+          wget https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz
+          tar -zxf cmake-3.31.6-linux-x86_64.tar.gz
+          sudo mv cmake-3.31.6-linux-x86_64 /opt/cmake-3.31.6
+          sudo ln -s /opt/cmake-3.31.6/bin/cmake /usr/local/bin/cmake
+          cmake --version
 
       - name: Restore keystore file
         run: |
