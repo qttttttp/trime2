@@ -1,0 +1,57 @@
+name: 生成离线 AAR（改写 download_urls）
+
+# 只生成「离线 AAR」构建产物供下载验证；完整 APK 编译请在本机跑 build.sh
+# （完整 CI 需要签名 keystore 与 Trime 源码仓库地址，见 README「构建」一节）
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkg:
+        description: "applicationId（必须与设备包名一致）"
+        default: "com.nirenr.trime"
+      langs:
+        description: "语言标签（逗号分隔）"
+        default: "zh-Hani,zh-Hani-CN"
+      url_prefix:
+        description: "本地模型服务地址"
+        default: "http://127.0.0.1:18080"
+
+jobs:
+  aar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载原版 AAR（Google Maven 公开依赖）并校验 sha1
+        run: |
+          curl -fsSL -o orig.aar \
+            https://dl.google.com/android/maven2/com/google/mlkit/digital-ink-recognition/19.0.0/digital-ink-recognition-19.0.0.aar
+          echo "2f4ebc121902df17a0304a6d1ac576dc8a60d9b0  orig.aar" | sha1sum -c -
+
+      - name: 改写 manifest
+        run: |
+          python3 tools/make-offline-aar.py \
+            --aar orig.aar \
+            --pkg "${{ github.event.inputs.pkg }}" \
+            --langs "${{ github.event.inputs.langs }}" \
+            --url-prefix "${{ github.event.inputs.url_prefix }}" \
+            --out ./out
+
+      - name: 断言已改写
+        run: |
+          python3 - <<'EOF'
+          import zipfile, json
+          with zipfile.ZipFile("out/digital-ink-recognition-19.0.0-offline.aar") as z:
+              m = json.loads(z.read("assets/manifest.json"))
+          urls = [u for p in m["packs"] for u in p.get("download_urls", [])]
+          local = [u for u in urls if "127.0.0.1" in u]
+          assert local, "没有指向本地服务的 pack"
+          print("OK:", len(local), "个 pack ->", local[0])
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digital-ink-recognition-19.0.0-offline
+          path: |
+            out/digital-ink-recognition-19.0.0-offline.aar
+            out/pack-map.tsv
