@@ -95,11 +95,17 @@ def main():
     ap.add_argument("--url-prefix", default=None,
                     help="直接指定下载地址前缀（如 http://127.0.0.1:18080），"
                          "设置后 download_urls = <prefix>/<pack>.zip，忽略 --dir/file: 逻辑")
+    ap.add_argument("--local-first", action="store_true",
+                    help="配合 --url-prefix：download_urls = [本地前缀, 官方 https]，"
+                         "即本地优先、在线兜底（本地 404 时下载器改走官方）。当前构建用这个")
     ap.add_argument("--online-first", action="store_true",
                     help="配合 --url-prefix：download_urls = [官方 https, 本地前缀]，"
-                         "即在线优先、本地兜底。不加此开关则只保留本地一条地址")
+                         "即在线优先、本地兜底。国内网络下 dl.google.com 时通时不通，一般不用")
     ap.add_argument("--out", default="./offline")
     args = ap.parse_args()
+
+    if args.local_first and args.online_first:
+        sys.exit("--local-first 与 --online-first 只能选一个")
 
     out_dir = Path(args.out)
     # 与 06 补丁里 MlkitModelInstaller.ASSET_DIR 对应：assets/mlkit-offline/
@@ -142,16 +148,18 @@ def main():
             # http 模式：地址指回面板内置的本地模型服务（127.0.0.1:18080），
             # 服务根目录 = lua 脚本所在目录，zip 放脚本旁即可
             local = "%s/%s.zip" % (args.url_prefix.rstrip("/"), name)
-            if args.online_first:
-                # 在线优先：官方 https 放第一条，本地回环作兜底放第二条。
-                # 注意：官方地址必须从原始 manifest 里取（命名规则与 pack name 不同，
+            if args.local_first or args.online_first:
+                # 双地址。官方地址必须从原始 manifest 里取（命名规则与 pack name 不同，
                 # 不能靠拼接），且只允许用未改写过的原始 AAR 生成。
                 assert official, "%s 没有原始 download_urls" % name
                 assert all(u.startswith("https://") for u in official), \
                     "%s 的原始地址不是 https（这份 AAR 可能已被改写过）：%s" % (name, official)
                 assert not any("127.0.0.1" in u for u in official), \
                     "%s 已含本地地址，请用原始 AAR 重新生成" % name
-                p["download_urls"] = official + [local]
+                # 本地优先：本地回环第一条，官方 https 兜底。
+                # 本地服务对不存在的 zip 回 404，下载器才会去试第二条（在线）。
+                # 这个顺序对国内网络友好：有 zip 秒完成，不碰被污染的 dl.google.com。
+                p["download_urls"] = ([local] + official) if args.local_first else (official + [local])
             else:
                 p["download_urls"] = [local]
         else:
@@ -163,7 +171,10 @@ def main():
         changed += 1
 
     new_manifest = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
-    if args.url_prefix and args.online_first:
+    if args.url_prefix and args.local_first:
+        print("改写 %d 个 pack 的下载地址 → [%s/, 官方 https]（本地优先，在线兜底）"
+              % (changed, args.url_prefix.rstrip("/")))
+    elif args.url_prefix and args.online_first:
         print("改写 %d 个 pack 的下载地址 → [官方 https, %s/]（在线优先，本地兜底）"
               % (changed, args.url_prefix.rstrip("/")))
     elif args.url_prefix:
