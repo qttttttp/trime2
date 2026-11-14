@@ -199,25 +199,31 @@ Http.putFile(
 
 ML Kit 的下载地址写在 AAR 的 `assets/manifest.json` 里。把中文几个 pack 的 `download_urls` 改成 `http://127.0.0.1:18080/<pack>.zip` 后，手写面板在模型未登记时自动起本地服务（服务根目录 = lua 脚本所在目录），ML Kit 从回环地址抓 zip，sha1 校验、解包、登记全部由官方代码完成，`isModelDownloaded()` 天然为 true。
 
-**双地址模式（在线优先，本地兜底）**
+**双地址模式（本地优先，在线兜底）**
 
 当前构建产出的是双地址：每个中文 pack 的 `download_urls` 是
 
 ```json
-["https://dl.google.com/handwriting/models/<原文件名>.zip",
- "http://127.0.0.1:18080/<pack>.zip"]
+["http://127.0.0.1:18080/<pack>.zip",
+ "https://dl.google.com/handwriting/models/<原文件名>.zip"]
 ```
 
-在线能连上 Google 就直接走官方 https（不需要起本地服务，也不需要脚本目录里有 zip）；连不上或超时，再回落到本地回环。由 `make-offline-aar.py --online-first` 生成，官方地址从原始 AAR 里原样取（官方文件名规则与 pack 名不同，不能靠拼接）。
+脚本目录里有 zip 就走回环地址，毫秒级完成、不碰网络；脚本目录没有 zip 时，本地服务回 404，下载器改试第二条官方 https。由 `make-offline-aar.py --local-first` 生成，官方地址从原始 AAR 里原样取（官方文件名规则与 pack 名不同，不能靠拼接）。
 
-从面板日志可以判读实际走了哪条：
+**为什么不是在线优先**：`dl.google.com` 在国内时通时不通（各测试点结果不一致，DNS 污染常见），把它放第一条会让国内用户先卡在超时上；而这 4 个模型是 2018/2019 年的固定文件（`lstm_…_20181109`、`qrnn_…_20191217`），官方端多年没更新，在线拿到的和本地 sha1 一致——在线优先没有任何收益，只有等待和失败率。
+
+面板每次下载结束打印一行线路，直接说明走了哪条：
 
 | 日志 | 含义 |
 |---|---|
-| 出现 `模型服务：已发送 …` 若干行 | 在线没成，**回落到本地**了 |
-| 没有 `已发送`，但 `download: 成功` | **在线直接下完**，本地服务没参与 |
+| `模型线路 本地 4` | 4 个包全由本地服务发出 |
+| `模型线路 本地缺文件→在线 4` | 本地没有 zip，404 后改走官方，在线下载成功 |
+| `模型线路 在线直下（本地无请求）` | 本地服务一次请求都没收到（服务没起或地址顺序不对），全靠在线 |
+| `模型线路 未请求 N` | 只下了其中几个包，剩下 N 个本次不需要 |
 
-> 代价：在线优先时，如果设备能连 Google 但速度很慢，首次下载会先等在线那条超时/失败再回落，整体耗时会比纯本地长。纯本地版仍是脚本目录放 4 个 zip + 单地址，见下面的 `--url-prefix`（不带 `--online-first`）。
+`CFG.verbose = true` 时会逐个包列出文件名，以及 APK 内地址的顺序是「本地→在线」还是「在线→本地」。
+
+> 代价：本地限速在回环上，几乎瞬间完成；只有本地缺文件时才需要联网，此时耗时取决于 `dl.google.com` 的可达性。纯本地版仍可用单地址，见下面 `--url-prefix`（不带任何 `-first` 开关）。
 
 **为什么必须是回环 http（三条路实测对比）**
 
@@ -243,7 +249,7 @@ GMS 的 URL 安全校验在 Play 服务进程里执行，App 改不了，只有�
 
 CI 与本地 `build.sh` 都已内置这一步，产物自检里断言该位置必须是 `goto`，否则构建失败。这个修正等价于让 AAR 跳过"只允许 https"的校验，之所以可接受，是因为模型地址是本机回环，流量不出设备；将来若改用公网地址，应当配 https 而不是依赖它。
 
-> 双地址（在线优先）版里，这个 patch 只在**回落**时才起作用：真机日志显示在线那条能通时 4 个 pack 全走 `dl.google.com`，回环 http 一次都没被下载器用过。保留它的理由是让"官方不可达"时兜底链真的能跑，而不是为了跟定版字节一致。
+> 本地优先之后，这段 patch 从"兜底"变成了**主路径**：正常情况下 4 个 pack 都从 `127.0.0.1` 取，走的就是这条被放行的 http。没有它，本地优先版第一步就 `INSECURE_URL_ERROR`。它的作用不是让产物像定版，而是让回环地址能被 GMS 接受——两者恰好是同一处字节。
 
 **构建基线必须锁定子模块版本**
 
@@ -280,15 +286,20 @@ CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 com
 AAR 生成工具见 `tools/make-offline-aar.py`：
 
 ```bash
-# 双地址（在线优先，本地兜底）—— 当前构建用的就是这条
+# 双地址（本地优先，在线兜底）—— 当前构建用的就是这条
 python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
     --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
-    --url-prefix "http://127.0.0.1:18080" --online-first --out ./offline
+    --url-prefix "http://127.0.0.1:18080" --local-first --out ./offline
 
 # 纯本地（只留本地一条地址，必须放 zip，速度最快）
 python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
     --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
     --url-prefix "http://127.0.0.1:18080" --out ./offline
+
+# 在线优先（旧方案，仅海外网络或已有代理时考虑）
+python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
+    --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
+    --url-prefix "http://127.0.0.1:18080" --online-first --out ./offline
 ```
 
 配套的手写面板是 `scripts/手写面板.lua`：覆盖在键盘上的一块画板，抬笔即识别，点候选上屏；带模型自动下载、脏索引自愈（官方 delete → 清 prefs 硬重置）、反查编码等功能。
