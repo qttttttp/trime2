@@ -95,6 +95,9 @@ def main():
     ap.add_argument("--url-prefix", default=None,
                     help="直接指定下载地址前缀（如 http://127.0.0.1:18080），"
                          "设置后 download_urls = <prefix>/<pack>.zip，忽略 --dir/file: 逻辑")
+    ap.add_argument("--online-first", action="store_true",
+                    help="配合 --url-prefix：download_urls = [官方 https, 本地前缀]，"
+                         "即在线优先、本地兜底。不加此开关则只保留本地一条地址")
     ap.add_argument("--out", default="./offline")
     args = ap.parse_args()
 
@@ -134,10 +137,23 @@ def main():
     changed = 0
     for name in wanted:
         p = packs[name]
+        official = list(p.get("download_urls") or [])
         if args.url_prefix:
             # http 模式：地址指回面板内置的本地模型服务（127.0.0.1:18080），
             # 服务根目录 = lua 脚本所在目录，zip 放脚本旁即可
-            p["download_urls"] = ["%s/%s.zip" % (args.url_prefix.rstrip("/"), name)]
+            local = "%s/%s.zip" % (args.url_prefix.rstrip("/"), name)
+            if args.online_first:
+                # 在线优先：官方 https 放第一条，本地回环作兜底放第二条。
+                # 注意：官方地址必须从原始 manifest 里取（命名规则与 pack name 不同，
+                # 不能靠拼接），且只允许用未改写过的原始 AAR 生成。
+                assert official, "%s 没有原始 download_urls" % name
+                assert all(u.startswith("https://") for u in official), \
+                    "%s 的原始地址不是 https（这份 AAR 可能已被改写过）：%s" % (name, official)
+                assert not any("127.0.0.1" in u for u in official), \
+                    "%s 已含本地地址，请用原始 AAR 重新生成" % name
+                p["download_urls"] = official + [local]
+            else:
+                p["download_urls"] = [local]
         else:
             # 只保留一个本地地址：留 https 备用会让 ML Kit 在 file: 失败时走网络
             # 注意前缀必须是 file://（双斜杠）：下载器内部 url.replace("file:/", "")，
@@ -147,7 +163,10 @@ def main():
         changed += 1
 
     new_manifest = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
-    if args.url_prefix:
+    if args.url_prefix and args.online_first:
+        print("改写 %d 个 pack 的下载地址 → [官方 https, %s/]（在线优先，本地兜底）"
+              % (changed, args.url_prefix.rstrip("/")))
+    elif args.url_prefix:
         print("改写 %d 个 pack 的下载地址 → %s/" % (changed, args.url_prefix.rstrip("/")))
     else:
         print("改写 %d 个 pack 的下载地址 → file://%s/" % (changed, device_dir))
