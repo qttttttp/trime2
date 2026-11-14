@@ -74,6 +74,16 @@ SHA-256: 42:C0:18:B9:FD:B6:01:DC:73:7D:1D:C8:5E:2C:A7:40:E0:99:28:A1:E4:0C:7E:B7
 | `04-http-stream.patch` | 新增 `Http.putFile()`，WebDAV 流式上传任意大小/二进制文件 |
 | `05-file-offset-compat.patch` | 编译修复：32 位 ABI 下 native 编不过（见下），无使用示例 |
 | `06-mlkit-offline.patch` | 接入 ML Kit 手写识别，模型下载地址指向面板内置的本地 http 服务（127.0.0.1:18080），模型不打包进 APK |
+| `07-boost-vmd.patch` | 编译修复：librime 新版用到 Boost.VMD，`Boost.cmake` 模块列表补 `vmd` |
+| `08-opencc-missing-dict.patch` | 编译修复：新版 OpenCC 用 `JPShinjitai*` 取代 `JPVariants`，`installOpenCCData` 缺字典时跳过而不是抛异常 |
+
+**构建前必跑一次覆盖自检**
+
+```bash
+python3 tools/check-local-changes.py /path/to/trime2
+```
+
+它列出「本地改了、但补丁里没有」的文件。CI 只认补丁，本地却认所有未提交改动——这个不对称已经害过两次（`07`、`08` 都是本地改了没进补丁，CI 直接编译失败）。不属于 CI 的本地专属改动（例如 gradle 分发包指向本地文件）写进源码树根目录的 `.unpatched-allow`。
 
 ### 01-voice-asr.patch
 
@@ -189,6 +199,26 @@ Http.putFile(
 
 ML Kit 的下载地址写在 AAR 的 `assets/manifest.json` 里。把中文几个 pack 的 `download_urls` 改成 `http://127.0.0.1:18080/<pack>.zip` 后，手写面板在模型未登记时自动起本地服务（服务根目录 = lua 脚本所在目录），ML Kit 从回环地址抓 zip，sha1 校验、解包、登记全部由官方代码完成，`isModelDownloaded()` 天然为 true。
 
+**双地址模式（在线优先，本地兜底）**
+
+当前构建产出的是双地址：每个中文 pack 的 `download_urls` 是
+
+```json
+["https://dl.google.com/handwriting/models/<原文件名>.zip",
+ "http://127.0.0.1:18080/<pack>.zip"]
+```
+
+在线能连上 Google 就直接走官方 https（不需要起本地服务，也不需要脚本目录里有 zip）；连不上或超时，再回落到本地回环。由 `make-offline-aar.py --online-first` 生成，官方地址从原始 AAR 里原样取（官方文件名规则与 pack 名不同，不能靠拼接）。
+
+从面板日志可以判读实际走了哪条：
+
+| 日志 | 含义 |
+|---|---|
+| 出现 `模型服务：已发送 …` 若干行 | 在线没成，**回落到本地**了 |
+| 没有 `已发送`，但 `download: 成功` | **在线直接下完**，本地服务没参与 |
+
+> 代价：在线优先时，如果设备能连 Google 但速度很慢，首次下载会先等在线那条超时/失败再回落，整体耗时会比纯本地长。纯本地版仍是脚本目录放 4 个 zip + 单地址，见下面的 `--url-prefix`（不带 `--online-first`）。
+
 **为什么必须是回环 http（三条路实测对比）**
 
 GMS 的 URL 安全校验在 Play 服务进程里执行，App 改不了，只有两条路能落地：
@@ -208,7 +238,7 @@ GMS 的 URL 安全校验在 Play 服务进程里执行，App 改不了，只有�
 
 CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 commit，与真机验证过的定版构建不同，产物会出现 `librime_jni.so` 少 500 KB、`shared/opencc` 少 5 个条目、词典数据不一致等差异。workflow 的「拉取子模块」步骤末尾用 `pin` 把 8 个关键子模块锁定到定版使用的 commit（librime / OpenCC / octagram / predict / snappy / lua / lua-deps / data/rime/essay），并把 JNI 缓存 key 升到 `v2`，避免复用旧版本编出的 `.so`。
 
-构建日志的「产物基线自检」步骤会打印 `librime_jni.so` 大小、`shared/opencc` 条目数和 manifest 里 `127.0.0.1:18080` 的出现次数，用来核对是否与定版对齐（基准：5959144 / 30 / 4）。
+构建日志的「产物基线自检」步骤会打印 `librime_jni.so` 大小、`shared/opencc` 条目数，并断言 manifest 里正好 4 个 pack 且每个都是 `[官方 https, 本地 127.0.0.1]` 两条（基准：5959144 / 30 / 4×2）。
 
 补丁做四件事：
 
@@ -230,6 +260,12 @@ CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 com
 AAR 生成工具见 `tools/make-offline-aar.py`：
 
 ```bash
+# 双地址（在线优先，本地兜底）—— 当前构建用的就是这条
+python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
+    --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
+    --url-prefix "http://127.0.0.1:18080" --online-first --out ./offline
+
+# 纯本地（只留本地一条地址，必须放 zip，速度最快）
 python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
     --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
     --url-prefix "http://127.0.0.1:18080" --out ./offline
