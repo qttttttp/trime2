@@ -170,7 +170,35 @@ jobs:
           fi
           git status --short | head -30
 
-      - name: 生成 ML Kit 离线 AAR（download_urls → 本地 http 服务）
+      - name: 补丁落地自检（每个补丁必须真正生效）
+        run: |
+          set -e
+          # 1) 不允许出现被拒绝的 hunk 残留（patch --fuzz 失败时会留 .rej）
+          REJ=$(find . -path ./.git -prune -o \( -name '*.rej' -o -name '*.orig' \) -print)
+          if [ -n "$REJ" ]; then
+            echo "::error::存在 .rej/.orig，补丁未干净应用"
+            echo "$REJ"
+            exit 1
+          fi
+          # 2) 抽查每个补丁的标志物，防止「apply 报成功但内容没进去」
+          check() {
+            local file="$1" needle="$2" label="$3"
+            if ! grep -qF "$needle" "$file"; then
+              echo "::error::$label 未生效：$file 中找不到 '$needle'"
+              exit 1
+            fi
+            echo "OK: $label"
+          }
+          check app/src/main/jni/cmake/Boost.cmake "vmd" "07 boost vmd"
+          check build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt \
+                "Skip missing OpenCC dictionary" "08 opencc 缺字典跳过"
+          check app/src/main/java/com/osfans/trime/TrimeService.java \
+                "MlkitModelInstaller" "06 mlkit installer"
+          check app/proguard-rules.pro "mlkit_vision_digital_ink" "06 proguard keep"
+          check app/src/main/java/com/androlua/Http.java "putFile" "04 http 流式上传"
+          check app/src/main/jni/CMakeLists.txt "_FILE_OFFSET_BITS=0" "05 file offset 兼容"
+
+      - name: 生成 ML Kit 离线 AAR（在线 https 优先，本地 127.0.0.1 兜底）
         run: |
           set -e
           # 从 Google Maven 拉原版 AAR（Apache-2.0 公开依赖），sha1 校验防供应链篡改
@@ -180,22 +208,30 @@ jobs:
           curl -fsSL -o digital-ink-recognition-19.0.0.aar \
             https://dl.google.com/android/maven2/com/google/mlkit/digital-ink-recognition/19.0.0/digital-ink-recognition-19.0.0.aar
           echo "2f4ebc121902df17a0304a6d1ac576dc8a60d9b0  digital-ink-recognition-19.0.0.aar" | sha1sum -c -
-          # 改写 manifest：http2 路线（手写面板内置 127.0.0.1:18080 本地模型服务）
+          # 改写 manifest：双地址模式 —— 官方 https 优先，127.0.0.1:18080 兜底
+          # （在线能下就走 Google，在线不通/超时才回落到手写面板的本地模型服务）
           # 仓库中不存放 AAR，构建期现场生成
           python3 tools/make-offline-aar.py \
             --aar digital-ink-recognition-19.0.0.aar \
             --pkg com.nirenr.trime \
             --langs zh-Hani,zh-Hani-CN \
             --url-prefix "http://127.0.0.1:18080" \
+            --online-first \
             --out ./offline-aar
           # 断言改写成功（防止静默产出地址没改的坏 AAR，到设备上才暴露）
           python3 - <<'PYEOF'
           import zipfile, json
           with zipfile.ZipFile("offline-aar/digital-ink-recognition-19.0.0-offline.aar") as z:
               m = json.loads(z.read("assets/manifest.json"))
-          local = [u for p in m["packs"] for u in p.get("download_urls", []) if "127.0.0.1" in u]
-          assert local, "没有指向本地服务的 pack"
-          print("OK:", len(local), "个 pack ->", local[0])
+          both = [p for p in m["packs"]
+                  if any("127.0.0.1" in u for u in p.get("download_urls", []))]
+          assert len(both) == 4, "双地址 pack 数应为 4，实际 %d" % len(both)
+          for p in both:
+              us = p["download_urls"]
+              assert len(us) == 2, "%s 地址数应为 2，实际 %d" % (p["name"], len(us))
+              assert us[0].startswith("https://dl.google.com/"), "%s 第一条不是官方 https" % p["name"]
+              assert "127.0.0.1:18080" in us[1], "%s 第二条不是本地服务" % p["name"]
+          print("OK: 4 个 pack 均为 [官方 https, 本地 127.0.0.1]")
           PYEOF
           mkdir -p app/libs
           cp -f offline-aar/digital-ink-recognition-19.0.0-offline.aar app/libs/
@@ -378,13 +414,50 @@ jobs:
           echo "=== 定版基准 ==="
           echo "  librime_jni.so        5959144"
           echo "  libdigitalink.so      (与 AAR 一致)"
-          echo "  shared/opencc 条目数  $(unzip -l "$APK" | grep -c 'assets/shared/opencc/')（定版 30）"
-          echo "=== manifest 地址统计 ==="
-          unzip -p "$APK" assets/manifest.json | grep -o "127.0.0.1:18080" | wc -l
-          echo "=== https 校验分支状态（必须是 goto）==="
+          OPENCC_N=$(unzip -l "$APK" | grep -c 'assets/shared/opencc/')
+          echo "  shared/opencc 条目数  $OPENCC_N（定版 30）"
+          # task 没执行 / 08 补丁没生效时，这里会明显偏少（上游会直接抛 JPVariants 缺失）
+          if [ "$OPENCC_N" -lt 28 ]; then
+            echo "::error::opencc 条目数 $OPENCC_N 明显偏少，installOpenCCData 可能没跑或 08 补丁未生效"
+            unzip -l "$APK" | grep 'assets/shared/opencc/' | awk '{print "    " $4}'
+            exit 1
+          fi
+          if ! unzip -l "$APK" | grep -q 'shared/opencc/JPShinjitaiCharacters.txt'; then
+            echo "::error::opencc 缺少 JPShinjitaiCharacters.txt，08 补丁的字典映射未生效"
+            exit 1
+          fi
+          if [ "$OPENCC_N" -ne 30 ]; then
+            echo "::warning::opencc 条目数 $OPENCC_N != 定版 30（差异不影响手写下载链路）"
+          fi
+          RIME_SZ=$(unzip -l "$APK" | grep 'arm64-v8a/librime_jni.so' | awk '{print $1}' | head -1)
+          if [ "$RIME_SZ" != "5959144" ]; then
+            echo "::warning::librime_jni.so 大小 $RIME_SZ != 定版 5959144（编译基线未完全对齐，不影响下载链路）"
+          fi
+          echo "=== manifest 地址自检（4 个 pack × [官方 https, 本地]）==="
+          APK="$APK" python3 - <<'PYEOF'
+          import zipfile, json, os, sys
+          apk = os.environ["APK"]
+          with zipfile.ZipFile(apk) as z:
+              m = json.loads(z.read("assets/manifest.json"))
+          both = [p for p in m["packs"]
+                  if any("127.0.0.1" in u for u in p.get("download_urls", []))]
+          bad = [p["name"] for p in both
+                 if len(p["download_urls"]) != 2
+                 or not p["download_urls"][0].startswith("https://dl.google.com/")
+                 or "127.0.0.1:18080" not in p["download_urls"][1]]
+          if len(both) != 4 or bad:
+              sys.exit("地址结构异常: pack 数=%d, 不合格=%s" % (len(both), bad))
+          for p in both:
+              print("  %-52s https + local" % p["name"])
+          PYEOF
+          echo "=== https 校验分支状态（必须是 goto，否则构建失败）==="
           DEXDUMP=$(ls -d "$ANDROID_HOME"/build-tools/*/dexdump | sort -V | tail -1)
           unzip -p "$APK" classes.dex > /tmp/check.dex
-          "$DEXDUMP" -d /tmp/check.dex 2>/dev/null | grep -B2 "is not secure" | head -4
+          "$DEXDUMP" -d /tmp/check.dex 2>/dev/null | grep -B3 "is not secure" | head -4
+          if ! "$DEXDUMP" -d /tmp/check.dex 2>/dev/null | grep -B3 "is not secure" | grep -q "goto"; then
+            echo "::error::https 校验分支未被修正为 goto，此包无法下载本地模型"
+            exit 1
+          fi
 
       - name: 上传 APK
         uses: actions/upload-artifact@v5
