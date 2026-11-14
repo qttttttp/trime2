@@ -198,6 +198,48 @@ jobs:
           check app/src/main/java/com/androlua/Http.java "putFile" "04 http 流式上传"
           check app/src/main/jni/CMakeLists.txt "_FILE_OFFSET_BITS=0" "05 file offset 兼容"
 
+      - name: 工具版本自检（防止仓库里只更新了一半）
+        run: |
+          set -e
+          # 踩过两次的坑：workflow 更新了、tools/ 没同步，构建到中途才报
+          # "unrecognized arguments"，日志里看不出是哪个文件旧了。
+          need() {
+            local f="$1" needle="$2" label="$3"
+            if [ ! -f "$f" ]; then
+              echo "::error::$label 缺失：$f"
+              exit 1
+            fi
+            if ! grep -qF -- "$needle" "$f"; then
+              echo "::error::$label 版本过旧：$f 中找不到 '$needle'"
+              echo "  该文件需与 workflow 同批更新（交付包里的 $f 直接覆盖即可）"
+              exit 1
+            fi
+            echo "OK: $label"
+          }
+          need tools/make-offline-aar.py "--local-first" "make-offline-aar 支持本地优先"
+          need tools/patch-dex-https.py "is not secure" "dex https 补丁"
+          need tools/postprocess-apk.sh "patch-dex-https.py" "postprocess 串联 patch"
+          for p in patches/07-boost-vmd.patch patches/08-opencc-missing-dict.patch; do
+            if [ ! -f "$p" ]; then
+              echo "::error::缺少补丁 $p"
+              exit 1
+            fi
+            echo "OK: $p"
+          done
+          # 语法级校验：参数名对不上时这里就会暴露，而不是等到 argparse 报 usage
+          python3 - <<'PYEOF'
+          import subprocess, sys
+          out = subprocess.run([sys.executable, "tools/make-offline-aar.py", "--help"],
+                               capture_output=True, text=True)
+          if out.returncode != 0:
+              sys.exit("make-offline-aar.py --help 执行失败:\n" + out.stderr)
+          text = out.stdout + out.stderr
+          for flag in ("--local-first", "--url-prefix", "--online-first"):
+              if flag not in text:
+                  sys.exit("make-offline-aar.py 不支持 %s，请更新 tools/ 下该文件" % flag)
+          print("OK: make-offline-aar.py 参数完整")
+          PYEOF
+
       - name: 生成 ML Kit 离线 AAR（本地 127.0.0.1 优先，在线 https 兜底）
         run: |
           set -e
@@ -391,7 +433,8 @@ jobs:
           unzip -l "$APK" | grep -E "librime_jni\.so|libdigitalink\.so|assets/manifest\.json" \
             | awk '{printf "  %10d  %s\n", $1, $4}'
           # 模型必须不在包里：出现任一 assets/mlkit-offline/*.zip 就是打包逻辑跑偏了
-          PACKED=$(unzip -l "$APK" | grep -c 'assets/mlkit-offline/.*\.zip')
+          # grep -c 无匹配时退出码为 1，配合 set -e 会让脚本静默退出（不打印任何 error）
+          PACKED=$(unzip -l "$APK" | grep -c 'assets/mlkit-offline/.*\.zip' || true)
           SIZE_MB=$(( $(stat -c%s "$APK") / 1048576 ))
           echo "  APK 体积 ${SIZE_MB} MB，包内模型 zip ${PACKED} 个"
           if [ "$PACKED" -ne 0 ]; then
@@ -402,7 +445,7 @@ jobs:
           if [ "$SIZE_MB" -gt 40 ]; then
             echo "::warning::APK ${SIZE_MB} MB 偏大，确认没有别的资源被误打包"
           fi
-          OPENCC_N=$(unzip -l "$APK" | grep -c 'assets/shared/opencc/')
+          OPENCC_N=$(unzip -l "$APK" | grep -c 'assets/shared/opencc/' || true)
           echo "  shared/opencc 条目数  $OPENCC_N"
           # 定版 30 条目里含 s2seal/t2seal/seal2t 三个文言配置，
           # 而 pin 的 OpenCC(025f371) 的 data/config 已不含它们——定版那 3 个是旧构建残留。
