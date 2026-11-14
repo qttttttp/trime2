@@ -1,0 +1,37 @@
+diff --git a/build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt b/build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt
+index ab60790..41d3e9c 100644
+--- a/build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt
++++ b/build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt
+@@ -92,7 +92,13 @@ class OpenCCDataPlugin : Plugin<Project> {
+                 val dictionary = resolve("dictionary")
+                 for (raw in DICTS_RAW) {
+                     val basename = "$raw.txt"
+-                    dictionary.resolve(basename).copyTo(output.resolve(basename), overwrite = true)
++                    val src = dictionary.resolve(basename)
++                    // 新版本 OpenCC 已用 JPShinjitai* 取代 JPVariants，缺失时跳过
++                    if (!src.exists()) {
++                        logger.lifecycle("Skip missing OpenCC dictionary: $basename")
++                        continue
++                    }
++                    src.copyTo(output.resolve(basename), overwrite = true)
+                 }
+ 
+                 val merge = resolve("scripts/merge.py").absolutePath
+@@ -128,11 +134,12 @@ class OpenCCDataPlugin : Plugin<Project> {
+                     } else {
+                         val sourceName = generated.substringBefore("Rev")
+                         val source =
+-                            if (sourceName == "TWPhrases") {
+-                                output
+-                            } else {
+-                                dictionary
+-                            }.resolve("$sourceName.txt")
++                            when (sourceName) {
++                                "TWPhrases" -> output
++                                "JPVariants" -> dictionary.resolve("JPShinjitaiCharacters.txt")
++                                else -> dictionary.resolve("$sourceName.txt")
++                            }
++                        if (!source.exists()) continue
+                         reverse(source.absolutePath, outputFile.name)
+                     }
+                 }
