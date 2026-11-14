@@ -280,7 +280,9 @@ CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 com
 **AAR 与模型的管理方式**：
 
 - **AAR 不入库**：CI 构建 `应用补丁` 步骤之后自动执行——从 Google Maven 下载原版 AAR（sha1 校验 `2f4ebc12…`）→ `tools/make-offline-aar.py --url-prefix http://127.0.0.1:18080 --pkg com.nirenr.trime` 改写 → 断言已指向本地服务 → 放入 `app/libs/`。本地手动构建同理（`build.sh` 已内置）；
-- **模型不打包**：`assets/mlkit-offline` 保持为空，APK 体积约 16 MB。使用者把 4 个模型 zip 放到 `手写面板.lua` 所在目录即可（文件名与 pack 名一致，见 `pack-map.tsv`）；
+- **模型不打包**：构建时 `rm -rf app/src/main/assets/mlkit-offline` 再建空目录，APK 只带 AAR 和 installer 逻辑，体积约 16 MB。使用者把 4 个模型 zip 放到 `手写面板.lua` 所在目录即可（文件名与 pack 名一致，见 `pack-map.tsv`）；
+  - 产物自检里有硬断言：APK 内只要出现 `assets/mlkit-offline/*.zip` 就 `exit 1`，防止以后又把 25 MB 模型塞回去；
+  - `MlkitModelInstaller` 在 assets 为空时静默跳过，不会因为目录空而报错；这条路径保留是为了将来「模型随包」仍能一键启用；
 - workflow 的恢复名单不含 `app/libs`（不再入库），`git reset --hard` 冲掉后由构建步骤现场重建。
 
 AAR 生成工具见 `tools/make-offline-aar.py`：
