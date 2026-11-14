@@ -195,7 +195,7 @@ Http.putFile(
 
 ### 06-mlkit-offline.patch
 
-接入 ML Kit 数字墨水手写识别，模型「下载」走**面板内置的本地 http 服务**（http2 路线，真机验证可用）。
+接入 ML Kit 数字墨水手写识别，模型地址配成**两条**：官方 https 优先，面板内置的本地 http 服务兜底。（也可以只留本地一条，见下文 `--url-prefix`。）
 
 ML Kit 的下载地址写在 AAR 的 `assets/manifest.json` 里。把中文几个 pack 的 `download_urls` 改成 `http://127.0.0.1:18080/<pack>.zip` 后，手写面板在模型未登记时自动起本地服务（服务根目录 = lua 脚本所在目录），ML Kit 从回环地址抓 zip，sha1 校验、解包、登记全部由官方代码完成，`isModelDownloaded()` 天然为 true。
 
@@ -232,7 +232,16 @@ GMS 的 URL 安全校验在 Play 服务进程里执行，App 改不了，只有�
 
 结论：回环 http 是唯一既不需要公网、又能过校验的方案，这就是 06 补丁内置本地服务的原因。
 
-> 注意：`INSECURE_URL_ERROR` 不一定只由协议引起。同一份 http2 包在不同时机可能出现「服务已启动但一条请求都没收到」就报这个错码，服务端日志无 `已发送` 记录即代表**请求根本没发出**（卡在校验/下载条件阶段），此时先确认设备网络状态（需要连一个 WiFi，不要求能上外网）后重试，不要误判为协议被拒。
+**AAR 里那条 https 检查必须改掉**
+
+`digital-ink-recognition` 的下载器（`zzwu.zzc`）在发请求前判断地址是否以 `https` 开头，不是就抛 `INSECURE_URL_ERROR`——所以只把地址改成 `http://127.0.0.1` 还不够，编译出来必定失败。构建后由 `tools/postprocess-apk.sh` 调 `tools/patch-dex-https.py`：按字符串特征定位该分支，把 `if-nez` 改成 `goto`（3 字节），再重算 dex 头部 `checksum`/`signature`、重新对齐签名。
+
+```lua
+0x32ad9e:  39 01 19  (if-nez v1, +0x19)   -- 编译产物，会抛错
+0x32ad9e:  28 19 00  (goto +0x19)          -- 修正后，跳过整个抛错块
+```
+
+CI 与本地 `build.sh` 都已内置这一步，产物自检里断言该位置必须是 `goto`，否则构建失败。这个修正等价于让 AAR 跳过"只允许 https"的校验，之所以可接受，是因为模型地址是本机回环，流量不出设备；将来若改用公网地址，应当配 https 而不是依赖它。
 
 **构建基线必须锁定子模块版本**
 
@@ -542,56 +551,16 @@ patches/                              # 补丁集合（按文件名顺序应用�
   03-clipboard-broadcast.patch
   04-http-stream.patch
   05-file-offset-compat.patch
+  06-mlkit-offline.patch
+  07-boost-vmd.patch
+  08-opencc-missing-dict.patch
+tools/make-offline-aar.py             # 生成离线 AAR（改写 download_urls）
+tools/patch-dex-https.py              # 修正 AAR 内 https 校验分支
+tools/postprocess-apk.sh              # 修正 + 对齐 + 重签
+tools/check-local-changes.py          # 检查本地改动是否都进了补丁
 signing/trime2-100y.keystore          # 可选，已用 secret 时可删
 README.md
 ```
-
----
-
-## 十一、为什么只有定版能下载模型（已定位）
-
-### 结论
-
-不是 GMS 白名单，不是签名摘要，也不是包指纹——是**字节码里的一条指令**。
-
-`digital-ink-recognition-19.0.0.aar` 的下载器（类 `zzwu`，方法 `zzc`）在发起请求前
-判断地址是否以 `https` 开头，不是就抛 `INSECURE_URL_ERROR`。反汇编对比，同一方法
-同一偏移 `0x32ad9e`：
-
-| 版本 | 指令 |
-|---|---|
-| 定版（能下载） | `goto 0036` —— 无条件跳过抛错块，等于该检查不存在 |
-| 任何干净编译 | `if-nez v1, 0036` —— url 不是 https 就落入抛错块 |
-
-两者只差 3 个字节（`39 01 19` → `28 19 00`）。这解释了全部现象：
-
-- 定版每次都能下载，因为它根本不执行这个检查
-- 源码重编必然失败，因为编译器正常保留了分支
-- 用 apktool 删模型、重打包、重签名的包能下载，因为它的 `classes.dex`
-  原样来自定版
-
-> 之前"只差 27 字节且全是哈希字段"的结论是错的：`dexdump` 对比输出被 `head`
-> 截断，恰好漏掉了这一行指令差异。
-
-### 解决：构建后按字节修正
-
-`tools/postprocess-apk.sh` 对 Gradle 产物做三件事：
-
-1. `tools/patch-dex-https.py` 按字符串特征定位该分支，改回 `goto`
-2. 重算 dex 头部的 `checksum` / `signature`
-3. 重新 zipalign + apksigner 签名
-
-已验证：修正后的 dex 与定版 `sha256` 完全相同（`ef89a4b4…`），整个 APK 与定版
-逐条零差异（md5 同为 `699eec6a…`）。
-
-CI（`build-patched.yml`）与本地 `build.sh` 都已内置这一步，产物自检里会断言
-该位置必须是 `goto`，否则构建直接失败。
-
-### 注意
-
-这个改动等价于让 AAR 跳过"只允许 https"的校验。之所以可接受，是因为模型地址
-是 `127.0.0.1` 上的本机回环服务，流量不出设备。若将来改用公网地址，应当配置
-https 而不是依赖这个修正。
 
 ---
 
