@@ -198,7 +198,7 @@ jobs:
           check app/src/main/java/com/androlua/Http.java "putFile" "04 http 流式上传"
           check app/src/main/jni/CMakeLists.txt "_FILE_OFFSET_BITS=0" "05 file offset 兼容"
 
-      - name: 生成 ML Kit 离线 AAR（在线 https 优先，本地 127.0.0.1 兜底）
+      - name: 生成 ML Kit 离线 AAR（本地 127.0.0.1 优先，在线 https 兜底）
         run: |
           set -e
           # 从 Google Maven 拉原版 AAR（Apache-2.0 公开依赖），sha1 校验防供应链篡改
@@ -208,15 +208,16 @@ jobs:
           curl -fsSL -o digital-ink-recognition-19.0.0.aar \
             https://dl.google.com/android/maven2/com/google/mlkit/digital-ink-recognition/19.0.0/digital-ink-recognition-19.0.0.aar
           echo "2f4ebc121902df17a0304a6d1ac576dc8a60d9b0  digital-ink-recognition-19.0.0.aar" | sha1sum -c -
-          # 改写 manifest：双地址模式 —— 官方 https 优先，127.0.0.1:18080 兜底
-          # （在线能下就走 Google，在线不通/超时才回落到手写面板的本地模型服务）
+          # 改写 manifest：双地址模式 —— 127.0.0.1:18080 优先，官方 https 兜底
+          # 本地有 zip 就走回环（毫秒级、不碰网络）；本地 404 才由下载器改试 Google。
+          # dl.google.com 在国内时通时不通，所以不能把在线放第一条。
           # 仓库中不存放 AAR，构建期现场生成
           python3 tools/make-offline-aar.py \
             --aar digital-ink-recognition-19.0.0.aar \
             --pkg com.nirenr.trime \
             --langs zh-Hani,zh-Hani-CN \
             --url-prefix "http://127.0.0.1:18080" \
-            --online-first \
+            --local-first \
             --out ./offline-aar
           # 断言改写成功（防止静默产出地址没改的坏 AAR，到设备上才暴露）
           python3 - <<'PYEOF'
@@ -229,39 +230,17 @@ jobs:
           for p in both:
               us = p["download_urls"]
               assert len(us) == 2, "%s 地址数应为 2，实际 %d" % (p["name"], len(us))
-              assert us[0].startswith("https://dl.google.com/"), "%s 第一条不是官方 https" % p["name"]
-              assert "127.0.0.1:18080" in us[1], "%s 第二条不是本地服务" % p["name"]
-          print("OK: 4 个 pack 均为 [官方 https, 本地 127.0.0.1]")
+              assert "127.0.0.1:18080" in us[0], "%s 第一条不是本地服务" % p["name"]
+              assert us[1].startswith("https://dl.google.com/"), "%s 第二条不是官方 https" % p["name"]
+          print("OK: 4 个 pack 均为 [本地 127.0.0.1, 官方 https]")
           PYEOF
           mkdir -p app/libs
           cp -f offline-aar/digital-ink-recognition-19.0.0-offline.aar app/libs/
-          # 模型 zip 双保险打进 assets（与定版 http2 APK 一致）：
-          # 面板的本地模型服务根目录兜底链是 脚本目录 → MlkitModelInstaller.getTargetDir，
-          # 用户脚本目录没有 zip 时靠 assets 这份兜底（installer 会解压到 target dir）
-          python3 - <<'PYEOF'
-          import json, hashlib, pathlib, subprocess, zipfile
-          orig = json.loads(zipfile.ZipFile("digital-ink-recognition-19.0.0.aar").read("assets/manifest.json"))
-          packs = {p["name"]: p for p in orig["packs"]}
-          # pack 名来自 make-offline-aar.py 生成的 pack-map.tsv（与改写范围一致）
-          names = [l.split("\t")[0] for l in pathlib.Path("offline-aar/pack-map.tsv").read_text().splitlines()[1:] if l.strip()]
-          out = pathlib.Path("app/src/main/assets/mlkit-offline")
-          out.mkdir(parents=True, exist_ok=True)
-          for n in names:
-              p = packs[n]
-              dest = out / (n + ".zip")
-              # curl 自身重试 + 外层再兜 3 轮，网络抖动不至于让整个构建失败
-              for attempt in range(3):
-                  r = subprocess.run(["curl", "-fsSL", "--retry", "5", "--retry-all-errors",
-                                      "--connect-timeout", "20", "-o", str(dest), p["download_urls"][0]])
-                  if r.returncode == 0:
-                      break
-              else:
-                  raise SystemExit("下载失败: %s" % n)
-              data = dest.read_bytes()
-              assert len(data) == p["compressed_size"], "%s 大小不符: %d != %s" % (n, len(data), p["compressed_size"])
-              assert hashlib.sha1(data).hexdigest() == p["sha1_checksum"], "%s sha1 不符" % n
-              print("OK: %s (%.1f MB)" % (dest.name, len(data) / 1048576))
-          PYEOF
+          # 模型不进包：APK 只带 AAR 与 installer 逻辑，4 个 zip 由使用者放到
+          # 手写面板脚本所在目录（本地模型服务根目录就是脚本目录）。
+          # assets/mlkit-offline 留空时，MlkitModelInstaller 静默跳过，不报错。
+          rm -rf app/src/main/assets/mlkit-offline
+          mkdir -p app/src/main/assets/mlkit-offline
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -411,6 +390,18 @@ jobs:
           echo "=== 关键条目 ==="
           unzip -l "$APK" | grep -E "librime_jni\.so|libdigitalink\.so|assets/manifest\.json" \
             | awk '{printf "  %10d  %s\n", $1, $4}'
+          # 模型必须不在包里：出现任一 assets/mlkit-offline/*.zip 就是打包逻辑跑偏了
+          PACKED=$(unzip -l "$APK" | grep -c 'assets/mlkit-offline/.*\.zip')
+          SIZE_MB=$(( $(stat -c%s "$APK") / 1048576 ))
+          echo "  APK 体积 ${SIZE_MB} MB，包内模型 zip ${PACKED} 个"
+          if [ "$PACKED" -ne 0 ]; then
+            echo "::error::APK 里打进了 $PACKED 个模型 zip，模型应只随脚本目录分发"
+            unzip -l "$APK" | grep 'assets/mlkit-offline/' | awk '{print "    " $1, $4}'
+            exit 1
+          fi
+          if [ "$SIZE_MB" -gt 40 ]; then
+            echo "::warning::APK ${SIZE_MB} MB 偏大，确认没有别的资源被误打包"
+          fi
           OPENCC_N=$(unzip -l "$APK" | grep -c 'assets/shared/opencc/')
           echo "  shared/opencc 条目数  $OPENCC_N"
           # 定版 30 条目里含 s2seal/t2seal/seal2t 三个文言配置，
@@ -430,7 +421,7 @@ jobs:
             exit 1
           fi
           echo "::notice::librime_jni.so 大小仅记录不比较：子模块已 pin 一致，剩余差异来自 CI 工具链，与下载链路无关"
-          echo "=== manifest 地址自检（4 个 pack × [官方 https, 本地]）==="
+          echo "=== manifest 地址自检（4 个 pack × [本地, 官方 https]）==="
           APK="$APK" python3 - <<'PYEOF'
           import zipfile, json, os, sys
           apk = os.environ["APK"]
@@ -440,12 +431,12 @@ jobs:
                   if any("127.0.0.1" in u for u in p.get("download_urls", []))]
           bad = [p["name"] for p in both
                  if len(p["download_urls"]) != 2
-                 or not p["download_urls"][0].startswith("https://dl.google.com/")
-                 or "127.0.0.1:18080" not in p["download_urls"][1]]
+                 or "127.0.0.1:18080" not in p["download_urls"][0]
+                 or not p["download_urls"][1].startswith("https://dl.google.com/")]
           if len(both) != 4 or bad:
               sys.exit("地址结构异常: pack 数=%d, 不合格=%s" % (len(both), bad))
           for p in both:
-              print("  %-52s https + local" % p["name"])
+              print("  %-52s local + https" % p["name"])
           PYEOF
           echo "=== https 校验分支状态（必须是 goto，否则构建失败）==="
           DEXDUMP=$(ls -d "$ANDROID_HOME"/build-tools/*/dexdump | sort -V | tail -1)
