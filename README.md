@@ -76,6 +76,7 @@ SHA-256: 42:C0:18:B9:FD:B6:01:DC:73:7D:1D:C8:5E:2C:A7:40:E0:99:28:A1:E4:0C:7E:B7
 | `06-mlkit-offline.patch` | 接入 ML Kit 手写识别，模型下载地址指向面板内置的本地 http 服务（127.0.0.1:18080），模型不打包进 APK |
 | `07-boost-vmd.patch` | 编译修复：librime 新版用到 Boost.VMD，`Boost.cmake` 模块列表补 `vmd` |
 | `08-opencc-missing-dict.patch` | 编译修复：新版 OpenCC 用 `JPShinjitai*` 取代 `JPVariants`，`installOpenCCData` 缺字典时跳过而不是抛异常 |
+| `09-rime-property.patch` | lua侧与librime简单通讯,Rime.setProperty("string","string") , Rime.getProperty("string"),librime-lua:env.engine.context:get_property("string")和set_property("string","string")|
 
 **构建前必跑一次覆盖自检**
 
@@ -87,7 +88,7 @@ python3 tools/check-local-changes.py /path/to/trime2
 
 ### 01-voice-asr.patch
 
-改动要点：新增 `AiClient.transcribeAudio()`（multipart 上传 WAV 到 `/v1/audio/transcriptions`）与 `looksLikeAsr()`（按模型名 `sensevoice`/`whisper`/`paraformer`/`asr` 自动分流）；`asr_config` 新增可选 `api` 字段强制指定接口；语音输入改为「长按说话、松手上屏」。
+改动要点：新增 `AiClient.transcribeAudio()`（multipart 上传 WAV 到 `/v1/audio/transcriptions`）与 `looksLikeAsr()`（按模型名 `sensevoice`/`whisper`/`paraformer`/`asr` 自动分流）；`asr_config` 新增可选 `api` 字段强制指定接口。
 
 主题 `main.lua` 的写法（以硅基流动为例）：
 
@@ -123,7 +124,6 @@ asr_config = {
 ```lua
 font = {
     "system",          -- 系统当前字体，最优先
-    "方正行楷.TTF",     -- 系统没有的字形走这里
     "明月HanaMinB.ttf", -- 生僻字兜底
 }
 ```
@@ -208,7 +208,41 @@ ML Kit 的下载地址写在 AAR 的 `assets/manifest.json` 里。把中文几�
  "https://dl.google.com/handwriting/models/<原文件名>.zip"]
 ```
 
-脚本目录里有 zip 就走回环地址，毫秒级完成、不碰网络；脚本目录没有 zip 时，本地服务回 404，下载器改试第二条官方 https。由 `make-offline-aar.py --local-first` 生成，官方地址从原始 AAR 里原样取（官方文件名规则与 pack 名不同，不能靠拼接）。
+脚本目录里有 zip 就走回环地址，毫秒级完成、不碰网络。由 `make-offline-aar.py --local-first` 生成，官方地址从原始 AAR 里原样取（官方文件名规则与 pack 名不同，不能靠拼接）。
+
+**GMS 不会自己试第二条地址（实测）**
+
+真机日志（`lf302` 之前那一版）证明：三个 pack 全部 `404`，紧接着就是
+
+```
+zzai: Failed to download file group zh-Hani-CN
+3 failure(s) in total:
+--- Failure 1 --- zzcg: HTTP_ERROR HttpCode: 404;
+--- Failure 2 --- zzcg: HTTP_ERROR HttpCode: 404;
+--- Failure 3 --- zzcg: HTTP_ERROR HttpCode: 404;
+```
+
+也就是说 `download_urls` 的多地址是**按序尝试直到成功的列表**这件事并不成立——第一条返回 404，整个 file group 直接失败，第二条 https 从未被请求。所以「本地没有文件时用网络」不能靠 manifest 的第二条地址，只能由本地服务自己完成：
+
+```
+GMS ──GET──> 127.0.0.1:18080/<pack>.zip
+               ├─ 文件存在   → 200 + 文件内容（走本地）
+               └─ 文件不存在 → 302 Location: https://dl.google.com/...（转在线）
+```
+
+本地服务在 404 之前先查 APK 内 `assets/manifest.json`，用 `org.json.JSONObject` 取该 pack 的官方 https 地址，回 `302`。GMS 的 okhttp 跟随重定向，下载的是官方文件本身，sha1 校验、解包、登记仍由官方代码完成。manifest 第二地址保留着没有坏处，但**不要指望它**。
+
+302 这条路径已实测跑通（`lf302` 版首次替换脚本后的真机日志）：
+
+```
+模型服务：本地没有 lstm_chinese_tflite_4_192_tflite_20181109_zip.zip，302 转在线
+模型服务：本地没有 qrnn_zh_cn_reco_20191217_fst_20190322_recospec_zip.zip，302 转在线
+模型服务：本地没有 zh_cn_20190322_compact_fst_zip.zip，302 转在线
+模型已就绪
+模型线路 302转在线 3，未请求 1
+```
+
+同一台设备、同一份 APK，上一版脚本（只回 404）三次重试全部 `HTTP_ERROR 404`；换成 302 后直接 `模型已就绪`。两组日志的差别只有脚本，说明**跟随重定向成立，多地址按序回落不成立**。模型下载后由 GMS 登记缓存，之后不再访问网络。
 
 **为什么不是在线优先**：`dl.google.com` 在国内时通时不通（各测试点结果不一致，DNS 污染常见），把它放第一条会让国内用户先卡在超时上；而这 4 个模型是 2018/2019 年的固定文件（`lstm_…_20181109`、`qrnn_…_20191217`），官方端多年没更新，在线拿到的和本地 sha1 一致——在线优先没有任何收益，只有等待和失败率。
 
@@ -217,26 +251,16 @@ ML Kit 的下载地址写在 AAR 的 `assets/manifest.json` 里。把中文几�
 | 日志 | 含义 |
 |---|---|
 | `模型线路 本地 4` | 4 个包全由本地服务发出 |
-| `模型线路 本地缺文件→在线 4` | 本地没有 zip，404 后改走官方，在线下载成功 |
-| `模型线路 在线直下（本地无请求）` | 本地服务一次请求都没收到（服务没起或地址顺序不对），全靠在线 |
+| `模型线路 302转在线 3，未请求 1` | 本地没有 zip，服务 302 把 GMS 引到官方地址（已实测可成功） |
+| `模型线路 无地址404 3` | 本地没有 zip，manifest 里也没解析出在线地址（解析失败或纯本地单地址包） |
+| `模型线路 在线直下（本地无请求）` | 本地服务一次请求都没收到（服务没起或地址顺序不对） |
 | `模型线路 未请求 N` | 只下了其中几个包，剩下 N 个本次不需要 |
 
 `CFG.verbose = true` 时会逐个包列出文件名，以及 APK 内地址的顺序是「本地→在线」还是「在线→本地」。
 
-> 代价：本地限速在回环上，几乎瞬间完成；只有本地缺文件时才需要联网，此时耗时取决于 `dl.google.com` 的可达性。纯本地版仍可用单地址，见下面 `--url-prefix`（不带任何 `-first` 开关）。
-
-**为什么必须是回环 http（三条路实测对比）**
-
-GMS 的 URL 安全校验在 Play 服务进程里执行，App 改不了，只有两条路能落地：
-
-| 方案 | 实测结果 |
-|---|---|
-| `https://` | 可行，但需要 https 服务器（公网或自签证书），且模型得先能上网拿到 |
-| `http://127.0.0.1:<port>` | **可行**，回环地址在校验白名单内 |
-| `file:///sdcard/...` | 失败，`Download result code: INSECURE_URL_ERROR` |
-| `content://<app>.mlkitmodels/...` | 失败，`unknown protocol: content`（scheme 过了校验，但下载器是 okhttp，`new URL()` 不认 content 协议） |
-
-结论：回环 http 是唯一既不需要公网、又能过校验的方案，这就是 06 补丁内置本地服务的原因。
+> 代价：本地有 zip 时几乎瞬间完成；没有 zip 时由服务端 302 到官方，耗时取决于 `dl.google.com` 的可达性。国内网络下最稳的做法仍是把 4 个 zip 放在脚本目录。纯本地单地址可用 `--url-prefix`（不带任何 `-first` 开关）。
+>
+> **不要把 manifest 的第二条地址当成冗余清理掉**：脚本 302 的目标就是从这里解析出来的（找 `download_urls` 里第一个 `https://`）。删成单地址后本地缺文件只能回 404，302 链直接断掉。
 
 **AAR 里那条 https 检查必须改掉**
 
@@ -255,7 +279,6 @@ CI 与本地 `build.sh` 都已内置这一步，产物自检里断言该位置�
 
 CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 commit，与真机验证过的定版构建不同，产物会出现 `librime_jni.so` 少 500 KB、`shared/opencc` 少 5 个条目、词典数据不一致等差异。workflow 的「拉取子模块」步骤末尾用 `pin` 把 8 个关键子模块锁定到定版使用的 commit（librime / OpenCC / octagram / predict / snappy / lua / lua-deps / data/rime/essay），并把 JNI 缓存 key 升到 `v2`，避免复用旧版本编出的 `.so`。
 
-**只对齐行为，不对齐字节。** 真要对齐的只有一条：`zzwu.zzc` 里的 https 校验分支必须是 `goto`（见上一节），这决定了本地兜底能不能用。其余指标不再拿定版当基准：
 
 | 指标 | 定版 | 现构建 | 处理 |
 |---|---|---|---|
@@ -280,7 +303,7 @@ CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 com
 **AAR 与模型的管理方式**：
 
 - **AAR 不入库**：CI 构建 `应用补丁` 步骤之后自动执行——从 Google Maven 下载原版 AAR（sha1 校验 `2f4ebc12…`）→ `tools/make-offline-aar.py --url-prefix http://127.0.0.1:18080 --pkg com.nirenr.trime` 改写 → 断言已指向本地服务 → 放入 `app/libs/`。本地手动构建同理（`build.sh` 已内置）；
-- **模型不打包**：构建时 `rm -rf app/src/main/assets/mlkit-offline` 再建空目录，APK 只带 AAR 和 installer 逻辑，体积约 16 MB。使用者把 4 个模型 zip 放到 `手写面板.lua` 所在目录即可（文件名与 pack 名一致，见 `pack-map.tsv`）；
+- **模型不打包**：构建时 `rm -rf app/src/main/assets/mlkit-offline` 再建空目录，APK 只带 AAR 和 installer 逻辑，体积约 16 MB。使用者把 4 个模型 zip 放到 `手写面板.lua` 所在目录即可（文件名与 pack 名一致，见 `pack-map.tsv`）；不放也能跑，脚本会让本地服务 302 到官方地址，但那样就依赖 `dl.google.com` 的可达性；
   - 产物自检里有硬断言：APK 内只要出现 `assets/mlkit-offline/*.zip` 就 `exit 1`，防止以后又把 25 MB 模型塞回去；
   - `MlkitModelInstaller` 在 assets 为空时静默跳过，不会因为目录空而报错；这条路径保留是为了将来「模型随包」仍能一键启用；
 - workflow 的恢复名单不含 `app/libs`（不再入库），`git reset --hard` 冲掉后由构建步骤现场重建。
@@ -305,6 +328,19 @@ python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
 ```
 
 配套的手写面板是 `scripts/手写面板.lua`：覆盖在键盘上的一块画板，抬笔即识别，点候选上屏；带模型自动下载、脏索引自愈（官方 delete → 清 prefs 硬重置）、反查编码等功能。
+
+反查编码已抽成独立模块 `scripts/单字反查.lua`，手写面板用 `dofile` 加载，其他脚本也能同样复用：
+
+```lua
+local m = dofile("/storage/emulated/0/Documents/rime/scripts/单字反查.lua")
+m.init(svc)                       -- 找数据文件；idx 缺失/无效时后台自动生成
+m.codeOfCandidate("花")            -- 索引没就绪返回 nil
+m.onReady(function() ... end)     -- 索引建好后回调一次（面板用它刷新候选小字）
+m.lookbackType() / m.saveLookbackType(t) / m.CODE_TYPES / m.isReady()
+```
+
+数据只认 `单字编码.idx + 单字编码.text`（`gen-code-table.py` 生成，`HEX8 OFFSET7 LEN5` 行宽 23 字节）。idx 缺失或与 `.text` 不配套时模块后台重建，**建好之前 `codeOfCandidate` 一律返回 nil** —— 候选照常显示，只是不带反查小字；建好后自动可用并回调刷新。整表 `.lua` / `.text` 整载的兜底被刻意去掉了：整载要占内存、拖慢首次调用，而索引本来就毫秒级。
+
 
 ### 1. 准备本地源码
 
