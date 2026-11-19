@@ -1,0 +1,36 @@
+--- a/app/src/main/java/com/osfans/trime/InputView.java	2026-10-23 18:24:29.000000000 +0800
++++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-19 15:33:02.319625645 +0800
+@@ -46,6 +46,16 @@
+     private Globals globals;
+     private View oldView;
+ 
++    // ===== 主题工作室数据桥接：当前键盘脚本执行后的 Globals 静态快照 =====
++    // 同进程的 tools Lua（主题工作室）通过 ThemeDataBridge 读取它，拿到真实键盘布局，
++    // 避免在工具沙箱里重跑键盘脚本。每次 setKeyboard 成功后更新。
++    private static Globals sCurrentKeyboardGlobals;
++
++    /** 主题工作室数据桥接：返回当前键盘 Globals（可能为空） */
++    public static Globals getCurrentKeyboardGlobals() {
++        return sCurrentKeyboardGlobals;
++    }
++
+     public InputView(@NonNull Context context) {
+         super(context);
+         setClipChildren(false);
+@@ -146,6 +156,7 @@
+                 if (func.isfunction()) {
+                     LuaValue ret = func.call();
+                     if (ret.isuserdata(View.class)) {
++                        sCurrentKeyboardGlobals = globals;  // 主题工作室数据桥接
+                         setKeyboardView(ret.touserdata(View.class));
+                         return;
+                     }
+@@ -156,6 +167,8 @@
+                 ThemeManager.sendMsg("setKeyboard " + e);
+             }
+             //Log.w("TAG", "setKeyboard: "+globals.checktable().dump().tojstring() );
++            // 主题工作室数据桥接：保存当前键盘 Globals 静态快照
++            sCurrentKeyboardGlobals = globals;
+             // 创建并存入缓存
+             if (globals.get("rows").istable()) {
+                 targetView = new RowKeyboardView(getContext(), globals);

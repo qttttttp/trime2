@@ -1,0 +1,14 @@
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-10-23 18:24:29.000000000 +0800
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-19 15:30:13.569516285 +0800
+@@ -67,6 +67,11 @@
+         return mGlobals;
+     }
+ 
++    /** 主题工作室数据桥接：暴露当前配色表（配色脚本执行后的最终 LuaTable） */
++    public static LuaTable getColor() {
++        return mColor;
++    }
++
+     public static void vibrate(VibrationEffect ve) {
+         if (vibrator == null) {
+             Context context = LuaApplication.getInstance();
