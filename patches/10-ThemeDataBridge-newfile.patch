@@ -1,9 +1,9 @@
 diff --git a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
 new file mode 100644
-index 0000000..9f6b2e5
+index 0000000..6c9630a
 --- /dev/null
 +++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,394 @@
 +/*
 + * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
 + *
@@ -32,9 +32,15 @@ index 0000000..9f6b2e5
 +package com.osfans.trime.theme;
 +
 +import android.text.TextUtils;
++import android.text.Spanned;
++import android.text.style.ImageSpan;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.TextView;
 +
 +import com.osfans.trime.Config;
 +import com.osfans.trime.InputView;
++import com.osfans.trime.TrimeService;
 +
 +import org.luaj.Globals;
 +import org.luaj.LuaTable;
@@ -307,5 +313,88 @@ index 0000000..9f6b2e5
 +        }
 +        b.append('"');
 +        return b.toString();
++    }
++
++    // =====================================================================
++    // 主题工作室数据桥接：读真机【整个 RootInputView】当前显示的所有文本
++    // ---------------------------------------------------------------------
++    // 真机与工具是同一进程、不同 Lua 虚拟机；工具进程里 Service 实例不是
++    // 正在渲染键盘的那个对象，工具侧反射读 View 拿不到。这里在 Java 编译期
++    // 直接持有 TrimeService.onCreate 保存的 RootInputView 静态引用，在 Java 内部
++    // 遍历【整棵树】（键盘 + 工具栏 + 候选栏），把每个 TextView 的最终显示文本与
++    // 是否含 ImageSpan 序列化返回。工具只读字符串，无 native 引擎调用。
++    // =====================================================================
++    public static String dumpRootTexts() {
++        StringBuilder out = new StringBuilder();
++        try {
++            View root = TrimeService.getCurrentRootView();
++            if (root == null) {
++                out.append("ERR: RootInputView 为空（输入法视图尚未就绪？）");
++                return out.toString();
++            }
++            String cls = root.getClass().getName();
++            out.append("ROOT: ").append(cls).append('\n');
++            walkView(root, out, 0, new int[]{0}, "");
++            out.append("---- DONE ----");
++        } catch (Throwable t) {
++            out.append("ERR: ").append(t);
++        }
++        return out.toString();
++    }
++
++    /** 兼容别名：早期工具端调用此方法，实际返回整个 root 的文本 */
++    public static String dumpKeyboardTexts() {
++        return dumpRootTexts();
++    }
++
++    private static void walkView(View v, StringBuilder out, int depth, int[] count, String region) {
++        if (v == null || depth > 22 || count[0] >= 600) return;
++        try {
++            String cname = v.getClass().getName();
++            String shortName = cname.substring(cname.lastIndexOf('.') + 1);
++            // 根据类名推断当前所在区域，标注在每行前，方便对照
++            String here = region;
++            String lc = cname.toLowerCase();
++            if (lc.contains("toolbar")) here = "TOOLBAR";
++            else if (lc.contains("candidate")) here = "CANDIDATE";
++            else if (lc.contains("keyboard") || lc.contains("keyview")) here = "KEYBOARD";
++            else if (lc.contains("composition") || lc.contains("preedit")) here = "COMPOSITION";
++            if (v instanceof TextView) {
++                CharSequence cs = ((TextView) v).getText();
++                boolean img = false;
++                if (cs instanceof Spanned) {
++                    Spanned sp = (Spanned) cs;
++                    img = sp.getSpans(0, sp.length(), ImageSpan.class).length > 0;
++                }
++                String txt = cs == null ? "" : cs.toString().replace("\n", "\\n");
++                out.append('[').append(here.isEmpty() ? "-" : here).append("] ")
++                   .append(pad(depth)).append(shortName)
++                   .append('@').append(v.getLeft()).append(',').append(v.getTop())
++                   .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
++                   .append(img ? " [IMG]" : " [TXT]")
++                   .append(" = [").append(txt).append("]\n");
++                count[0]++;
++            }
++            try {
++                if (v instanceof ViewGroup) {
++                    ViewGroup g = (ViewGroup) v;
++                    int n = g.getChildCount();
++                    for (int i = 0; i < n; i++) {
++                        walkView(g.getChildAt(i), out, depth + 1, count, here);
++                    }
++                }
++            } catch (Throwable ignore) {
++                // 子 View 遍历失败不影响整体
++            }
++        } catch (Throwable ignore) {
++            // 单个 View 读取失败不影响整体遍历
++        }
++    }
++
++    private static String pad(int depth) {
++        StringBuilder s = new StringBuilder();
++        int n = Math.min(depth, 10);
++        for (int i = 0; i < n; i++) s.append("  ");
++        return s.toString();
 +    }
 +}

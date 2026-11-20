@@ -1,6 +1,8 @@
---- a/app/src/main/java/com/osfans/trime/InputView.java	2026-10-23 18:24:29.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-19 15:33:02.319625645 +0800
-@@ -46,6 +46,16 @@
+diff --git a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
+index 69c46ea..f952df9 100644
+--- a/app/src/main/java/com/osfans/trime/InputView.java
++++ b/app/src/main/java/com/osfans/trime/InputView.java
+@@ -46,6 +46,16 @@ public class InputView extends FrameLayout implements ResourceFinder {
      private Globals globals;
      private View oldView;
  
@@ -17,7 +19,7 @@
      public InputView(@NonNull Context context) {
          super(context);
          setClipChildren(false);
-@@ -146,6 +156,7 @@
+@@ -146,6 +156,7 @@ public class InputView extends FrameLayout implements ResourceFinder {
                  if (func.isfunction()) {
                      LuaValue ret = func.call();
                      if (ret.isuserdata(View.class)) {
@@ -25,7 +27,7 @@
                          setKeyboardView(ret.touserdata(View.class));
                          return;
                      }
-@@ -156,6 +167,8 @@
+@@ -156,6 +167,8 @@ public class InputView extends FrameLayout implements ResourceFinder {
                  ThemeManager.sendMsg("setKeyboard " + e);
              }
              //Log.w("TAG", "setKeyboard: "+globals.checktable().dump().tojstring() );
