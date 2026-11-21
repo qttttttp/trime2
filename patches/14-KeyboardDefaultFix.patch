@@ -1,6 +1,6 @@
 diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/com/osfans/trime/Config.java
---- a/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 16:35:09.021643321 +0800
-+++ b/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 19:45:14.506008245 +0800
+--- a/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 20:08:37.027405776 +0800
++++ b/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 20:47:53.103613417 +0800
 @@ -11,6 +11,7 @@
  
  import android.os.Build;
@@ -92,9 +92,18 @@ diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/c
  
      public static String[] getKeyboards() {
 diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
---- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 16:35:09.022643332 +0800
-+++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 19:45:14.508008311 +0800
-@@ -87,11 +87,15 @@
+--- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:08:37.027405776 +0800
++++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:48:29.933822751 +0800
+@@ -35,6 +35,8 @@
+ public class KeyboardDialog implements ResourceFinder {
+     private final AlertDialog mDialog;
+     private IBinder mWindowToken;
++    /** 是否真的选了某一项；没选也要恢复键盘，见 setOnDismissListener */
++    private boolean mPicked;
+ 
+     @Override
+     public InputStream findResource(String name) {
+@@ -87,11 +89,15 @@
                          //       (dialog, id) -> new ThemeDialog(context).show(mWindowToken))
                          .setNegativeButton(android.R.string.cancel, null);
  
@@ -112,8 +121,12 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
              String[] rawKeyboardIds = Config.getKeyboards();
  
              // 2. 准备 Lua 环境
-@@ -148,10 +152,17 @@
+@@ -146,16 +152,38 @@
+                     sortedNames,
+                     currentSelectedIndex,
                      (dialog, index) -> {
++                        // 先置位再 dismiss：dismiss 会同步触发 setOnDismissListener
++                        mPicked = true;
                          dialog.dismiss();
                          String selectedId = sortedIds[index];
 -                        Config.setKeyboard(selectedId);
@@ -133,9 +146,26 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
                          }
                      });
          }
+         mDialog = builder.create();
++        // 为了列出候选名称，上面已经把每个键盘的 lua 都执行了一遍（在临时的 Globals 里）。
++        // 脚本里对 Java 侧的全局副作用——最典型的是给部分按键挂的滑动接管——会落到
++        // 正在使用的输入法上，表现为「打开一次默认键盘，按键滑动就没了，只剩点击」。
++        // 这里在没选任何项（取消/返回/点空白）时把当前键盘完整重建一次，
++        // 让真正的键盘脚本重跑，恢复那些运行时挂上去的行为。
++        mDialog.setOnDismissListener(d -> {
++            if (mPicked) return;
++            try {
++                TrimeService trime = TrimeService.getInstance();
++                if (trime != null) trime.setKeyboard(".reload");
++            } catch (Throwable ignored) {
++            }
++        });
+     }
+ 
+     /**
 diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
---- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 16:35:09.021643321 +0800
-+++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 19:45:14.507008278 +0800
+--- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 20:08:37.027405776 +0800
++++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 20:49:29.701785255 +0800
 @@ -60,10 +60,7 @@
          super(context);
          setClipChildren(false);
@@ -164,26 +194,39 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
      // 2. 视图缓存：SchemaId -> KeyboardView 实例
      private final Map<String, KeyboardView> mViewCache = new HashMap<>();
      private final Map<String, SymbolsKeyboardView> mSymbolsViewCache = new HashMap<>();
-@@ -141,10 +147,17 @@
+@@ -141,10 +147,30 @@
                  setKeyboardView(oldView);
              return;
          }
++        boolean forceReload = false;
 +        if (".reload".equals(id)) {
-+            // 设置里点了「自动匹配」：偏好已清空，这里强制重算一次并写回
++            // 「重新应用键盘」：偏好可能被清空（自动匹配），也可能只是要求把键盘重建一次。
++            // 默认键盘对话框为了列出名称会逐个 load 键盘 lua，脚本里的全局副作用
++            // （典型是给部分按键挂上的滑动接管）会把当前键盘的运行时状态改掉，
++            // 只有重跑当前键盘脚本才能恢复——所以这里连视图缓存一起丢掉。
 +            mCurrentSchemaId = null;
 +            id = Config.currentSchema();
++            // 从设置页返回的瞬间 schema 可能还没就绪，退到上一次真正加载的键盘名，
++            // 至少把它重建一次，别让滑动接管一直丢着。
++            if (TextUtils.isEmpty(id)) id = sLoadedKeyboard;
 +            if (TextUtils.isEmpty(id)) return;
++            forceReload = true;
 +        }
          if (id == null || id.equals(mCurrentSchemaId)) return;
          mCurrentSchemaId = id;
          id = getKeyboardId(id);
 -        Log.w("TAG", "setKeyboard:e " + id);
++        if (forceReload) {
++            // 解析后才是真正的键盘名（如 wanxiang），缓存键用的也是它
++            mViewCache.remove(id);
++            mSymbolsViewCache.remove(id);
++        }
 +        sLoadedKeyboard = id;
 +        Log.w("TAG", "setKeyboard:e " + id + " (schema=" + mCurrentSchemaId + ")");
          // 获取或创建 KeyboardView
          KeyboardView targetView = mViewCache.get(id);
          if (targetView == null) {
-@@ -197,48 +210,108 @@
+@@ -197,48 +223,108 @@
      }
  
      private String getKeyboardId(String id) {
@@ -211,14 +254,14 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
 +            if (!TextUtils.isEmpty(id) && kbdFileExists(id)) {
 +                Log.w("TAG", "setKeyboard: schema 为空，沿用参数 " + id);
 +                return id;
-+            }
-+            if (!TextUtils.isEmpty(sLoadedKeyboard) && kbdFileExists(sLoadedKeyboard)) {
-+                Log.w("TAG", "setKeyboard: schema 为空，保持上次键盘 " + sLoadedKeyboard);
-+                return sLoadedKeyboard;
              }
 -            id = Rime.getRimeStatus().getSchemaId();
 -            if (TextUtils.isEmpty(id))
 -                id = Function.getPref(getContext()).getString("select_schema_id", "");
++            if (!TextUtils.isEmpty(sLoadedKeyboard) && kbdFileExists(sLoadedKeyboard)) {
++                Log.w("TAG", "setKeyboard: schema 为空，保持上次键盘 " + sLoadedKeyboard);
++                return sLoadedKeyboard;
++            }
 +            Log.w("TAG", "setKeyboard: schema 为空且无可用键盘，暂不重算");
 +            return "qwerty36";
          }
@@ -287,8 +330,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
 +        Log.w("TAG", "setKeyboard:fallback qwerty36");
 +        return rememberKeyboard(schemaId, "qwerty36");
 +    }
- 
--        return "qwerty36";
++
 +    private boolean kbdFileExists(String name) {
 +        if (TextUtils.isEmpty(name)) return false;
 +        try {
@@ -305,7 +347,8 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
 +    private boolean kbdUsable(String name) {
 +        return !TextUtils.isEmpty(name) && (mViewCache.containsKey(name) || kbdFileExists(name));
 +    }
-+
+ 
+-        return "qwerty36";
 +    private static String stripLua(String s) {
 +        if (s == null) return "";
 +        return s.endsWith(".lua") ? s.substring(0, s.length() - 4) : s;
@@ -328,7 +371,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
      }
  
      @Override
-@@ -258,6 +331,15 @@
+@@ -258,6 +344,15 @@
              if (BuildConfig.DEBUG)
                  e.printStackTrace();
          }
@@ -344,7 +387,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
          if (!name.endsWith(".lua"))
              return null;
          try {
-@@ -286,7 +368,13 @@
+@@ -286,7 +381,13 @@
              return null;
          if (filename.startsWith("/"))
              return filename;
@@ -360,8 +403,8 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
  
      public void invalidateComposingKeys() {
 diff -ruN a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
---- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 16:35:09.023643344 +0800
-+++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 19:45:14.509008344 +0800
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 20:08:37.027405776 +0800
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 20:08:37.029405843 +0800
 @@ -303,10 +303,31 @@
      }
  
