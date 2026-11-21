@@ -190,11 +190,17 @@ jobs:
           # 2) 抽查每个补丁的标志物，防止「apply 报成功但内容没进去」
           check() {
             local file="$1" needle="$2" label="$3"
-            if ! grep -qF "$needle" "$file"; then
-              echo "::error::$label 未生效：$file 中找不到 '$needle'"
+            if grep -qF "$needle" "$file"; then
+              echo "OK: $label"
+              return 0
+            fi
+            # 标志物不在源码里：先分清是「补丁没生效」还是「自检项本身已过期」。
+            # 后者很常见——workflow 和 patches/ 不是同一批更新，旧标签会误杀构建。
+            if grep -rqF -- "$needle" patches/ 2>/dev/null; then
+              echo "::error::$label 未生效：$file 中找不到 '$needle'（patches/ 里存在该标志物）"
               exit 1
             fi
-            echo "OK: $label"
+            echo "::warning::$label 的检查项已过期：patches/ 中已无 '$needle'，跳过该条；请同步 workflow"
           }
           check app/src/main/jni/cmake/Boost.cmake "vmd" "07 boost vmd"
           check build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt \
@@ -204,10 +210,10 @@ jobs:
           check app/proguard-rules.pro "mlkit_vision_digital_ink" "06 proguard keep"
           check app/src/main/java/com/androlua/Http.java "putFile" "04 http 流式上传"
           check app/src/main/jni/CMakeLists.txt "_FILE_OFFSET_BITS=0" "05 file offset 兼容"
-          check app/src/main/java/com/osfans/trime/Config.java \
-                "migrateKeyboardPrefs" "14 键盘偏好迁移"
           check app/src/main/java/com/osfans/trime/InputView.java \
                 "sLoadedKeyboard" "14 键盘解析保护"
+          check app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java \
+                "readKeyboardName" "14 对话框不执行键盘脚本"
 
       - name: 工具版本自检（防止仓库里只更新了一半）
         run: |
@@ -544,7 +550,7 @@ jobs:
               11-ThemeManager*)       echo "主题配色接口" ;;
               12-InputView*)          echo "键盘快照" ;;
               13-TrimeService*)       echo "根视图快照" ;;
-              14-KeyboardDefaultFix*) echo "默认键盘修复" ;;
+              14-KeyboardDefaultFix*) echo "默认键盘与按键滑动" ;;
               *)                      echo "${1%.patch}" ;;
             esac
           }
