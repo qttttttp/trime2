@@ -1,0 +1,793 @@
+diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	1970-01-01 08:00:00.000000000 +0800
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-21 17:27:11.047289312 +0800
+@@ -0,0 +1,789 @@
++/*
++ * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
++ *
++ * 目的：让运行在【同一进程、不同 Lua 虚拟机】里的“主题工作室”脚本，
++ * 直接拿到输入法已经加载好的当前主题全部数据（样式表 + 配色 + 当前键盘布局），
++ * 而不必在工具自己的沙箱里重新执行主题 Lua（那会因为缺少真机环境而处处崩溃/补洞）。
++ *
++ * 原理：Java 静态字段跨同进程的所有 LuaJ Globals 共享。本类只做一件事：
++ *   读取 ThemeManager.mGlobals / mColor 及当前键盘 Globals，
++ *   把其中的纯数据（数字/字符串/布尔/table）递归序列化成 Lua 字面量字符串返回。
++ * 全程【不调用任何 native 引擎方法、不执行键盘脚本的真机逻辑】，
++ * 因此绝对安全，pcall 之外也不会有 native 崩溃风险。
++ *
++ * 兜底：若输入法尚未加载主题（静态字段为空），用与输入法同源的纯加载链补齐：
++ *   主题/配色 → ThemeManager.setTheme()（TrimeService 初始化用的同一方法）
++ *   键盘      → 独立 Globals + 键盘目录 finder 纯加载当前键盘脚本
++ *
++ * 用法（工具端 Lua）：
++ *   local ok, data = pcall(function()
++ *     return loadstring(luajava.bindClass("com.osfans.trime.theme.ThemeDataBridge").snapshot())()
++ *   end)
++ *   -- data.style    : 完整样式表（配色 mColor 展开 __index 继承链）
++ *   -- data.keyboard : 当前键盘 { rows=..., key_width=..., key_height=..., name=... }
++ *   -- data.meta     : { theme=..., style=..., keyboard=..., source=... }
++ */
++package com.osfans.trime.theme;
++
++import android.content.SharedPreferences;
++import android.text.TextUtils;
++import android.text.Spanned;
++import android.text.style.ImageSpan;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.TextView;
++
++import com.androlua.LuaApplication;
++import com.osfans.trime.Config;
++import com.osfans.trime.InputView;
++import com.osfans.trime.TrimeService;
++import com.osfans.trime.util.Function;
++
++import org.luaj.Globals;
++import org.luaj.LuaTable;
++import org.luaj.LuaValue;
++import org.luaj.lib.ResourceFinder;
++import org.luaj.lib.jse.JsePlatform;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.InputStream;
++import java.util.IdentityHashMap;
++
++public final class ThemeDataBridge {
++    private ThemeDataBridge() {}
++
++    private static final int MAX_DEPTH = 24;        // 递归深度上限
++    private static final int MAX_NODES = 20000;     // 节点数上限，防止超大表卡死
++    private static final int MAX_KBD_NODES = 200000; // 键盘子树单独配额：rows 展开后节点多，不能与样式表抢额度
++    private static final int MAX_STR = 4096;        // 单个字符串最大长度
++
++    /**
++     * 键盘渲染只依赖这些字段。
++     * 以前直接把整个键盘 Globals 序列化：里面还挂着 _G、package、以及主题的所有全局变量，
++     * 节点数两万很快就用光，按 keys() 的遍历顺序 rows 往往排在后面，直接被配额跳过。
++     * 结果 bridgeData.keyboard 只有 name 没有 rows —— 工具判定"桥接键盘不可用"，
++     * 退回解析 keyboards/*.lua，解析出的又不是真机正在用的那个文件（常见是 qwerty36），
++     * 于是预览显示 36 键。逐字段导出后 rows 必定完整。
++     */
++    private static final String[] KBD_FIELDS = {
++            "name", "rows",
++            "key_width", "key_height", "key_width_landscape", "key_height_landscape",
++            "vertical_gap", "horizontal_gap", "columns", "row_height", "keyboard_height",
++            "key_text_size", "label_text_size", "symbol_text_size",
++            "key_text_offset_x", "key_text_offset_y",
++            "key_symbol_offset_x", "key_symbol_offset_y",
++            "label_text_offset_x", "label_text_offset_y",
++            "key_text", "key_symbol", "label_text", "label_symbol"
++    };
++
++    private static final class Counter {
++        int nodes = 0;
++        int limit = MAX_NODES;
++        Counter() {}
++        Counter(int limit) { this.limit = limit; }
++    }
++
++    /**
++     * 生成主题数据快照（Lua 字面量字符串）。任何异常都返回一个合法的空表字符串，
++     * 保证工具端 loadstring 永远成功、绝不因本方法崩溃。
++     */
++    public static String snapshot() {
++        // 确保数据已加载（输入法没启动过时用同源纯加载补齐）
++        ensureLoaded();
++
++        StringBuilder out = new StringBuilder();
++        out.append("local d={}\n");
++        try {
++            LuaTable color = safeColor();
++            LuaTable globals = safeGlobals();
++            Globals kbd = safeKeyboardGlobals();
++
++            // ---- 1. 样式表：主题根（继承层）+ 配色覆盖，展开 __index 合并 ----
++            out.append("d.style=");
++            if (color != null) {
++                Counter c = new Counter();
++                StringBuilder merged = new StringBuilder();
++                merged.append("{");
++                IdentityHashMap<LuaValue, Boolean> seen = new IdentityHashMap<LuaValue, Boolean>();
++                writeEntries(merged, globals, seen, 1, c);   // 继承层先写
++                writeEntries(merged, color, seen, 1, c);     // 配色覆盖
++                merged.append("}");
++                out.append(merged);
++            } else if (globals != null) {
++                Counter c = new Counter();
++                writeValue(out, globals, new IdentityHashMap<LuaValue, Boolean>(), 0, c);
++            } else {
++                out.append("{}");
++            }
++            out.append("\n");
++
++            // ---- 2. 当前键盘数据：只导出渲染需要的字段（见 KBD_FIELDS 注释） ----
++            out.append("d.keyboard=");
++            if (kbd != null) {
++                Counter c = new Counter(MAX_KBD_NODES);
++                writeKeyboardSubset(out, kbd, c);
++            } else {
++                out.append("{}");
++            }
++            out.append("\n");
++
++            // ---- 3. 元信息 ----
++            String kbdId = currentKeyboardId();   // 只读偏好，一次算好复用
++            out.append("d.meta={\n");
++            out.append("theme=").append(luaString(safeStr(Config.getTheme()))).append(",\n");
++            out.append("style=").append(luaString(safeStr(Config.getStyle()))).append(",\n");
++            out.append("keyboard=").append(luaString(currentKeyboardName(kbd, kbdId))).append(",\n");
++            // 键盘真实文件 id（DefaultSharedPreferences 里存的是去掉 .lua 的文件名，如 wanxiang）。
++            // keyboard 字段是脚本 name 显示名（如"万象"），两者不一致；写回主题必须用这个 id。
++            out.append("keyboard_id=").append(luaString(kbdId)).append(",\n");
++            // 与输入法同源求出的键盘文件名：在真机主题 Globals 里调 get_keyboard(设置id, alphabet)。
++            // 这才是"当前键盘"的权威值，显示名反查、偏好猜测都只是它的降级替代。
++            String kbdFile = themeKeyboardFile();
++            out.append("keyboard_file=").append(luaString(kbdFile)).append(",\n");
++            out.append("keyboard_file_source=").append(luaString(lastKeyboardFileSource)).append(",\n");
++            out.append("alphabet=").append(luaString(TextUtils.isEmpty(lastAlphabet) ? schemaAlphabet() : lastAlphabet)).append(",\n");
++            // 这个 id 是从哪个偏好键读到的（诊断用：键名能说明真机到底把键盘记在哪）
++            out.append("keyboard_pref=").append(luaString(safeStr(lastKeyboardPrefKey))).append(",\n");
++            out.append("source=").append(luaString(sourceOf(color, globals, kbd))).append(",\n");
++            // 键盘数据来源：inputview=输入法内存中正在用的键盘；fallback=桥接自己按 id 加载的脚本
++            out.append("keyboard_source=").append(luaString(lastKeyboardSource)).append(",\n");
++            out.append("keyboard_dir=").append(luaString(safeStr(safeKeyboardDir()))).append(",\n");
++            out.append("kbd_rows=").append(lastKbdRows).append(",\n");
++            out.append("kbd_keys=").append(lastKbdKeys).append(",\n");
++            out.append("inputview_api=").append(luaString(probeApis(InputView.class))).append(",\n");
++            out.append("config_api=").append(luaString(probeApis(Config.class))).append(",\n");
++            out.append("theme_kbd_decl=").append(luaString(keyboardFromThemeRoot())).append("\n");
++            out.append("}\n");
++        } catch (Throwable t) {
++            out.setLength(0);
++            out.append("local d={style={},keyboard={},meta={}}");
++        }
++        out.append("\nreturn d");
++        return out.toString();
++    }
++
++    private static String sourceOf(LuaTable color, LuaTable globals, Globals kbd) {
++        StringBuilder s = new StringBuilder();
++        s.append(color != null ? "color" : (globals != null ? "globals" : "none"));
++        s.append("+");
++        s.append(kbd != null ? "keyboard" : "no-keyboard");
++        return s.toString();
++    }
++
++    private static String currentKeyboardName(Globals kbd, String fallbackId) {
++        try {
++            if (kbd != null) {
++                LuaValue n = kbd.get("name");
++                if (n != null && n.isstring() && !TextUtils.isEmpty(n.tojstring())) return n.tojstring();
++            }
++        } catch (Throwable ignored) {}
++        return fallbackId == null ? "" : fallbackId;   // 只读偏好，避免 Config.getKeyboard() 求值回写污染
++    }
++
++    /**
++     * 当前键盘的真实文件 id：DefaultSharedPreferences 里 key=<主题>_<schema>_keyboard，
++     * 值就是去掉 .lua 的文件名（如 wanxiang）——真机 KeyboardDialog 选键盘时写入。
++     *
++     * 【只读】绝不调用 Config.getKeyboard(x)。该方法是"键不存在 → 按主题脚本求值 → 回写偏好"
++     * 的接口：工具进程里主题 VM 不完整，求值必然落到 qwerty36 并写进偏好。若写坏的是
++     * "<主题>_.default_keyboard"，而真机读的是 "<主题>_<schema>_keyboard"，两者不是同一个键，
++     * 结果就是真机永远正常、工具永远显示 36 键，重装重进都不恢复。
++     * 这里只 getString，不触发任何求值/回写；读不到返回空，由 Lua 用内存键盘对象的
++     * 显示名反查真实文件名（那条路不经过偏好，不受污染影响）。
++     */
++    private static String currentKeyboardId() {
++        try {
++            SharedPreferences pref = Function.getPref(LuaApplication.getInstance());
++            String theme = safeStr(Config.getTheme());
++            String schema = "";
++            try { schema = pref.getString("select_schema_id", ""); } catch (Throwable ignored) {}
++
++            // ① 精确键：真机 Config.getKeyboard(schema) 命中/求值后回写的就是这个，
++            //    只要真机加载过一次键盘，它就应该存在。
++            if (!TextUtils.isEmpty(theme) && !TextUtils.isEmpty(schema)) {
++                String k0 = theme + "_" + schema + "_keyboard";
++                String v = pref.getString(k0, "");
++                if (!TextUtils.isEmpty(v)) {
++                    lastKeyboardPrefKey = k0;
++                    return v;
++                }
++            }
++            // ② 枚举全部 *_keyboard 按键名打分。不能只按主题前缀过滤：
++            //    工具进程的 Config.getTheme() 可能取到别的值，精确键不一定拼得对；
++            //    而真机写下的那条键一定在偏好里，靠打分能把它挑出来。
++            //    评分：主题前缀 +4 / 含 schema +3 / 非 qwerty36 +2 / 非 .default 镜像键 +1
++            String best = "", bestKey = "";
++            int bestScore = -1;
++            for (java.util.Map.Entry<String, ?> e : pref.getAll().entrySet()) {
++                String k = e.getKey();
++                if (k == null || !k.endsWith("_keyboard")) continue;
++                Object ov = e.getValue();
++                if (!(ov instanceof String)) continue;
++                String v = (String) ov;
++                if (TextUtils.isEmpty(v)) continue;
++                int score = 0;
++                if (!TextUtils.isEmpty(theme) && k.startsWith(theme + "_")) score += 4;
++                if (!TextUtils.isEmpty(schema) && k.contains("_" + schema + "_")) score += 3;
++                if (!"qwerty36".equals(v)) score += 2;
++                if (!k.contains("_.default")) score += 1;
++                if (score > bestScore) { bestScore = score; best = v; bestKey = k; }
++            }
++            if (!TextUtils.isEmpty(best)) {
++                lastKeyboardPrefKey = bestKey;
++                return best;
++            }
++        } catch (Throwable ignored) {}
++        return "";
++    }
++
++    /** 最近一次命中的偏好键名（诊断用，快照里带出去） */
++    private static String lastKeyboardPrefKey = "";
++
++    // ============ 数据获取 + 同源兜底 ============
++
++    /** 若输入法尚未加载主题，用同源方法补齐 ThemeManager 的静态字段 */
++    private static void ensureLoaded() {
++        try {
++            Globals g = ThemeManager.getGlobals();
++            if (g == null || g.isnil() || ThemeManager.getColor() == null) {
++                String theme = Config.getTheme();
++                if (!TextUtils.isEmpty(theme)) {
++                    // 这正是 TrimeService.onCreate 初始化主题时调用的方法，纯加载、不碰 native 引擎
++                    ThemeManager.setTheme(theme);
++                }
++            }
++        } catch (Throwable ignored) {}
++    }
++
++    private static LuaTable safeColor() {
++        try {
++            LuaTable c = ThemeManager.getColor();
++            return (c != null && !c.isnil()) ? c : null;
++        } catch (Throwable t) { return null; }
++    }
++
++    private static LuaTable safeGlobals() {
++        try {
++            Globals g = ThemeManager.getGlobals();
++            return (g != null && !g.isnil()) ? g : null;
++        } catch (Throwable t) { return null; }
++    }
++
++    /**
++     * 当前键盘 Globals：
++     *   ① InputView 的静态快照（输入法已加载键盘时必然有值）
++     *   ② 独立 Globals + 键盘目录 finder 纯加载当前键盘脚本
++     */
++    private static Globals safeKeyboardGlobals() {
++        try {
++            Globals g = InputView.getCurrentKeyboardGlobals();
++            if (g != null) { lastKeyboardSource = "inputview"; return g; }
++        } catch (Throwable ignored) {}
++        Globals g2 = loadKeyboardNow();
++        lastKeyboardSource = (g2 != null) ? "fallback" : "none";
++        return g2;
++    }
++
++    /** 键盘数据来源，诊断用 */
++    private static String lastKeyboardSource = "none";
++
++    private static String safeKeyboardDir() {
++        try { return Config.getKeyboardDir(); } catch (Throwable t) { return ""; }
++    }
++
++    // ============ 当前键盘文件名：与输入法同源求解 ============
++
++    /** 本次键盘文件的判定来源，诊断用 */
++    private static String lastKeyboardFileSource = "none";
++    /** 本次求值用的 alphabet，诊断用 */
++    private static String lastAlphabet = "";
++
++    /**
++     * 当前键盘文件名（= keyboards/<name>.lua 的 <name>），不靠猜，直接问主题自己。
++     *
++     * 输入法里键盘是怎么定的？主题根 main.lua 定义：
++     *     function get_keyboard(id, alphabet)
++     *         if id == "" then return keyboard else return id end
++     *     end
++     * 输入法加载键盘时，用【设置里的键盘选择】当 id、【当前方案的 alphabet】当 alphabet
++     * 调用它，返回的文件名就是当前键盘。所以最准确的方式不是复刻这段分支，而是
++     * 【拿真机那份主题 Globals，用同样的参数把 get_keyboard 自己调一遍】——
++     * 函数换实现、加分支、读别的全局变量，都不影响结果。
++     *
++     * 顺序（与 InputView.getKeyboardId 一致）：
++     *   ① 偏好里的当前键盘（<主题>_<方案>_keyboard，手选值或 auto 解析后的回写值，且文件存在）
++     *   ② auto：方案名同名键盘文件
++     *   ③ 真机主题 Globals 里的 get_keyboard（完全同源）
++     *   ④ 同一个 Globals 里的 keyboard 字段（get_keyboard 缺失时的等价物）
++     *   ⑤ 偏好兜底（打分，低可信）
++     */
++    private static String themeKeyboardFile() {
++        // 与 InputView.getKeyboardId() 的新顺序保持一致：
++        //   ① 偏好里已有当前键盘（文件存在）
++        //   ② auto：方案名同名键盘文件（如 wanxiang.lua）
++        //   ③ 主题 get_keyboard(id, alphabet)
++        // 少任何一层，工具就会和真机在「存在同名文件」时给出不同答案。
++        try {
++            String schema = currentSchemaId();
++            if (!TextUtils.isEmpty(schema)) {
++                String k0 = safeStr(Config.getTheme()) + "_" + schema + "_keyboard";
++                try {
++                    SharedPreferences pref = Function.getPref(LuaApplication.getInstance());
++                    String v = pref.getString(k0, "");
++                    if (!TextUtils.isEmpty(v)) {
++                        String f = v.endsWith(".lua") ? v.substring(0, v.length() - 4) : v;
++                        if (new File(safeKeyboardDir(), f + ".lua").exists()) {
++                            lastKeyboardPrefKey = k0;
++                            lastKeyboardFileSource = "偏好记录（当前键盘）";
++                            return f;
++                        }
++                    }
++                } catch (Throwable ignored) {}
++                if (new File(safeKeyboardDir(), schema + ".lua").exists()) {
++                    lastKeyboardFileSource = "auto 方案同名 " + schema + ".lua";
++                    return schema;
++                }
++            }
++        } catch (Throwable ignored) {}
++
++        try {
++            Globals g = ThemeManager.getGlobals();
++            if (g != null && !g.isnil()) {
++                String id = settingKeyboardId();
++                String alpha = schemaAlphabet();
++                lastAlphabet = alpha;
++                LuaValue gk = g.get("get_keyboard");
++                if (gk != null && gk.isfunction()) {
++                    try {
++                        LuaValue ret = gk.call(LuaValue.valueOf(id), LuaValue.valueOf(alpha));
++                        if (ret != null && ret.isstring()) {
++                            String s = ret.tojstring().trim();
++                            if (!TextUtils.isEmpty(s)) {
++                                lastKeyboardFileSource = "get_keyboard(id=\"" + id + "\", alphabet)";
++                                return s;
++                            }
++                        }
++                    } catch (Throwable ignored) {}
++                }
++                LuaValue kv = g.get("keyboard");
++                if (kv != null && kv.isstring()) {
++                    String s = kv.tojstring().trim();
++                    if (!TextUtils.isEmpty(s)) {
++                        lastKeyboardFileSource = "主题 Globals.keyboard";
++                        return s;
++                    }
++                }
++            }
++        } catch (Throwable ignored) {}
++
++        String pid = currentKeyboardId();   // 只读偏好，绝不走 Config.getKeyboard
++        if (!TextUtils.isEmpty(pid)) {
++            // 镜像键 <主题>_.default_keyboard 是 Config.getKeyboard() 无参调用的产物，
++            // 不能代表真机当前键盘，只在别无来源时退而求其次。
++            lastKeyboardFileSource = (lastKeyboardPrefKey.contains("_.default"))
++                    ? "偏好镜像键（低可信）" : "偏好 " + lastKeyboardPrefKey;
++            return pid;
++        }
++        String decl = keyboardFromThemeRoot();
++        if (!TextUtils.isEmpty(decl)) {
++            lastKeyboardFileSource = "主题根 main.lua keyboard=";
++            return decl;
++        }
++        return "";
++    }
++
++    /**
++     * 当前方案 id，用于「方案同名键盘」判定。
++     * 先反射问 native（不新增编译期依赖），取不到再退回偏好 select_schema_id。
++     */
++    private static String currentSchemaId() {
++        String[] classes = {"com.osfans.trime.Rime", "com.osfans.trime.core.Rime"};
++        String[] methods = {"getCurrentRimeSchema", "getCurrentSchemaId"};
++        for (String cn : classes) {
++            try {
++                Class<?> c = Class.forName(cn);
++                String v = tryStaticString(c, methods);
++                if (!TextUtils.isEmpty(v) && !".default".equals(v)) return v;
++            } catch (Throwable ignored) {}
++        }
++        try {
++            String v = Function.getPref(LuaApplication.getInstance()).getString("select_schema_id", "");
++            if (!TextUtils.isEmpty(v)) return v;
++        } catch (Throwable ignored) {}
++        return "";
++    }
++
++    /**
++     * 设置里"键盘"这一项的值。空 / "auto" 都表示跟随主题，与主题 get_keyboard 的
++     * `if id == "" then return keyboard` 分支对应。
++     */
++    private static String settingKeyboardId() {
++        try {
++            SharedPreferences pref = Function.getPref(LuaApplication.getInstance());
++            String v = pref.getString("keyboard", "");
++            if (v == null) return "";
++            v = v.trim();
++            if ("auto".equalsIgnoreCase(v)) return "";
++            return v;
++        } catch (Throwable ignored) {}
++        return "";
++    }
++
++    /**
++     * 当前方案的 alphabet（如 "abcdefghijklmnopqrstuvwxyz" 或含数字的设计）。
++     * 主题的 get_keyboard 若按 alphabet 选键盘（中英/数字布局），这个参数决定结果。
++     * 取值依次尝试源码里的静态方法，最后退回纯字母表。
++     */
++    private static String schemaAlphabet() {
++        String[] classes = {"com.osfans.trime.Rime", "com.osfans.trime.core.Rime"};
++        String[] methods = {"getSchemaAlphabet", "getAlphabet", "getCurrentAlphabet"};
++        for (String cn : classes) {
++            try {
++                Class<?> c = Class.forName(cn);
++                String v = tryStaticString(c, methods);
++                if (!TextUtils.isEmpty(v)) return v;
++            } catch (Throwable ignored) {}
++        }
++        String v2 = tryStaticString(Config.class, methods);
++        if (!TextUtils.isEmpty(v2)) return v2;
++        // 取不到就用纯字母表：绝大多数主题的 alphabet 分支是死代码（写在 return 之后），
++        // 真用到它的主题会按"含数字/含斜杠"区分布局，这里给最中性的英文表最安全。
++        return "abcdefghijklmnopqrstuvwxyz";
++    }
++
++    private static String tryStaticString(Class<?> cls, String[] names) {
++        for (String n : names) {
++            try {
++                java.lang.reflect.Method m = cls.getDeclaredMethod(n);
++                m.setAccessible(true);
++                Object r = m.invoke(null);
++                if (r instanceof CharSequence) {
++                    String s = r.toString().trim();
++                    if (!TextUtils.isEmpty(s)) return s;
++                }
++            } catch (Throwable ignored) {}
++        }
++        return "";
++    }
++
++    /** 主题根 main.lua 里 keyboard= 的声明值（纯文件读取，不执行脚本） */
++    private static String keyboardFromThemeRoot() {
++        try {
++            String kbdDir = safeKeyboardDir();
++            if (TextUtils.isEmpty(kbdDir)) return "";
++            File dir = new File(kbdDir);
++            File themeDir = dir.getParentFile();
++            if (themeDir == null) return "";
++            File main = new File(themeDir, "main.lua");
++            if (!main.exists()) return "";
++            String src = readText(main);
++            java.util.regex.Matcher m = java.util.regex.Pattern
++                    .compile("keyboard\\s*=\\s*[\"']([^\"']+)[\"']").matcher(src);
++            if (m.find()) return m.group(1);
++        } catch (Throwable ignored) {}
++        return "";
++    }
++
++    private static String readText(File f) {
++        try {
++            java.io.BufferedReader r = new java.io.BufferedReader(
++                    new java.io.InputStreamReader(new FileInputStream(f), "UTF-8"));
++            StringBuilder sb = new StringBuilder();
++            char[] buf = new char[4096];
++            int n;
++            while ((n = r.read(buf)) > 0) sb.append(buf, 0, n);
++            r.close();
++            return sb.toString();
++        } catch (Throwable t) { return ""; }
++    }
++
++    /** 兜底：用独立 Globals + 多目录 finder 纯加载当前键盘脚本（纯数据，安全） */
++    private static Globals loadKeyboardNow() {
++        try {
++            // 文件名统一由 themeKeyboardFile() 给：它优先在真机主题 Globals 里调 get_keyboard，
++            // 与输入法内部判定完全同源；拿不到才读偏好镜像键 / 主题根声明。
++            String name = themeKeyboardFile();
++            if (TextUtils.isEmpty(name)) return null;   // 不猜，交给工具侧用主题根判定
++            name = name.replaceAll("\\.lua$", "");   // 偏好里可能存了带后缀的 id，避免拼成 xx.lua.lua
++            final String kbdDir = Config.getKeyboardDir();
++            if (TextUtils.isEmpty(kbdDir)) return null;
++            File kd = new File(kbdDir);
++            final File themeDir = kd.getParentFile();
++
++            // 用标准 Globals（含全部标准库），再把真机对象替换成安全桩
++            Globals g = JsePlatform.standardGlobals();
++            g.finder = new ResourceFinder() {
++                /**
++                 * 键盘脚本里的 require "keys" / require "allk" 等，目标文件通常在【主题根】，
++                 * 不在 keyboards/ 下。旧实现只搜键盘目录，require 必然失败 → allk 为空 →
++                 * rows 里的键名解析不出来 → 渲染成朴素布局。这里按真机的搜索顺序补齐。
++                 */
++                @Override
++                public InputStream findResource(String filename) {
++                    try {
++                        File f = new File(kbdDir, filename);
++                        if (f.exists()) return new FileInputStream(f);
++                        if (themeDir != null) {
++                            File f2 = new File(themeDir, filename);
++                            if (f2.exists()) return new FileInputStream(f2);
++                            File f3 = new File(new File(themeDir, "keyboards"), filename);
++                            if (f3.exists()) return new FileInputStream(f3);
++                        }
++                    } catch (Throwable ignored) {}
++                    return null;
++                }
++                public String findFile(String filename) {
++                    if (filename != null && filename.startsWith("/")) return filename;
++                    File f = new File(kbdDir, filename == null ? "" : filename);
++                    if (f.exists()) return f.getAbsolutePath();
++                    if (themeDir != null) {
++                        File f2 = new File(themeDir, filename == null ? "" : filename);
++                        if (f2.exists()) return f2.getAbsolutePath();
++                    }
++                    return f.getAbsolutePath();
++                }
++            };
++            // 注入常见真机全局为 no-op 桩，保证键盘脚本顶部的 import/gesture 等
++            // 初始化调用不中断，让后面的 rows/allk 纯数据定义能执行到。
++            final LuaValue noop = new org.luaj.LuaFunction() {
++                @Override public LuaValue call() { return LuaValue.NIL; }
++                @Override public LuaValue call(LuaValue a) { return LuaValue.NIL; }
++                @Override public LuaValue call(LuaValue a, LuaValue b) { return LuaValue.NIL; }
++                @Override public LuaValue call(LuaValue a, LuaValue b, LuaValue c) { return LuaValue.NIL; }
++            };
++            String[] stubs = {"import", "service", "this", "gesture", "luajava",
++                    "PreferenceManager", "LuaApplication", "activity", "context"};
++            for (String s : stubs) g.set(LuaValue.valueOf(s), noop);
++            LuaValue func = g.loadfilex(name + ".lua");
++            if (func != null && func.isfunction()) func.call();
++            return g;
++        } catch (Throwable t) {
++            return null;
++        }
++    }
++
++    /**
++     * 列出某个类里"名字与键盘相关"的静态方法签名（只读反射元数据，不调用、无副作用）。
++     * 用途：不同 trime 版本保存当前键盘文件名的位置不一样，先看清有哪些 API 可用，
++     * 再决定是读字段还是调方法，避免继续靠猜。
++     */
++    private static String probeApis(Class<?> cls) {
++        if (cls == null) return "";
++        StringBuilder sb = new StringBuilder();
++        try {
++            for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
++                if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
++                String n = m.getName().toLowerCase();
++                if (!(n.contains("keyboard") || n.contains("globals") || n.contains("schema"))) continue;
++                sb.append(m.getName()).append("() ");
++            }
++        } catch (Throwable t) { return "ERR:" + t.getClass().getSimpleName(); }
++        return sb.length() == 0 ? "" : sb.toString().trim();
++    }
++
++    private static String safeStr(String s) { return s == null ? "" : s; }
++
++    // ============ 序列化 ============
++
++    /**
++     * 只导出键盘渲染需要的字段（KBD_FIELDS）。rows 与键里的共享表按栈式 seen 处理：
++     * 同一张表被多处引用会重复输出（体积可控），只有真正的环才截断成 {}，
++     * 因此不会出现"第一个键完整、后面同样的键全空"的情况。
++     */
++    private static void writeKeyboardSubset(StringBuilder out, Globals kbd, Counter c) {
++        out.append("{");
++        IdentityHashMap<LuaValue, Boolean> seen = new IdentityHashMap<LuaValue, Boolean>();
++        int rows = 0, keys = 0;
++        for (String f : KBD_FIELDS) {
++            LuaValue v;
++            try { v = kbd.get(f); } catch (Throwable t) { continue; }
++            if (v == null || v.isnil() || v.isfunction() || v.isuserdata() || v.isthread()) continue;
++            if ("rows".equals(f) && v.istable()) {
++                rows = v.checktable().length();
++                try {
++                    for (int i = 1; i <= rows; i++) {
++                        LuaValue row = v.checktable().get(i);
++                        if (row != null && row.istable()) keys += row.checktable().length();
++                    }
++                } catch (Throwable ignored) {}
++            }
++            out.append("[").append(luaString(f)).append("]=");
++            writeValue(out, v, seen, 0, c);
++            out.append(",");
++        }
++        out.append("}");
++        lastKbdRows = rows;
++        lastKbdKeys = keys;
++    }
++
++    /** 最近一次导出的键盘行数 / 键数（诊断用） */
++    private static int lastKbdRows = 0, lastKbdKeys = 0;
++
++    private static void writeValue(StringBuilder out, LuaValue v,
++                                   IdentityHashMap<LuaValue, Boolean> seen,
++                                   int depth, Counter c) {
++        c.nodes++;
++        if (c.nodes > c.limit || depth > MAX_DEPTH) { out.append("nil"); return; }
++        try {
++            if (v.isnil()) { out.append("nil"); return; }
++            if (v.isboolean()) { out.append(v.toboolean() ? "true" : "false"); return; }
++            if (v.isnumber()) { out.append(numLit(v.todouble())); return; }
++            if (v.isstring()) { out.append(luaString(clipStr(v.tojstring()))); return; }
++            if (v.istable()) {
++                LuaTable t = v.checktable();
++                if (seen.containsKey(t)) { out.append("{}"); return; }  // 循环引用截断
++                seen.put(t, Boolean.TRUE);
++                out.append("{");
++                writeEntries(out, t, seen, depth + 1, c);
++                out.append("}");
++                seen.remove(t);
++                return;
++            }
++            // function / userdata / thread 等不可序列化
++            out.append("nil");
++        } catch (Throwable t) {
++            out.append("nil");
++        }
++    }
++
++    private static void writeEntries(StringBuilder out, LuaTable tbl,
++                                     IdentityHashMap<LuaValue, Boolean> seen,
++                                     int depth, Counter c) {
++        if (tbl == null || depth > MAX_DEPTH || c.nodes > c.limit) return;
++        LuaValue[] keys = null;
++        try { keys = tbl.keys(); } catch (Throwable t) { return; }
++        if (keys == null) return;
++        for (LuaValue k : keys) {
++            if (k == null || c.nodes > c.limit) continue;
++            LuaValue v;
++            try { v = tbl.get(k); } catch (Throwable t) { continue; }
++            if (v == null || v.isnil() || v.isfunction() || v.isuserdata() || v.isthread()) continue;
++            String keyLit = null;
++            if (k.isstring()) keyLit = "[" + luaString(k.tojstring()) + "]";
++            else if (k.isnumber()) keyLit = "[" + numLit(k.todouble()) + "]";
++            if (keyLit == null) continue;
++            out.append(keyLit).append("=");
++            writeValue(out, v, seen, depth + 1, c);
++            out.append(",");
++        }
++    }
++
++    private static String clipStr(String s) {
++        if (s == null) return "";
++        return s.length() > MAX_STR ? s.substring(0, MAX_STR) : s;
++    }
++
++    private static String numLit(double d) {
++        if (Double.isNaN(d) || Double.isInfinite(d)) return "0";
++        if (d == Math.floor(d) && d >= -9007199254740992L && d <= 9007199254740992L)
++            return Long.toString((long) d);
++        return Double.toString(d);
++    }
++
++    private static String luaString(String s) {
++        if (s == null) return "\"\"";
++        StringBuilder b = new StringBuilder(s.length() + 8);
++        b.append('"');
++        for (int i = 0; i < s.length(); i++) {
++            char ch = s.charAt(i);
++            switch (ch) {
++                case '\\': b.append("\\\\"); break;
++                case '"':  b.append("\\\""); break;
++                case '\n': b.append("\\n"); break;
++                case '\r': b.append("\\r"); break;
++                case '\t': b.append("\\t"); break;
++                case '\b': b.append("\\b"); break;
++                case '\f': b.append("\\f"); break;
++                default:
++                    if (ch < 0x20) b.append(String.format("\\%03d", (int) ch));
++                    else b.append(ch);
++            }
++        }
++        b.append('"');
++        return b.toString();
++    }
++
++    // =====================================================================
++    // 主题工作室数据桥接：读真机【整个 RootInputView】当前显示的所有文本
++    // ---------------------------------------------------------------------
++    // 真机与工具是同一进程、不同 Lua 虚拟机；工具进程里 Service 实例不是
++    // 正在渲染键盘的那个对象，工具侧反射读 View 拿不到。这里在 Java 编译期
++    // 直接持有 TrimeService.onCreate 保存的 RootInputView 静态引用，在 Java 内部
++    // 遍历【整棵树】（键盘 + 工具栏 + 候选栏），把每个 TextView 的最终显示文本与
++    // 是否含 ImageSpan 序列化返回。工具只读字符串，无 native 引擎调用。
++    // =====================================================================
++    public static String dumpRootTexts() {
++        StringBuilder out = new StringBuilder();
++        try {
++            View root = TrimeService.getCurrentRootView();
++            if (root == null) {
++                out.append("ERR: RootInputView 为空（输入法视图尚未就绪？）");
++                return out.toString();
++            }
++            String cls = root.getClass().getName();
++            out.append("ROOT: ").append(cls).append('\n');
++            walkView(root, out, 0, new int[]{0}, "");
++            out.append("---- DONE ----");
++        } catch (Throwable t) {
++            out.append("ERR: ").append(t);
++        }
++        return out.toString();
++    }
++
++    /** 兼容别名：早期工具端调用此方法，实际返回整个 root 的文本 */
++    public static String dumpKeyboardTexts() {
++        return dumpRootTexts();
++    }
++
++    private static void walkView(View v, StringBuilder out, int depth, int[] count, String region) {
++        if (v == null || depth > 22 || count[0] >= 600) return;
++        try {
++            String cname = v.getClass().getName();
++            String shortName = cname.substring(cname.lastIndexOf('.') + 1);
++            // 根据类名推断当前所在区域，标注在每行前，方便对照
++            String here = region;
++            String lc = cname.toLowerCase();
++            if (lc.contains("toolbar")) here = "TOOLBAR";
++            else if (lc.contains("candidate")) here = "CANDIDATE";
++            else if (lc.contains("keyboard") || lc.contains("keyview")) here = "KEYBOARD";
++            else if (lc.contains("composition") || lc.contains("preedit")) here = "COMPOSITION";
++            if (v instanceof TextView) {
++                CharSequence cs = ((TextView) v).getText();
++                boolean img = false;
++                if (cs instanceof Spanned) {
++                    Spanned sp = (Spanned) cs;
++                    img = sp.getSpans(0, sp.length(), ImageSpan.class).length > 0;
++                }
++                String txt = cs == null ? "" : cs.toString().replace("\n", "\\n");
++                out.append('[').append(here.isEmpty() ? "-" : here).append("] ")
++                   .append(pad(depth)).append(shortName)
++                   .append('@').append(v.getLeft()).append(',').append(v.getTop())
++                   .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
++                   .append(img ? " [IMG]" : " [TXT]")
++                   .append(" = [").append(txt).append("]\n");
++                count[0]++;
++            }
++            try {
++                if (v instanceof ViewGroup) {
++                    ViewGroup g = (ViewGroup) v;
++                    int n = g.getChildCount();
++                    for (int i = 0; i < n; i++) {
++                        walkView(g.getChildAt(i), out, depth + 1, count, here);
++                    }
++                }
++            } catch (Throwable ignore) {
++                // 子 View 遍历失败不影响整体
++            }
++        } catch (Throwable ignore) {
++            // 单个 View 读取失败不影响整体遍历
++        }
++    }
++
++    private static String pad(int depth) {
++        StringBuilder s = new StringBuilder();
++        int n = Math.min(depth, 10);
++        for (int i = 0; i < n; i++) s.append("  ");
++        return s.toString();
++    }
++}
