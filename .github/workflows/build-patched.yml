@@ -514,8 +514,8 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 90
 
-      # Release 页面的「更新记录」：只写「这次更新了哪几个功能」，每个功能链到对应补丁，
-      # 完整清单折叠起来，不写长篇说明。
+      # Release 页面的「更新记录」：每个功能写一句「改了什么」，并链到对应补丁，
+      # 完整清单折叠起来。只给名字看不出做了什么，容易误解。
       # 机器可读字段放在 HTML 注释里：页面不显示，但 check job 仍能解析。
       - name: 生成更新记录
         if: startsWith(github.ref, 'refs/tags/') == false
@@ -535,30 +535,44 @@ jobs:
           UP_LINK="[\`${UPSTREAM_SHA:0:7}\`](${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA})"
           BLOB="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${CUR}/patches"
 
-          # 补丁文件名 -> 功能名（只写功能，不写说明；说明看补丁本身）
-          feature() {
+          # 补丁文件名 -> 功能名|一句话改进（只写这一版实际做的事，不写空话）
+          describe() {
             case "$1" in
-              01-voice-asr*)          echo "语音输入与剪贴板" ;;
-              02-font-system-first*)  echo "字体加载" ;;
-              04-http-stream*)        echo "HTTP 流式请求" ;;
-              05-file-offset*)        echo "大文件兼容" ;;
-              06-mlkit-offline*)      echo "离线手写识别" ;;
-              07-boost-vmd*)          echo "Boost 兼容" ;;
-              08-opencc*)             echo "OpenCC 容错" ;;
-              09-runtime-property*)   echo "运行时属性通道" ;;
-              10-ThemeDataBridge*)    echo "主题工作室桥接" ;;
-              11-ThemeManager*)       echo "主题配色接口" ;;
-              12-InputView*)          echo "键盘快照" ;;
-              13-TrimeService*)       echo "根视图快照" ;;
-              14-KeyboardDefaultFix*) echo "默认键盘与按键滑动" ;;
-              *)                      echo "${1%.patch}" ;;
+              01-voice-asr*)          echo "语音输入与剪贴板|语音识别结果直接写入输入框；剪贴板变化改发轻量广播，不再把全文塞进 Intent" ;;
+              02-font-system-first*)  echo "字体加载|优先使用系统已装字体，缺失时才回落到随包字体" ;;
+              04-http-stream*)        echo "HTTP 流式请求|下载改为边收边写盘，大响应不再整块读进内存" ;;
+              05-file-offset*)        echo "大文件兼容|修正 32 位环境的文件偏移，读取大文件不再截断" ;;
+              06-mlkit-offline*)      echo "离线手写识别|首次启动自动安装手写识别模型，离线可用；同步补上混淆保留规则" ;;
+              07-boost-vmd*)          echo "Boost 兼容|补齐 boost vmd 依赖，NDK 构建不再缺头文件" ;;
+              08-opencc*)             echo "OpenCC 容错|字典缺失时跳过转换，而不是整个构建失败" ;;
+              09-runtime-property*)   echo "运行时属性通道|补齐 JNI 的运行时属性读写，配置能正确下发" ;;
+              10-ThemeDataBridge*)    echo "主题工作室桥接|新增主题数据桥接类，供主题工作室读写配置" ;;
+              11-ThemeManager*)       echo "主题配色接口|主题可指定配色，跟随系统深浅色切换" ;;
+              12-InputView*)          echo "键盘快照|记住已加载的键盘，schema 未就绪时不再回落 36 键" ;;
+              13-TrimeService*)       echo "根视图快照|根视图重建时保留键盘状态" ;;
+              14-KeyboardDefaultFix*) echo "默认键盘与按键滑动|打开「默认键盘」不再改动当前键盘、不再让按键滑动失效；解析顺序改为 偏好 → 方案同名 → 主题 → qwerty36" ;;
+              *)                      echo "${1%.patch}|" ;;
             esac
           }
 
-          # 一行一个功能：**功能名** · [补丁文件](链接)
+          # 一行一个功能：**功能名**：改了什么 · [补丁文件](链接)
           item() {
-            local name="$1"
-            echo "- **$(feature "$name")** · [\`${name}\`](${BLOB}/${name})"
+            local name="$1" info title desc
+            info=$(describe "$name")
+            title="${info%%|*}"
+            desc="${info#*|}"
+            if [ -n "$desc" ] && [ "$desc" != "$info" ]; then
+              echo "- **${title}**：${desc} · [\`${name}\`](${BLOB}/${name})"
+            else
+              echo "- **${title}** · [\`${name}\`](${BLOB}/${name})"
+            fi
+          }
+
+          # 折叠区里只留名字，避免整段太长
+          item_short() {
+            local name="$1" title
+            title="$(describe "$name")"
+            echo "- ${title%%|*} · [\`${name}\`](${BLOB}/${name})"
           }
 
           {
@@ -592,7 +606,7 @@ jobs:
             echo
             for p in patches/*.patch; do
               [ -f "$p" ] || continue
-              item "$(basename "$p")"
+              item_short "$(basename "$p")"
             done
             echo
             echo "</details>"
