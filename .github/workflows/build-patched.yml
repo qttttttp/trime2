@@ -156,6 +156,13 @@ jobs:
             esac
             found=1
             echo "::group::应用 $name"
+            # 基线里已经含有该补丁的成品时（例如某模块先被并进别的补丁），
+            # 正向应用必然失败、反向校验却能过；这种情况直接跳过，别让整次构建挂掉。
+            if git apply --reverse --check "$p" >/dev/null 2>&1; then
+              echo "内容已在基线中（反向校验通过），跳过"
+              echo "::endgroup::"
+              continue
+            fi
             if ! git apply -v "$p"; then
               echo "git apply 失败,尝试三方合并"
               if ! git apply --3way "$p"; then
@@ -197,6 +204,10 @@ jobs:
           check app/proguard-rules.pro "mlkit_vision_digital_ink" "06 proguard keep"
           check app/src/main/java/com/androlua/Http.java "putFile" "04 http 流式上传"
           check app/src/main/jni/CMakeLists.txt "_FILE_OFFSET_BITS=0" "05 file offset 兼容"
+          check app/src/main/java/com/osfans/trime/Config.java \
+                "migrateKeyboardPrefs" "14 键盘偏好迁移"
+          check app/src/main/java/com/osfans/trime/InputView.java \
+                "sLoadedKeyboard" "14 键盘解析保护"
 
       - name: 工具版本自检（防止仓库里只更新了一半）
         run: |
@@ -497,9 +508,8 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 90
 
-      # 生成 Release 页面的「更新记录」：
-      #   上次构建的 fork-sha 从 patched-latest 的说明里读，和本次提交对比，
-      #   列出「本仓库改了什么 + 改了哪些补丁文件 + 本次补丁清单」。
+      # Release 页面的「更新记录」：只写「这次更新了哪几个功能」，每个功能链到对应补丁，
+      # 完整清单折叠起来，不写长篇说明。
       # 机器可读字段放在 HTML 注释里：页面不显示，但 check job 仍能解析。
       - name: 生成更新记录
         if: startsWith(github.ref, 'refs/tags/') == false
@@ -512,95 +522,79 @@ jobs:
                    --json body -q .body 2>/dev/null || true)
           PREV_FORK=$(printf '%s\n' "$PREV" \
                         | sed -n 's/.*fork-sha: *\([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
-          PREV_UP=$(printf '%s\n' "$PREV" \
-                      | sed -n 's/.*upstream-sha: *\([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
           CUR="$GITHUB_SHA"
           APK=$(ls app/build/outputs/apk/release/*arm64-v8a*.apk | head -1)
           SIZE_MB=$(( $(stat -c%s "$APK") / 1048576 ))
           UP_SUBJECT=$(git log -1 --format='%s' "$UPSTREAM_SHA" 2>/dev/null || true)
+          UP_LINK="[\`${UPSTREAM_SHA:0:7}\`](${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA})"
+          BLOB="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${CUR}/patches"
+
+          # 补丁文件名 -> 功能名（只写功能，不写说明；说明看补丁本身）
+          feature() {
+            case "$1" in
+              01-voice-asr*)          echo "语音输入与剪贴板" ;;
+              02-font-system-first*)  echo "字体加载" ;;
+              04-http-stream*)        echo "HTTP 流式请求" ;;
+              05-file-offset*)        echo "大文件兼容" ;;
+              06-mlkit-offline*)      echo "离线手写识别" ;;
+              07-boost-vmd*)          echo "Boost 兼容" ;;
+              08-opencc*)             echo "OpenCC 容错" ;;
+              09-runtime-property*)   echo "运行时属性通道" ;;
+              10-ThemeDataBridge*)    echo "主题工作室桥接" ;;
+              11-ThemeManager*)       echo "主题配色接口" ;;
+              12-InputView*)          echo "键盘快照" ;;
+              13-TrimeService*)       echo "根视图快照" ;;
+              14-KeyboardDefaultFix*) echo "默认键盘修复" ;;
+              *)                      echo "${1%.patch}" ;;
+            esac
+          }
+
+          # 一行一个功能：**功能名** · [补丁文件](链接)
+          item() {
+            local name="$1"
+            echo "- **$(feature "$name")** · [\`${name}\`](${BLOB}/${name})"
+          }
 
           {
             echo "## 更新记录"
             echo
-            if [ -z "$PREV_FORK" ]; then
-              echo "### 本仓库改动"
-              echo
-              echo "- 首次构建或读取不到上次记录，本次全量应用 \`patches/\`"
-              echo
-            elif [ "$PREV_FORK" = "$CUR" ]; then
-              echo "### 本仓库改动"
-              echo
-              echo "- 与上次构建是同一个提交（\`${CUR:0:7}\`），本次为重新构建"
-              echo
-            elif ! git cat-file -e "${PREV_FORK}^{commit}" 2>/dev/null; then
-              echo "### 本仓库改动"
-              echo
-              echo "- 本地没有上次构建的提交 \`${PREV_FORK:0:7}\`（浅克隆或强推），无法逐条对比；本次补丁清单见下"
-              echo
+
+            if [ -n "$PREV_FORK" ] && git cat-file -e "${PREV_FORK}^{commit}" 2>/dev/null; then
+              CHANGED=$(git diff --name-only --diff-filter=AM "${PREV_FORK}..${CUR}" -- patches 2>/dev/null \
+                          | grep '\.patch$' || true)
             else
-              echo "### 本仓库改动（\`${PREV_FORK:0:7}\` → \`${CUR:0:7}\`）"
-              echo
-              git log --no-merges --pretty='- %s（`%h`）' "${PREV_FORK}..${CUR}" \
-                > /tmp/forklog.txt 2>/dev/null || true
-              if [ -s /tmp/forklog.txt ]; then
-                head -40 /tmp/forklog.txt
-                TOTAL=$(wc -l < /tmp/forklog.txt)
-                if [ "$TOTAL" -gt 40 ]; then
-                  echo "- …共 ${TOTAL} 条，其余见提交历史"
-                fi
-              else
-                echo "- 无新提交"
-              fi
-              echo
-              git diff --name-status "${PREV_FORK}..${CUR}" -- patches signing tools .github \
-                > /tmp/forkdiff.txt 2>/dev/null || true
-              if [ -s /tmp/forkdiff.txt ]; then
-                echo "<details><summary>改动文件（补丁 / 签名 / 工具）</summary>"
-                echo
-                echo '```'
-                head -60 /tmp/forkdiff.txt
-                echo '```'
-                echo
-                echo "</details>"
-                echo
-              fi
+              CHANGED=""
             fi
 
-            echo "### 补丁清单（按应用顺序）"
+            if [ -n "$CHANGED" ]; then
+              COUNT=$(printf '%s\n' "$CHANGED" | sed '/^$/d' | wc -l | tr -d ' ')
+              echo "本次更新 ${COUNT} 个功能："
+              echo
+              for p in $CHANGED; do
+                [ -f "$p" ] || continue
+                item "$(basename "$p")"
+              done
+            elif [ -n "$PREV_FORK" ] && [ "$PREV_FORK" = "$CUR" ]; then
+              echo "补丁无改动，本次为跟随上游重新构建（\`${CUR:0:7}\`）。"
+            else
+              echo "首次构建（或无法对比上次提交），全部补丁均已应用。"
+            fi
             echo
-            shopt -s nullglob
-            cnt=0
+
+            TOTAL=$(find patches -maxdepth 1 -name '*.patch' | wc -l | tr -d ' ')
+            echo "<details><summary>构建内含全部补丁（${TOTAL} 个）</summary>"
+            echo
             for p in patches/*.patch; do
-              name=$(basename "$p")
-              n=$(grep -c '^diff --git ' "$p" || true)
-              brief=$(grep '^diff --git ' "$p" \
-                        | sed 's|^diff --git a/.* b/||' | sed 's|.*/||' \
-                        | head -3 | tr '\n' ',' | sed 's/,$//; s/,/、/g' || true)
-              case "$name" in
-                *android9*|*安卓9*) note="（安卓 9 专用，本次跳过）" ;;
-                *) note="" ;;
-              esac
-              echo "- \`${name}\` — ${n:-0} 个文件：${brief}${note}"
-              cnt=$((cnt+1))
+              [ -f "$p" ] || continue
+              item "$(basename "$p")"
             done
-            if [ "$cnt" -eq 0 ]; then
-              echo "- 未找到补丁"
-            fi
+            echo
+            echo "</details>"
             echo
 
-            echo "## 本次构建"
+            echo "---"
             echo
-            echo "- 上游基线：\`${UPSTREAM_REPO}@${UPSTREAM_REF}\`"
-            if [ -n "$UP_SUBJECT" ]; then
-              echo "- 上游提交：[\`${UPSTREAM_SHA:0:7}\`](${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA}) ${UP_SUBJECT}"
-            else
-              echo "- 上游提交：[\`${UPSTREAM_SHA:0:7}\`](${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA})"
-            fi
-            if [ -n "$PREV_UP" ] && [ "$PREV_UP" != "$UPSTREAM_SHA" ]; then
-              echo "  （上次构建：\`${PREV_UP:0:7}\`）"
-            fi
-            echo "- 构建：[#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
-            echo "- APK：arm64-v8a ${SIZE_MB} MB，另含 armeabi-v7a / x86 / x86_64"
+            echo "上游 ${UP_LINK} ${UP_SUBJECT} ｜ 构建 [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) ｜ arm64-v8a ${SIZE_MB} MB"
             echo
             echo "<!-- 以下字段供 CI 比对，页面不显示 -->"
             echo "<!-- upstream-sha: ${UPSTREAM_SHA} -->"
@@ -609,7 +603,6 @@ jobs:
 
           echo "===== $BODY ====="
           cat "$BODY"
-          # 同步显示到 Actions 运行页，构建日志里也能直接看到更新记录
           cat "$BODY" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       # 非 tag 构建统一发到固定 tag 的 rolling Release:
