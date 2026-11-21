@@ -93,7 +93,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/c
      public static String[] getKeyboards() {
 diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
 --- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:08:37.027405776 +0800
-+++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 22:11:42.623136336 +0800
++++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 22:42:14.255683532 +0800
 @@ -15,22 +15,21 @@
  import com.osfans.trime.BuildConfig;
  import com.osfans.trime.Config;
@@ -169,7 +169,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
  
              // 4. 【核心】按显示名称进行本地化排序
              Collections.sort(KeyboardItems, new Comparator<KeyboardItem>() {
-@@ -148,41 +158,236 @@
+@@ -148,41 +158,320 @@
                      (dialog, index) -> {
                          dialog.dismiss();
                          String selectedId = sortedIds[index];
@@ -242,6 +242,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
  
 +        LuaMeta meta = new LuaMeta();
 +        List<String> requires = new ArrayList<>();
++        StringBuilder src = new StringBuilder();
 +        BufferedReader reader = null;
          try {
 -            String path = Config.getKeyboardPath(keyboardId);
@@ -255,32 +256,39 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 -                    return nameValue.tojstring()+ " (" + keyboardId + ")"; // 仅返回名称，ID 在 UI 组装处处理
 +            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), "UTF-8"));
 +            String line;
-+            while ((line = reader.readLine()) != null) {
-+                String text = stripComment(line).trim();
-+                if (text.isEmpty()) continue;
-+                if (meta.name == null) {
-+                    String v = luaValue(text, "name");
-+                    if (v != null) meta.name = v;
-                 }
-+                if (!meta.hasLock) {
-+                    Boolean v = luaBool(text, "lock");
-+                    if (v != null) {
-+                        meta.hasLock = true;
-+                        meta.lock = v;
-+                    }
-+                }
-+                collectRequires(text, requires);
-             }
-         } catch (Exception e) {
--            return keyboardId + " (" + e + ")";
++            while ((line = reader.readLine()) != null) src.append(line).append('\n');
++        } catch (Exception e) {
 +            return depth == 0 ? null : meta;
 +        } finally {
 +            if (reader != null) {
 +                try {
 +                    reader.close();
 +                } catch (Exception ignored) {
+                 }
+             }
+-        } catch (Exception e) {
+-            return keyboardId + " (" + e + ")";
+         }
+-        return keyboardId;
++
++        // 先整份去掉注释（含 --[[ ... ]] / --[==[ ... ]==] 块注释），再逐行看字段。
++        // 块注释按行处理不了，里面出现的 name = "示例" / lock = true 会被当成真字段，
++        // 让不该进列表的键盘混进来，或让真字段被注释里的值覆盖。
++        for (String line : stripLuaComments(src.toString()).split("\n", -1)) {
++            String text = stripComment(line).trim();
++            if (text.isEmpty()) continue;
++            if (meta.name == null) {
++                String v = luaValue(text, "name");
++                if (v != null) meta.name = v;
++            }
++            if (!meta.hasLock) {
++                Boolean v = luaBool(text, "lock");
++                if (v != null) {
++                    meta.hasLock = true;
++                    meta.lock = v;
 +                }
 +            }
++            collectRequires(text, requires);
 +        }
 +
 +        for (String r : requires) {
@@ -314,8 +322,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +                f = new File(dir, c.substring("keyboards/".length()));
 +                if (f.isFile()) return f;
 +            }
-         }
--        return keyboardId;
++        }
 +        return null;
 +    }
 +
@@ -345,6 +352,84 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +            }
 +            if (arg != null && !arg.isEmpty()) out.add(arg);
 +        }
++    }
++
++    /**
++     * 去掉整份脚本里的注释（行注释 + 块注释），字符串与长字符串原样保留。
++     * Lua 的块注释是 --[[ ... ]] 或 --[==[ ... ]==]，可以跨行；只按行切是切不掉的。
++     */
++    private static String stripLuaComments(String src) {
++        StringBuilder out = new StringBuilder(src.length());
++        int i = 0, n = src.length();
++        while (i < n) {
++            char c = src.charAt(i);
++            if (c == '-' && i + 1 < n && src.charAt(i + 1) == '-') {
++                int level = longBracketLevel(src, i + 2);
++                if (level >= 0) {                       // --[[ 块注释
++                    int end = longBracketEnd(src, level, i + 2);
++                    int lines = 0;
++                    for (int j = i; j < end && j < n; j++) if (src.charAt(j) == '\n') lines++;
++                    i = end;
++                    for (int j = 0; j < lines; j++) out.append('\n'); // 保留行号结构
++                    continue;
++                }
++                int e = src.indexOf('\n', i);           // -- 行注释
++                i = e < 0 ? n : e;
++                continue;
++            }
++            if (c == '"' || c == '\'') {               // 普通字符串
++                int j = i + 1;
++                while (j < n) {
++                    char d = src.charAt(j);
++                    if (d == '\\') {
++                        j += 2;
++                        continue;
++                    }
++                    if (d == c || d == '\n') {
++                        j++;
++                        break;
++                    }
++                    j++;
++                }
++                if (j > n) j = n;
++                out.append(src, i, j);
++                i = j;
++                continue;
++            }
++            if (c == '[') {                             // 长字符串 [[...]] 不参与注释判断
++                int level = longBracketLevel(src, i);
++                if (level >= 0) {
++                    int end = longBracketEnd(src, level, i);
++                    out.append(src, i, end);
++                    i = end;
++                    continue;
++                }
++            }
++            out.append(c);
++            i++;
++        }
++        return out.toString();
++    }
++
++    /** `[` + n 个 `=` + `[` 的层级；不是长括号开头返回 -1 */
++    private static int longBracketLevel(String src, int from) {
++        if (from >= src.length() || src.charAt(from) != '[') return -1;
++        int j = from + 1, level = 0;
++        while (j < src.length() && src.charAt(j) == '=') {
++            level++;
++            j++;
++        }
++        if (j < src.length() && src.charAt(j) == '[') return level;
++        return -1;
++    }
++
++    /** 长括号结束位置（`]` + n 个 `=` + `]` 之后）；没有结束符就吃到文件尾 */
++    private static int longBracketEnd(String src, int level, int from) {
++        StringBuilder close = new StringBuilder("]");
++        for (int i = 0; i < level; i++) close.append('=');
++        close.append(']');
++        int idx = src.indexOf(close.toString(), from + level + 2);
++        return idx < 0 ? src.length() : idx + close.length();
 +    }
 +
 +    /** 去掉行尾注释，注意跳过字符串里的 `--` */
