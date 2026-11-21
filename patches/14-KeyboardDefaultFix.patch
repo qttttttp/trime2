@@ -1,21 +1,60 @@
-diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/com/osfans/trime/Config.java
---- a/app/src/main/java/com/osfans/trime/Config.java	2026-11-03 10:28:35.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 17:50:52.168175188 +0800
-@@ -250,9 +250,12 @@
+diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/com/osfans/trime/Config.java
+--- a/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 16:35:09.021643321 +0800
++++ b/app/src/main/java/com/osfans/trime/Config.java	2026-11-21 19:45:14.506008245 +0800
+@@ -11,6 +11,7 @@
+ 
+ import android.os.Build;
+ import android.os.Environment;
++import android.text.TextUtils;
+ import android.util.Log;
+ import android.view.Gravity;
+ 
+@@ -249,10 +250,41 @@
+         return "null";
      }
  
++    /**
++     * 统一的「当前方案 id」。
++     * 工程里原来有两套取法：Rime.getRimeStatus().getSchemaId() 和
++     * Rime.getCurrentRimeSchema()，两者在切换方案、重新部署、从设置页返回的
++     * 瞬间会给出不同结果（后者经常短暂返回 ".default"）。
++     * 键盘偏好键是 `<主题>_<方案>_keyboard`，方案 id 取错就会读写到另一个键上。
++     */
++    public static String currentSchema() {
++        String s = "";
++        try {
++            s = Rime.getRimeStatus().getSchemaId();
++        } catch (Throwable ignored) {
++        }
++        if (TextUtils.isEmpty(s) || ".default".equals(s)) {
++            try {
++                s = Rime.getCurrentRimeSchema();
++            } catch (Throwable ignored) {
++            }
++        }
++        if (TextUtils.isEmpty(s) || ".default".equals(s)) {
++            try {
++                s = Function.getPref(LuaApplication.getInstance()).getString("select_schema_id", "");
++            } catch (Throwable ignored) {
++            }
++        }
++        return s == null ? "" : s;
++    }
++
      public static String getKeyboard() {
+-        mKeyboard = Function.loadString(LuaApplication.getInstance(), getTheme() + "_" + Rime.getCurrentRimeSchema() + "_keyboard", "");
+-        Log.w("config", "getKeyboard: " + Rime.getCurrentRimeSchema() + ";" + mKeyboard);
+-        setKeyboard(".default", mKeyboard);
 +        // 【纯读】不要在这里回写偏好。
 +        // 旧实现在每次读取时执行 setKeyboard(".default", mKeyboard)，导致
 +        // 「打开默认键盘对话框」「解析一次键盘」这类只读动作也会改写共享数据，
 +        // 把 <主题>_.default_keyboard 变成上一次选择的镜像，污染 auto 模式。
-         mKeyboard = Function.loadString(LuaApplication.getInstance(), getTheme() + "_" + Rime.getCurrentRimeSchema() + "_keyboard", "");
-         Log.w("config", "getKeyboard: " + Rime.getCurrentRimeSchema() + ";" + mKeyboard);
--        setKeyboard(".default", mKeyboard);
++        mKeyboard = Function.loadString(LuaApplication.getInstance(), getTheme() + "_" + currentSchema() + "_keyboard", "");
++        Log.w("config", "getKeyboard: " + currentSchema() + ";" + mKeyboard);
          return mKeyboard;
      }
  
-@@ -261,13 +264,26 @@
+@@ -261,13 +293,34 @@
          return Function.loadString(LuaApplication.getInstance(), getTheme() + "_" + id + "_keyboard", "");
      }
  
@@ -31,7 +70,14 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/Config.java b/ap
      public static void setKeyboard(String s) {
          mKeyboard = s;
 -        Function.saveString(LuaApplication.getInstance(), getTheme() + "_" + Rime.getCurrentRimeSchema() + "_keyboard", s);
-+        setKeyboard(Rime.getCurrentRimeSchema(), s);
++        String schema = currentSchema();
++        if (TextUtils.isEmpty(schema)) {
++            // 方案 id 拿不到时写进去的是 `<主题>__keyboard` 这种没人会读的脏键，
++            // 而且下次真正要用的键仍然是旧值，表现为「选了但没生效」。
++            Log.w("config", "setKeyboard: 方案 id 为空，跳过写偏好");
++            return;
++        }
++        setKeyboard(schema, s);
      }
  
 +    /**
@@ -40,14 +86,20 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/Config.java b/ap
 +     */
      public static void setKeyboard(String id, String s) {
 -        Function.saveString(LuaApplication.getInstance(), getTheme() + "_" + id + "_keyboard", s);
++        if (TextUtils.isEmpty(id)) return;
 +        Function.saveString(LuaApplication.getInstance(), getTheme() + "_" + id + "_keyboard", s == null ? "" : s);
      }
  
      public static String[] getKeyboards() {
-diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
---- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-03 10:28:35.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 17:50:52.169175186 +0800
-@@ -91,7 +91,11 @@
+diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
+--- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 16:35:09.022643332 +0800
++++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 19:45:14.508008311 +0800
+@@ -87,11 +87,15 @@
+                         //       (dialog, id) -> new ThemeDialog(context).show(mWindowToken))
+                         .setNegativeButton(android.R.string.cancel, null);
+ 
+-        if (Rime.getCurrentRimeSchema().equals(".default")) {
++        if (Config.currentSchema().isEmpty()) {
              builder.setMessage("请先正确配置");
          } else {
              // 1. 获取当前选中的 ID 和所有样式文件夹名
@@ -55,7 +107,7 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/dialog/KeyboardD
 +            //    这里必须用「纯读」版本：无参 Config.getKeyboard() 旧实现会回写偏好，
 +            //    只打开对话框、什么都不选，也会改掉共享数据。
 +            //    偏好里存的就是当前实际键盘（手选值或 auto 解析后的值），直接回显。
-+            String dialogSchema = Rime.getCurrentRimeSchema();
++            String dialogSchema = Config.currentSchema();
 +            String currentKeyboardId = Config.getKeyboard(dialogSchema);
              String[] rawKeyboardIds = Config.getKeyboards();
  
@@ -70,7 +122,7 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/dialog/KeyboardD
 -                            trime.setKeyboard(selectedId);
 +                        if (TextUtils.isEmpty(selectedId)) {
 +                            // 自动匹配：先清空偏好，再让输入法按「方案同名 → 主题」重算并写回
-+                            Config.clearKeyboard(Rime.getCurrentRimeSchema());
++                            Config.clearKeyboard(dialogSchema);
 +                            if (trime != null)
 +                                trime.setKeyboard(".reload");
 +                        } else {
@@ -81,25 +133,57 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/dialog/KeyboardD
                          }
                      });
          }
-diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
---- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 17:50:52.018175564 +0800
-+++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 17:50:52.169175186 +0800
-@@ -141,6 +141,14 @@
+diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
+--- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 16:35:09.021643321 +0800
++++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 19:45:14.507008278 +0800
+@@ -60,10 +60,7 @@
+         super(context);
+         setClipChildren(false);
+         setClipToPadding(false);
+-        String id = Rime.getRimeStatus().getSchemaId();
+-        if (TextUtils.isEmpty(id))
+-            id = Function.getPref(context).getString("select_schema_id", "");
+-        setKeyboard(id);
++        setKeyboard(Config.currentSchema());
+     }
+ 
+     @Override
+@@ -130,6 +127,15 @@
+ 
+     private String mCurrentSchemaId;
+ 
++    /**
++     * 进程内最近一次真正加载成功的键盘名（解析后的文件名，不含 .lua）。
++     * RootInputView.setTheme/setSchema 会重建 InputView，新实例的 mViewCache 是空的；
++     * 若此时 schema id 还没就绪（从设置页返回的瞬间很常见），解析链会拿空 id 去问主题，
++     * 主题 get_keyboard("") 返回的往往是 keyboard 字段（如 qwerty36），键盘就被静默换掉。
++     * 用静态字段跨实例保存，schema 拿不到时保持原键盘不动。
++     */
++    private static String sLoadedKeyboard;
++
+     // 2. 视图缓存：SchemaId -> KeyboardView 实例
+     private final Map<String, KeyboardView> mViewCache = new HashMap<>();
+     private final Map<String, SymbolsKeyboardView> mSymbolsViewCache = new HashMap<>();
+@@ -141,10 +147,17 @@
                  setKeyboardView(oldView);
              return;
          }
 +        if (".reload".equals(id)) {
 +            // 设置里点了「自动匹配」：偏好已清空，这里强制重算一次并写回
 +            mCurrentSchemaId = null;
-+            id = Rime.getRimeStatus().getSchemaId();
-+            if (TextUtils.isEmpty(id))
-+                id = Function.getPref(getContext()).getString("select_schema_id", "");
++            id = Config.currentSchema();
 +            if (TextUtils.isEmpty(id)) return;
 +        }
          if (id == null || id.equals(mCurrentSchemaId)) return;
          mCurrentSchemaId = id;
          id = getKeyboardId(id);
-@@ -197,48 +205,83 @@
+-        Log.w("TAG", "setKeyboard:e " + id);
++        sLoadedKeyboard = id;
++        Log.w("TAG", "setKeyboard:e " + id + " (schema=" + mCurrentSchemaId + ")");
+         // 获取或创建 KeyboardView
+         KeyboardView targetView = mViewCache.get(id);
+         if (targetView == null) {
+@@ -197,48 +210,108 @@
      }
  
      private String getKeyboardId(String id) {
@@ -110,9 +194,7 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
 -                    return id;
 -                if (new File(findFile(id + ".lua")).exists())
 -                    return id;
-+        String schemaId = Rime.getRimeStatus().getSchemaId();
-+        if (TextUtils.isEmpty(schemaId))
-+            schemaId = Function.getPref(getContext()).getString("select_schema_id", "");
++        String schemaId = Config.currentSchema();
 +
 +        // 调用方直接指定了具体键盘名（主题脚本 setKeyboard、上次的视图 id 等）：
 +        // 这是运行时的显式切换，不是「默认键盘解析」，不改偏好。
@@ -120,8 +202,39 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
 +            Log.w("TAG", "setKeyboard: 指定键盘 " + id);
 +            return id;
 +        }
-+        if (TextUtils.isEmpty(id)) id = schemaId;
 +
++        // schema 拿不到时（从设置页返回、Rime 尚未就绪、setTheme 重建的瞬间），
++        // 绝不能拿空 id 去问主题：主题 get_keyboard("") 走的是 `id == ""` 分支，
++        // 返回 keyboard 字段，和「按方案 id 求值」是两条不同的路径，结果常常就是 qwerty36。
++        // 这正是「只打开默认键盘对话框、什么都不选，键盘却变了」的来源。
++        if (TextUtils.isEmpty(schemaId)) {
++            if (!TextUtils.isEmpty(id) && kbdFileExists(id)) {
++                Log.w("TAG", "setKeyboard: schema 为空，沿用参数 " + id);
++                return id;
++            }
++            if (!TextUtils.isEmpty(sLoadedKeyboard) && kbdFileExists(sLoadedKeyboard)) {
++                Log.w("TAG", "setKeyboard: schema 为空，保持上次键盘 " + sLoadedKeyboard);
++                return sLoadedKeyboard;
+             }
+-            id = Rime.getRimeStatus().getSchemaId();
+-            if (TextUtils.isEmpty(id))
+-                id = Function.getPref(getContext()).getString("select_schema_id", "");
++            Log.w("TAG", "setKeyboard: schema 为空且无可用键盘，暂不重算");
++            return "qwerty36";
+         }
+-        Log.w("TAG", "setKeyboard:2 " + id);
+-        if (mViewCache.containsKey(id))
+-            return id;
+-        if (new File(findFile(id + ".lua")).exists())
+-            return id;
++        if (TextUtils.isEmpty(id)) id = schemaId;
+ 
+-        id = ThemeManager.getKeyboard(id);
+-        Log.w("TAG", "setKeyboard:4 " + id);
+-        if (mViewCache.containsKey(id))
+-            return id;
+-        if (new File(findFile(id + ".lua")).exists())
+-            return id;
 +        // ① 偏好里已有记录：设置里手选的值，或上一次 auto 解析后回写的值。
 +        //    偏好是唯一事实来源，解析链只在「没有记录 / 记录失效 / 点了自动匹配」时执行。
 +        String picked = stripLua(Config.getKeyboard(schemaId));
@@ -129,20 +242,14 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
 +            if (kbdUsable(picked)) {
 +                Log.w("TAG", "setKeyboard: 偏好 " + picked);
 +                return picked;
-             }
--            id = Rime.getRimeStatus().getSchemaId();
--            if (TextUtils.isEmpty(id))
--                id = Function.getPref(getContext()).getString("select_schema_id", "");
++            }
 +            Log.w("TAG", "setKeyboard: 偏好 " + picked + " 无对应文件，重新解析");
-         }
--        Log.w("TAG", "setKeyboard:2 " + id);
--        if (mViewCache.containsKey(id))
--            return id;
--        if (new File(findFile(id + ".lua")).exists())
--            return id;
++        }
  
--        id = ThemeManager.getKeyboard(id);
--        Log.w("TAG", "setKeyboard:4 " + id);
+-        id = Rime.getRimeStatus().getSchemaId();
+-        if (TextUtils.isEmpty(id))
+-            id = Function.getPref(getContext()).getString("select_schema_id", "");
+-        Log.w("TAG", "setKeyboard:5 " + id);
 -        if (mViewCache.containsKey(id))
 -            return id;
 -        if (new File(findFile(id + ".lua")).exists())
@@ -151,7 +258,13 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
 +        Log.w("TAG", "setKeyboard:auto " + schemaId);
 +        if (kbdUsable(schemaId))
 +            return rememberKeyboard(schemaId, schemaId);
-+
+ 
+-        id = ThemeManager.getKeyboard(id);
+-        Log.w("TAG", "setKeyboard:6 " + id);
+-        if (mViewCache.containsKey(id))
+-            return id;
+-        if (new File(findFile(id + ".lua")).exists())
+-            return id;
 +        // ③ 方案没有同名键盘，才问主题 get_keyboard(id, alphabet)
 +        String themed = schemaId;
 +        try {
@@ -164,39 +277,35 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
 +        if (!TextUtils.isEmpty(themed) && kbdUsable(themed))
 +            return rememberKeyboard(schemaId, themed);
 +
-+        // ④ 兜底
++        // ④ 兜底：解析全失败时，不要用一个 36 键覆盖正在正常显示的键盘。
++        //    打开设置页再返回会触发 setTheme 重建，重建瞬间 schema 可能还没就绪，
++        //    旧逻辑会一路落到 qwerty36，看起来就是「没做任何操作，键盘被换了」。
++        if (!TextUtils.isEmpty(sLoadedKeyboard) && kbdFileExists(sLoadedKeyboard)) {
++            Log.w("TAG", "setKeyboard: 解析失败，保持当前 " + sLoadedKeyboard);
++            return sLoadedKeyboard;
++        }
 +        Log.w("TAG", "setKeyboard:fallback qwerty36");
 +        return rememberKeyboard(schemaId, "qwerty36");
 +    }
  
--        id = Rime.getRimeStatus().getSchemaId();
--        if (TextUtils.isEmpty(id))
--            id = Function.getPref(getContext()).getString("select_schema_id", "");
--        Log.w("TAG", "setKeyboard:5 " + id);
--        if (mViewCache.containsKey(id))
--            return id;
--        if (new File(findFile(id + ".lua")).exists())
--            return id;
+-        return "qwerty36";
 +    private boolean kbdFileExists(String name) {
 +        if (TextUtils.isEmpty(name)) return false;
 +        try {
-+            return new File(findFile(name + ".lua")).exists();
++            String f = name.endsWith(".lua") ? name : name + ".lua";
++            if (f.startsWith("/")) return new File(f).exists();
++            if (new File(Config.getKeyboardDir(), f).exists()) return true;
++            // 少数主题把键盘直接放在主题根目录，而不是 keyboards/ 子目录
++            return new File(Config.getThemeDir(Config.getTheme()), f).exists();
 +        } catch (Throwable t) {
 +            return false;
 +        }
 +    }
- 
--        id = ThemeManager.getKeyboard(id);
--        Log.w("TAG", "setKeyboard:6 " + id);
--        if (mViewCache.containsKey(id))
--            return id;
--        if (new File(findFile(id + ".lua")).exists())
--            return id;
++
 +    private boolean kbdUsable(String name) {
 +        return !TextUtils.isEmpty(name) && (mViewCache.containsKey(name) || kbdFileExists(name));
 +    }
- 
--        return "qwerty36";
++
 +    private static String stripLua(String s) {
 +        if (s == null) return "";
 +        return s.endsWith(".lua") ? s.substring(0, s.length() - 4) : s;
@@ -219,10 +328,41 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
      }
  
      @Override
-diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
---- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 17:50:51.940175760 +0800
-+++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 17:50:52.169175186 +0800
-@@ -303,10 +303,26 @@
+@@ -258,6 +331,15 @@
+             if (BuildConfig.DEBUG)
+                 e.printStackTrace();
+         }
++        // 主题根目录也作为搜索根：部分主题的键盘不放在 keyboards/ 子目录
++        try {
++            File f = new File(Config.getThemeDir(Config.getTheme()), name);
++            if (f.exists())
++                return new FileInputStream(f);
++        } catch (Exception e) {
++            if (BuildConfig.DEBUG)
++                e.printStackTrace();
++        }
+         if (!name.endsWith(".lua"))
+             return null;
+         try {
+@@ -286,7 +368,13 @@
+             return null;
+         if (filename.startsWith("/"))
+             return filename;
+-        return new File(Config.getKeyboardDir(), filename).getAbsolutePath();
++        File f = new File(Config.getKeyboardDir(), filename);
++        if (f.exists())
++            return f.getAbsolutePath();
++        File g = new File(Config.getThemeDir(Config.getTheme()), filename);
++        if (g.exists())
++            return g.getAbsolutePath();
++        return f.getAbsolutePath();
+     }
+ 
+     public void invalidateComposingKeys() {
+diff -ruN a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 16:35:09.023643344 +0800
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 19:45:14.509008344 +0800
+@@ -303,10 +303,31 @@
      }
  
      public static String getKeyboard(String id) {
@@ -240,7 +380,12 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeManag
 +     */
 +    public static String getKeyboard(String id, boolean usePref) {
 +        if (usePref) {
-+            String k = Config.getKeyboard();
++            // 必须用调用方传进来的 id 读偏好。
++            // 旧实现是无参 Config.getKeyboard()，它内部用 Rime.getCurrentRimeSchema() 拼键；
++            // 从设置页返回、Rime 尚未就绪的瞬间该值是 ".default"，于是读到的是
++            // <主题>_.default_keyboard（历史镜像键，里面可能躺着 qwerty36），
++            // 主题 get_keyboard 被跳过，键盘被静默换掉。
++            String k = Config.getKeyboard(id);
 +            Log.w("theme", "getKeyboard:Config " + id + ";" + k);
 +            // 偏好里存的是当前实际键盘；只有对应文件真的存在才算数，
 +            // 否则回退主题 get_keyboard()，避免拿一个不存在的文件名去 loadfile。
