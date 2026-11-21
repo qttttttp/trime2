@@ -93,8 +93,8 @@ diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/c
      public static String[] getKeyboards() {
 diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
 --- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:08:37.027405776 +0800
-+++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 21:18:01.970508143 +0800
-@@ -15,18 +15,15 @@
++++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 22:11:42.623136336 +0800
+@@ -15,22 +15,21 @@
  import com.osfans.trime.BuildConfig;
  import com.osfans.trime.Config;
  import com.osfans.trime.TrimeService;
@@ -115,7 +115,13 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
  import java.util.ArrayList;
  import java.util.Collections;
  import java.util.Comparator;
-@@ -87,26 +84,37 @@
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
+ 
+ public class KeyboardDialog implements ResourceFinder {
+     private final AlertDialog mDialog;
+@@ -87,26 +86,37 @@
                          //       (dialog, id) -> new ThemeDialog(context).show(mWindowToken))
                          .setNegativeButton(android.R.string.cancel, null);
  
@@ -163,7 +169,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
  
              // 4. 【核心】按显示名称进行本地化排序
              Collections.sort(KeyboardItems, new Comparator<KeyboardItem>() {
-@@ -148,10 +156,17 @@
+@@ -148,41 +158,236 @@
                      (dialog, index) -> {
                          dialog.dismiss();
                          String selectedId = sortedIds[index];
@@ -184,16 +190,16 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
                          }
                      });
          }
-@@ -161,28 +176,93 @@
-     /**
-      * 私有工具方法：从 main.lua 中提取 name 变量
-      */
--    private String getKeyboardNameFromLua(Globals globals, String keyboardId) {
--        LuaTable env = new LuaTable();
--        LuaTable mt = new LuaTable();
--        mt.set("__index", globals);
--        env.setmetatable(mt);
--
+         mDialog = builder.create();
+     }
+ 
++    /** 键盘脚本里能读到的元信息（文本解析，不执行脚本） */
++    private static final class LuaMeta {
++        String name;
++        boolean lock;
++        boolean hasLock;
++    }
++
 +    /**
 +     * 从键盘脚本里读 name / lock，只做文本解析，不执行脚本。
 +     *
@@ -201,9 +207,41 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +     * @return 显示名（带 id），不该出现在列表里时返回 null
 +     */
 +    private String readKeyboardName(String keyboardId, boolean ignoreLock) {
-+        String path = Config.getKeyboardPath(keyboardId);
-+        String name = null;
-+        boolean lock = false;
++        String dir = Config.getKeyboardDir();
++        LuaMeta meta = readMeta(new File(Config.getKeyboardPath(keyboardId)), new File(dir),
++                new HashSet<String>(), 0);
++        if (meta == null) return keyboardId;
++        if (!ignoreLock && !(meta.hasLock && meta.lock)) return null;
++        String name = TextUtils.isEmpty(meta.name) ? keyboardId : meta.name;
++        return name + " (" + keyboardId + ")";
++    }
++
+     /**
+-     * 私有工具方法：从 main.lua 中提取 name 变量
++     * 读一个键盘脚本的 name / lock，并跟着 require 一路往下找。
++     *
++     * 键盘之间常常是复用的：某个键盘在自己的文件里只写「在 qwerty36 的基础上改几个键」，
++     * name / lock（尤其是 lock = true）留在被 require 的文件里。只读自己这一份，
++     * 这类键盘就会被当成「没有 lock」而整个从列表里消失。
++     * 这里按文本跟进 require 链，缺什么补什么；自己显式写了的以自己为准。
+      */
+-    private String getKeyboardNameFromLua(Globals globals, String keyboardId) {
+-        LuaTable env = new LuaTable();
+-        LuaTable mt = new LuaTable();
+-        mt.set("__index", globals);
+-        env.setmetatable(mt);
++    private static LuaMeta readMeta(File file, File dir, Set<String> seen, int depth) {
++        if (file == null || depth > 6) return null;
++        String key;
++        try {
++            key = file.getCanonicalPath();
++        } catch (Exception e) {
++            key = file.getAbsolutePath();
++        }
++        if (!seen.add(key)) return null; // require 成环
+ 
++        LuaMeta meta = new LuaMeta();
++        List<String> requires = new ArrayList<>();
 +        BufferedReader reader = null;
          try {
 -            String path = Config.getKeyboardPath(keyboardId);
@@ -215,21 +253,27 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 -                    return null;
 -                if (nameValue.isstring()) {
 -                    return nameValue.tojstring()+ " (" + keyboardId + ")"; // 仅返回名称，ID 在 UI 组装处处理
--                }
-+            reader = new BufferedReader(new InputStreamReader(new FileInputStream(path), "UTF-8"));
++            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), "UTF-8"));
 +            String line;
 +            while ((line = reader.readLine()) != null) {
-+                String text = line.trim();
-+                if (text.startsWith("--")) continue;
-+                int c = text.indexOf("--");
-+                if (c >= 0) text = text.substring(0, c).trim();
-+                if (name == null) name = luaString(text, "name");
-+                if (!lock) lock = luaTrue(text, "lock");
++                String text = stripComment(line).trim();
++                if (text.isEmpty()) continue;
++                if (meta.name == null) {
++                    String v = luaValue(text, "name");
++                    if (v != null) meta.name = v;
+                 }
++                if (!meta.hasLock) {
++                    Boolean v = luaBool(text, "lock");
++                    if (v != null) {
++                        meta.hasLock = true;
++                        meta.lock = v;
++                    }
++                }
++                collectRequires(text, requires);
              }
          } catch (Exception e) {
 -            return keyboardId + " (" + e + ")";
-+            // 文件读不了就按 id 显示，至少还能选
-+            return keyboardId;
++            return depth == 0 ? null : meta;
 +        } finally {
 +            if (reader != null) {
 +                try {
@@ -238,18 +282,98 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +                }
 +            }
 +        }
-+        if (!ignoreLock && !lock) return null;
-+        if (TextUtils.isEmpty(name)) return keyboardId;
-+        return name + " (" + keyboardId + ")";
++
++        for (String r : requires) {
++            if (meta.name != null && meta.hasLock) break;
++            LuaMeta parent = readMeta(resolveKeyboardFile(dir, r), dir, seen, depth + 1);
++            if (parent == null) continue;
++            if (meta.name == null) meta.name = parent.name;
++            if (!meta.hasLock && parent.hasLock) {
++                meta.hasLock = true;
++                meta.lock = parent.lock;
++            }
++        }
++        return meta;
 +    }
 +
-+    /** 取 `key = "..."` / `key = '...'` / `key = [[...]]` 的字面量内容 */
-+    private static String luaString(String line, String key) {
-+        int i = indexOfKey(line, key);
-+        if (i < 0) return null;
-+        String rest = line.substring(i + key.length()).trim();
-+        if (!rest.startsWith("=")) return null;
-+        rest = rest.substring(1).trim();
++    /** require 里的名字 -> 实际文件；兼容 "x"、"x.lua"、"keyboards/x" 三种写法 */
++    private static File resolveKeyboardFile(File dir, String name) {
++        if (TextUtils.isEmpty(name)) return null;
++        String[] candidates = name.endsWith(".lua")
++                ? new String[]{name}
++                : new String[]{name, name + ".lua"};
++        for (String c : candidates) {
++            File f = new File(c);
++            if (f.isAbsolute()) {
++                if (f.isFile()) return f;
++                continue;
++            }
++            f = new File(dir, c);
++            if (f.isFile()) return f;
++            if (c.startsWith("keyboards/")) {
++                f = new File(dir, c.substring("keyboards/".length()));
++                if (f.isFile()) return f;
++            }
+         }
+-        return keyboardId;
++        return null;
++    }
++
++    /** 收集一行的 require 目标：require("x") / require 'x' / require [[x]] */
++    private static void collectRequires(String text, List<String> out) {
++        int from = 0;
++        while (true) {
++            int i = text.indexOf("require", from);
++            if (i < 0) return;
++            from = i + "require".length();
++            if (i > 0 && isIdentChar(text.charAt(i - 1))) continue;
++            int p = from;
++            while (p < text.length() && Character.isWhitespace(text.charAt(p))) p++;
++            if (p < text.length() && text.charAt(p) == '(') {
++                p++;
++                while (p < text.length() && Character.isWhitespace(text.charAt(p))) p++;
++            }
++            if (p >= text.length()) return;
++            char q = text.charAt(p);
++            String arg = null;
++            if (q == '"' || q == '\'') {
++                int end = text.indexOf(q, p + 1);
++                if (end > 0) arg = text.substring(p + 1, end);
++            } else if (text.startsWith("[[", p)) {
++                int end = text.indexOf("]]", p + 2);
++                if (end > 0) arg = text.substring(p + 2, end);
++            }
++            if (arg != null && !arg.isEmpty()) out.add(arg);
++        }
++    }
++
++    /** 去掉行尾注释，注意跳过字符串里的 `--` */
++    private static String stripComment(String line) {
++        boolean inSingle = false, inDouble = false;
++        for (int i = 0; i < line.length(); i++) {
++            char c = line.charAt(i);
++            if (inSingle) {
++                if (c == '\\') i++;
++                else if (c == '\'') inSingle = false;
++            } else if (inDouble) {
++                if (c == '\\') i++;
++                else if (c == '"') inDouble = false;
++            } else if (c == '\'') {
++                inSingle = true;
++            } else if (c == '"') {
++                inDouble = true;
++            } else if (c == '-' && i + 1 < line.length() && line.charAt(i + 1) == '-') {
++                return line.substring(0, i);
++            }
++        }
++        return line;
++    }
++
++    /** 取 `key = "..."` / `key = '...'` / `key = [[...]]` / `["key"] = "..."` 的字面量 */
++    private static String luaValue(String text, String key) {
++        int eq = valueStart(text, key);
++        if (eq < 0) return null;
++        String rest = text.substring(eq + 1).trim();
 +        if (rest.startsWith("[[")) {
 +            int end = rest.indexOf("]]", 2);
 +            return end < 0 ? null : rest.substring(2, end);
@@ -262,33 +386,39 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +            end = rest.indexOf(quote, end + 1);
 +        }
 +        if (end < 0) return null;
-+        String text = rest.substring(1, end);
-+        // 还原 \" 与 \\ 两种转义
-+        return text.replace("\\\"", "\"").replace("\\\\", "\\");
++        String value = rest.substring(1, end);
++        return value.replace("\\\"", "\"").replace("\\\\", "\\");
 +    }
 +
-+    /** 取 `key = true` */
-+    private static boolean luaTrue(String line, String key) {
-+        int i = indexOfKey(line, key);
-+        if (i < 0) return false;
-+        String rest = line.substring(i + key.length()).trim();
-+        if (!rest.startsWith("=")) return false;
-+        return rest.substring(1).trim().startsWith("true");
++    /** 取 `key = true` / `key = false`；没写返回 null（以便由 require 的父键盘补齐） */
++    private static Boolean luaBool(String text, String key) {
++        int eq = valueStart(text, key);
++        if (eq < 0) return null;
++        String rest = text.substring(eq + 1).trim().toLowerCase();
++        if (rest.startsWith("true")) return Boolean.TRUE;
++        if (rest.startsWith("false")) return Boolean.FALSE;
++        return null;
 +    }
 +
-+    /** 在行内找独立出现的 key（避免 `my_name`、`--name` 之类误匹配） */
-+    private static int indexOfKey(String line, String key) {
++    /** 找到 `key =` 里等号的位置；支持 `["key"] =`，避免 `name2`、`base_name` 之类误匹配 */
++    private static int valueStart(String text, String key) {
 +        int from = 0;
 +        while (true) {
-+            int i = line.indexOf(key, from);
++            int i = text.indexOf(key, from);
 +            if (i < 0) return -1;
-+            boolean leftOk = i == 0 || !isIdentChar(line.charAt(i - 1));
-+            int after = i + key.length();
-+            boolean rightOk = after >= line.length() || !isIdentChar(line.charAt(after));
-+            if (leftOk && rightOk) return i;
 +            from = i + key.length();
-         }
--        return keyboardId;
++            if (i > 0 && isIdentChar(text.charAt(i - 1))) continue;
++            int p = from;
++            while (p < text.length()) {
++                char c = text.charAt(p);
++                if (c == ']' || c == '"' || c == '\'' || Character.isWhitespace(c)) p++;
++                else break;
++            }
++            if (p < text.length() && text.charAt(p) == '='
++                    && (p + 1 >= text.length() || text.charAt(p + 1) != '=')) {
++                return p;
++            }
++        }
 +    }
 +
 +    private static boolean isIdentChar(char c) {
