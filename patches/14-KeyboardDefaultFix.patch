@@ -93,17 +93,29 @@ diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/c
      public static String[] getKeyboards() {
 diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
 --- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:08:37.027405776 +0800
-+++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:48:29.933822751 +0800
-@@ -35,6 +35,8 @@
- public class KeyboardDialog implements ResourceFinder {
-     private final AlertDialog mDialog;
-     private IBinder mWindowToken;
-+    /** 是否真的选了某一项；没选也要恢复键盘，见 setOnDismissListener */
-+    private boolean mPicked;
++++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 21:18:01.970508143 +0800
+@@ -15,18 +15,15 @@
+ import com.osfans.trime.BuildConfig;
+ import com.osfans.trime.Config;
+ import com.osfans.trime.TrimeService;
+-import com.osfans.trime.core.Rime;
+ import com.osfans.trime.theme.ThemeManager;
  
-     @Override
-     public InputStream findResource(String name) {
-@@ -87,11 +89,15 @@
+-import org.luaj.Globals;
+-import org.luaj.LuaTable;
+-import org.luaj.LuaValue;
+ import org.luaj.lib.ResourceFinder;
+-import org.luaj.lib.jse.JsePlatform;
+ 
++import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.InputStream;
++import java.io.InputStreamReader;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Comparator;
+@@ -87,26 +84,37 @@
                          //       (dialog, id) -> new ThemeDialog(context).show(mWindowToken))
                          .setNegativeButton(android.R.string.cancel, null);
  
@@ -120,13 +132,39 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +            String currentKeyboardId = Config.getKeyboard(dialogSchema);
              String[] rawKeyboardIds = Config.getKeyboards();
  
-             // 2. 准备 Lua 环境
-@@ -146,16 +152,38 @@
-                     sortedNames,
-                     currentSelectedIndex,
+-            // 2. 准备 Lua 环境
+-            Globals luaGlobals = JsePlatform.standardGlobals();
+-            luaGlobals.finder = this;
+-
+-            // 3. 遍历并解析每个样式的显示名称
++            // 2. 只读文本取名称，绝不执行键盘脚本。
++            //    旧实现为了拿 name 会把 keyboards/ 下每个 .lua 执行一遍
++            //    (loadfilex + call)，脚本里「初始化完成后挂上去」的运行时行为
++            //    （部分按键的滑动接管等）会落到正在使用的输入法上：
++            //    打开一次默认键盘，按键就只剩点击、滑动全部失效。
+             List<KeyboardItem> KeyboardItems = new ArrayList<>();
+             for (String id : rawKeyboardIds) {
+-                id=id.replace(".lua","");
+-                String displayName = getKeyboardNameFromLua(luaGlobals, id);
+-                if(TextUtils.isEmpty(displayName))
++                id = id.replace(".lua", "");
++                String displayName = readKeyboardName(id, false);
++                if (TextUtils.isEmpty(displayName))
+                     continue;
+                 KeyboardItems.add(new KeyboardItem(id, displayName));
+             }
++            if (KeyboardItems.isEmpty()) {
++                // 没有 lock = true 的键盘时退化为全部列出，别让列表只剩「自动匹配」
++                for (String id : rawKeyboardIds) {
++                    id = id.replace(".lua", "");
++                    KeyboardItems.add(new KeyboardItem(id, readKeyboardName(id, true)));
++                }
++            }
+ 
+             // 4. 【核心】按显示名称进行本地化排序
+             Collections.sort(KeyboardItems, new Comparator<KeyboardItem>() {
+@@ -148,10 +156,17 @@
                      (dialog, index) -> {
-+                        // 先置位再 dismiss：dismiss 会同步触发 setOnDismissListener
-+                        mPicked = true;
                          dialog.dismiss();
                          String selectedId = sortedIds[index];
 -                        Config.setKeyboard(selectedId);
@@ -146,26 +184,121 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
                          }
                      });
          }
-         mDialog = builder.create();
-+        // 为了列出候选名称，上面已经把每个键盘的 lua 都执行了一遍（在临时的 Globals 里）。
-+        // 脚本里对 Java 侧的全局副作用——最典型的是给部分按键挂的滑动接管——会落到
-+        // 正在使用的输入法上，表现为「打开一次默认键盘，按键滑动就没了，只剩点击」。
-+        // 这里在没选任何项（取消/返回/点空白）时把当前键盘完整重建一次，
-+        // 让真正的键盘脚本重跑，恢复那些运行时挂上去的行为。
-+        mDialog.setOnDismissListener(d -> {
-+            if (mPicked) return;
-+            try {
-+                TrimeService trime = TrimeService.getInstance();
-+                if (trime != null) trime.setKeyboard(".reload");
-+            } catch (Throwable ignored) {
+@@ -161,28 +176,93 @@
+     /**
+      * 私有工具方法：从 main.lua 中提取 name 变量
+      */
+-    private String getKeyboardNameFromLua(Globals globals, String keyboardId) {
+-        LuaTable env = new LuaTable();
+-        LuaTable mt = new LuaTable();
+-        mt.set("__index", globals);
+-        env.setmetatable(mt);
+-
++    /**
++     * 从键盘脚本里读 name / lock，只做文本解析，不执行脚本。
++     *
++     * @param ignoreLock true 时不看 lock，直接给名字（列表为空时的兜底）
++     * @return 显示名（带 id），不该出现在列表里时返回 null
++     */
++    private String readKeyboardName(String keyboardId, boolean ignoreLock) {
++        String path = Config.getKeyboardPath(keyboardId);
++        String name = null;
++        boolean lock = false;
++        BufferedReader reader = null;
+         try {
+-            String path = Config.getKeyboardPath(keyboardId);
+-            LuaValue chunk = globals.loadfilex(path, env);
+-            if (chunk.isfunction()) {
+-                chunk.call();
+-                LuaValue nameValue = env.get("name");
+-                if(!env.get("lock").toboolean())
+-                    return null;
+-                if (nameValue.isstring()) {
+-                    return nameValue.tojstring()+ " (" + keyboardId + ")"; // 仅返回名称，ID 在 UI 组装处处理
+-                }
++            reader = new BufferedReader(new InputStreamReader(new FileInputStream(path), "UTF-8"));
++            String line;
++            while ((line = reader.readLine()) != null) {
++                String text = line.trim();
++                if (text.startsWith("--")) continue;
++                int c = text.indexOf("--");
++                if (c >= 0) text = text.substring(0, c).trim();
++                if (name == null) name = luaString(text, "name");
++                if (!lock) lock = luaTrue(text, "lock");
+             }
+         } catch (Exception e) {
+-            return keyboardId + " (" + e + ")";
++            // 文件读不了就按 id 显示，至少还能选
++            return keyboardId;
++        } finally {
++            if (reader != null) {
++                try {
++                    reader.close();
++                } catch (Exception ignored) {
++                }
 +            }
-+        });
++        }
++        if (!ignoreLock && !lock) return null;
++        if (TextUtils.isEmpty(name)) return keyboardId;
++        return name + " (" + keyboardId + ")";
++    }
++
++    /** 取 `key = "..."` / `key = '...'` / `key = [[...]]` 的字面量内容 */
++    private static String luaString(String line, String key) {
++        int i = indexOfKey(line, key);
++        if (i < 0) return null;
++        String rest = line.substring(i + key.length()).trim();
++        if (!rest.startsWith("=")) return null;
++        rest = rest.substring(1).trim();
++        if (rest.startsWith("[[")) {
++            int end = rest.indexOf("]]", 2);
++            return end < 0 ? null : rest.substring(2, end);
++        }
++        if (rest.isEmpty()) return null;
++        char quote = rest.charAt(0);
++        if (quote != '"' && quote != '\'') return null;
++        int end = rest.indexOf(quote, 1);
++        while (end > 0 && rest.charAt(end - 1) == '\\') {
++            end = rest.indexOf(quote, end + 1);
++        }
++        if (end < 0) return null;
++        String text = rest.substring(1, end);
++        // 还原 \" 与 \\ 两种转义
++        return text.replace("\\\"", "\"").replace("\\\\", "\\");
++    }
++
++    /** 取 `key = true` */
++    private static boolean luaTrue(String line, String key) {
++        int i = indexOfKey(line, key);
++        if (i < 0) return false;
++        String rest = line.substring(i + key.length()).trim();
++        if (!rest.startsWith("=")) return false;
++        return rest.substring(1).trim().startsWith("true");
++    }
++
++    /** 在行内找独立出现的 key（避免 `my_name`、`--name` 之类误匹配） */
++    private static int indexOfKey(String line, String key) {
++        int from = 0;
++        while (true) {
++            int i = line.indexOf(key, from);
++            if (i < 0) return -1;
++            boolean leftOk = i == 0 || !isIdentChar(line.charAt(i - 1));
++            int after = i + key.length();
++            boolean rightOk = after >= line.length() || !isIdentChar(line.charAt(after));
++            if (leftOk && rightOk) return i;
++            from = i + key.length();
+         }
+-        return keyboardId;
++    }
++
++    private static boolean isIdentChar(char c) {
++        return Character.isLetterOrDigit(c) || c == '_';
      }
  
-     /**
+     public void show() {
 diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
 --- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 20:08:37.027405776 +0800
-+++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 20:49:29.701785255 +0800
++++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 21:17:41.815727385 +0800
 @@ -60,10 +60,7 @@
          super(context);
          setClipChildren(false);
@@ -178,7 +311,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
      }
  
      @Override
-@@ -130,6 +127,15 @@
+@@ -130,21 +127,50 @@
  
      private String mCurrentSchemaId;
  
@@ -194,16 +327,19 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
      // 2. 视图缓存：SchemaId -> KeyboardView 实例
      private final Map<String, KeyboardView> mViewCache = new HashMap<>();
      private final Map<String, SymbolsKeyboardView> mSymbolsViewCache = new HashMap<>();
-@@ -141,10 +147,30 @@
+ 
+     public void setKeyboard(String id) {
+-        Log.w("TAG", "setKeyboard:s " + id);
+         if (".last".equals(id)) {
+             if (oldView != null)
                  setKeyboardView(oldView);
              return;
          }
 +        boolean forceReload = false;
 +        if (".reload".equals(id)) {
-+            // 「重新应用键盘」：偏好可能被清空（自动匹配），也可能只是要求把键盘重建一次。
-+            // 默认键盘对话框为了列出名称会逐个 load 键盘 lua，脚本里的全局副作用
-+            // （典型是给部分按键挂上的滑动接管）会把当前键盘的运行时状态改掉，
-+            // 只有重跑当前键盘脚本才能恢复——所以这里连视图缓存一起丢掉。
++            // 「重新应用键盘」：连视图缓存一起丢掉，让键盘脚本重跑一遍。
++            // 用于设置里点「自动匹配」（偏好已清空，必须重算），
++            // 以及任何要求把当前键盘完整重建的场合。
 +            mCurrentSchemaId = null;
 +            id = Config.currentSchema();
 +            // 从设置页返回的瞬间 schema 可能还没就绪，退到上一次真正加载的键盘名，
@@ -213,6 +349,8 @@ diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/jav
 +            forceReload = true;
 +        }
          if (id == null || id.equals(mCurrentSchemaId)) return;
++        // 只在真的要换/重建键盘时打一行，避免每次候选刷新刷屏
++        Log.w("TAG", "setKeyboard:s " + id + (forceReload ? " (reload)" : ""));
          mCurrentSchemaId = id;
          id = getKeyboardId(id);
 -        Log.w("TAG", "setKeyboard:e " + id);
