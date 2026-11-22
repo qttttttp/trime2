@@ -64,15 +64,29 @@ pcall(function() dm = activity.getResources().getDisplayMetrics() end)
 if not dm then dm = { density = 2, widthPixels = 1080, heightPixels = 1920 } end
 
 function dp(n) return math.floor(n * dm.density + 0.5) end
-function toast(msg) Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show() end
+-- Toast 必须包 pcall：工具界面已销毁（用户按返回键退出）后，任何延迟回调里再弹
+-- Toast 都会抛 BadTokenException / "not attached to window"。这条异常一旦逃到
+-- Handler 的 Runnable 里就是进程级未捕获异常 —— 同进程的输入法一起挂。
+function toast(msg)
+    pcall(function() Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show() end)
+end
 
--- 【崩溃取证】接管 Java 层"未捕获异常"，把完整堆栈写进 /sdcard/Download/主题工作室_崩溃.txt。
+-- 【崩溃取证】把 Java 层"未捕获异常"的完整堆栈写进 /sdcard/Download/主题工作室_崩溃.txt。
 -- 判断价值：这条文件里有记录 → 是 Java 异常（NPE / BadToken / IllegalState 等）；
 --            没有记录却进程消失 → 是 native 崩溃或被系统杀（ANR/OOM），两者处置完全不同。
+--
+-- 【重要·不要越权】工具与输入法是【同一个进程】，这里的 handler 是进程级、全局的。
+-- 旧实现记录完直接 Process.killProcess()，等于把「工具里一次可恢复的 Java 异常」
+-- 升级成「整个输入法被杀」——用户看到的就是闪退。现改为：
+--   ① 只记录，绝不主动杀进程；
+--   ② 记录完把异常原样转交给安装前的 handler（系统默认 / 输入法自己的上报器），
+--      后续行为与没装这个工具时完全一致，不改变任何进程级语义。
 pcall(function()
     local JThread   = luajava.bindClass("java.lang.Thread")
     local StringWriter = luajava.bindClass("java.io.StringWriter")
     local PrintWriter  = luajava.bindClass("java.io.PrintWriter")
+    local prevHandler = nil
+    pcall(function() prevHandler = JThread.getDefaultUncaughtExceptionHandler() end)
     local handler = luajava.createProxy("java.lang.Thread$UncaughtExceptionHandler", {
         uncaughtException = function(t, e)
             pcall(function()
@@ -88,14 +102,16 @@ pcall(function()
                     f:close()
                 end
             end)
-            -- 记录完主动退出，避免主线程已死却留下半死不活的进程
-            pcall(function()
-                local P = luajava.bindClass("android.os.Process")
-                P.killProcess(P.myPid())
-            end)
+            -- 转交原 handler：不吞、不杀、不改变退出路径
+            if prevHandler then
+                pcall(function() prevHandler:uncaughtException(t, e) end)
+            end
         end
     })
-    if handler then JThread.setDefaultUncaughtExceptionHandler(handler) end
+    -- 已经是自己的 handler（脚本被重跑）就不再套一层，避免多重转发
+    if handler and prevHandler ~= handler then
+        JThread.setDefaultUncaughtExceptionHandler(handler)
+    end
 end)
 
 -- 工具内报错日志（logcat 抓不到时的兜底）
@@ -1257,11 +1273,15 @@ end
 local fontIndex = nil
 function buildFontIndex()
     fontIndex = {}
-    local function scan(dir, depth)
-        if not dir or depth > 4 or not isDir(dir) then return end
+    -- 深度限制很关键：万象这类主题根目录会有成百上千个图片/脚本，
+    -- 旧实现递归整棵树（深度 4）只为了找一个 iconfont.ttf，切一次主题就卡一下。
+    -- fonts 目录深一点，主题根只看到一级子目录即可。
+    local function scan(dir, depth, maxDepth)
+        if not dir or depth > maxDepth or not isDir(dir) then return end
         for _, name in ipairs(listDir(dir)) do
             local p = dir .. "/" .. name
-            if isDir(p) then scan(p, depth + 1)
+            if isDir(p) then
+                scan(p, depth + 1, maxDepth)
             elseif name:lower():match("%.ttf$") or name:lower():match("%.otf$") then
                 local low = name:lower()
                 if fontIndex[low] == nil then fontIndex[low] = p end
@@ -1272,10 +1292,10 @@ function buildFontIndex()
         end
     end
     if themeDir then
-        scan(themeDir .. "/fonts", 0)   -- 标准字体目录
-        scan(themeDir, 0)               -- 万象等主题常把 iconfont.ttf 放主题根或子目录
+        scan(themeDir .. "/fonts", 0, 4)   -- 标准字体目录
+        scan(themeDir, 0, 2)               -- 万象等主题常把 iconfont.ttf 放主题根或一级子目录
     end
-    if styleDir then scan(styleDir, 0) end  -- 样式目录内字体
+    if styleDir then scan(styleDir, 0, 2) end
 end
 function findFont(name)
     if type(name) ~= "string" or name == "" then return nil end
@@ -1284,6 +1304,8 @@ function findFont(name)
         local p = themeDir .. "/fonts/" .. name
         if fileExists(p) then return p end
     end
+    -- 懒建索引：主题脚本里没写字体时不必扫目录
+    if not fontIndex then buildFontIndex() end
     if fontIndex then
         local low = name:lower()
         local hit = fontIndex[low]
@@ -1300,14 +1322,36 @@ function findFont(name)
     end
     return nil
 end
+-- 字体缓存 + 文件校验。
+-- Typeface.createFromFile 每次都会重新读盘并让 native（Skia）解析字形，而预览里
+-- 每个键的每个标签（主标签、long_click 角标、hint 角标）都要取一次字体：
+-- 一次渲染就是 100+ 次 createFromFile → 明显卡顿、内存抖动。更麻烦的是，
+-- 损坏的或只是改了后缀名的「假 .ttf」会让 Skia 在 native 层直接崩（SIGSEGV，
+-- Lua 的 pcall 完全挡不住），表现就是输入法闪退。这里按路径缓存，
+-- 并且只接受大小合理、扩展名正确的字体文件；失败记 false，不反复重试。
+local tfCache = {}
+local JFileCls = nil
+pcall(function() JFileCls = luajava.bindClass("java.io.File") end)
 function loadTypeface(name)
     local p = findFont(name)
     if not p then return nil end
+    local hit = tfCache[p]
+    if hit ~= nil then return hit or nil end
+    local lower = tostring(p):lower()
+    if not lower:match("%.tt[fc]$") then tfCache[p] = false; return nil end
+    local okSize, size = false, 0
+    if JFileCls then
+        okSize, size = pcall(function() return JFileCls(p):length() end)
+    end
+    if not okSize or type(size) ~= "number" or size <= 0 or size > 12 * 1024 * 1024 then
+        tfCache[p] = false
+        return nil
+    end
     local ok, tf = pcall(function()
         return luajava.bindClass("android.graphics.Typeface").createFromFile(p)
     end)
-    if ok then return tf end
-    return nil
+    tfCache[p] = (ok and tf) or false
+    return tfCache[p] or nil
 end
 
 function buildPresetKeys()
@@ -1695,7 +1739,7 @@ function buildToolbarPreview(W)
     if type(tbbg) == "string" then
         local p = findImage(tbbg)
         if p then pcall(function()
-            local bmp = BitmapFactory.decodeFile(p)
+            local bmp = decodeImage(p, W, tbH)
             if bmp then row.setBackgroundDrawable(BitmapDrawable(activity.getResources(), bmp)) end
         end) end
     elseif type(tbbg) == "number" then
@@ -1902,7 +1946,7 @@ function buildCandidatePreview(W)
     if type(cdbg) == "string" then
         local p = findImage(cdbg)
         if p then pcall(function()
-            local bmp = BitmapFactory.decodeFile(p)
+            local bmp = decodeImage(p, W, cdH)
             if bmp then row.setBackgroundDrawable(BitmapDrawable(activity.getResources(), bmp)) end
         end) end
     elseif type(cdbg) == "number" then pcall(function() row.setBackgroundColor(cdbg) end) end
@@ -2034,6 +2078,69 @@ end
 -- 生成按键背景 Drawable（颜色 / 图片 + 圆角 + 描边），严格对齐 Style.getDrawable：
 --   真机 Style.getDrawable：radiusPx = dp(corner_radius)（不缩放）；
 --   strokeWidth = dp(stroke_width)，strokeColor = stroke_color，strokeWidth>0 才描边。
+-- ========== 图片解码缓存（防 OOM：这是「偶尔闪退」最容易被忽略的一处） ==========
+-- 真实主题的图片背景常见 1000~4000 px。BitmapFactory.decodeFile 不采样会把整张图按
+-- ARGB_8888 展开（4000×4000 ≈ 61 MB），而预览每重建一次就要为每个键解码一次背景图：
+-- 36 键 × 2（普通 + 按下态）+ 工具栏 + 候选栏，一次拖动滑块就能触发几十上百次全尺寸解码
+-- → 堆被吃满 → OutOfMemoryError / native 分配失败 → 同进程的输入法直接闪退。
+-- 这里做两件事：
+--   ① 按目标显示尺寸算 inSampleSize，绝不把整张大图展开；
+--   ② 同一路径 + 同一参数只解码一次，后续复用同一张 Bitmap。
+-- 淘汰时【不能 recycle】：旧 Bitmap 仍被 BitmapDrawable / View 引用，
+-- recycle 后下一次绘制会抛 "trying to use a recycled bitmap"，那同样是崩溃。
+local bmpCache, bmpCacheN, BMP_CACHE_MAX = {}, 0, 48
+
+local function bmpCachePut(k, v)
+    if bmpCache[k] == nil then
+        if bmpCacheN >= BMP_CACHE_MAX then bmpCache, bmpCacheN = {}, 0 end
+        bmpCacheN = bmpCacheN + 1
+    end
+    bmpCache[k] = v
+    return v
+end
+
+-- reqW/reqH = 目标显示尺寸（px）；传 nil/0 时只做总像素上限保护
+local bmpOptionsUsable = true   -- 个别机型/AndroLua 版本拿不到 BitmapFactory.Options 时降级
+function decodeImage(path, reqW, reqH)
+    if type(path) ~= "string" or path == "" then return nil end
+    local key = "d|" .. path .. "|" .. tostring(reqW or 0) .. "x" .. tostring(reqH or 0)
+    local hit = bmpCache[key]
+    if hit ~= nil then return hit or nil end
+    local bmp = nil
+    if bmpOptionsUsable then
+        local ok, r = pcall(function()
+            local o1 = BitmapFactory.Options()
+            o1.inJustDecodeBounds = true
+            BitmapFactory.decodeFile(path, o1)
+            local w, h = o1.outWidth, o1.outHeight
+            if not w or not h or w <= 0 or h <= 0 then return nil end
+            local sample = 1
+            local maxW, maxH = tonumber(reqW) or 0, tonumber(reqH) or 0
+            if maxW > 0 and maxH > 0 then
+                -- 留 2 倍余量，避免高 DPI 下糊掉
+                while (w / sample) > maxW * 2 and (h / sample) > maxH * 2 do sample = sample * 2 end
+            end
+            -- 硬上限：单张不超过约 240 万像素（ARGB_8888 ≈ 9.6 MB）
+            while (w / sample) * (h / sample) > 2400000 do sample = sample * 2 end
+            local o2 = BitmapFactory.Options()
+            o2.inSampleSize = sample
+            o2.inPreferredConfig = Bitmap.Config.ARGB_8888
+            return BitmapFactory.decodeFile(path, o2)
+        end)
+        if ok then
+            bmp = r
+        else
+            bmpOptionsUsable = false   -- 不再尝试，后续统一走普通解码
+        end
+    end
+    if not bmp then
+        local ok, r = pcall(function() return BitmapFactory.decodeFile(path) end)
+        if ok then bmp = r end
+    end
+    if not bmp then bmpCachePut(key, false); return nil end
+    return bmpCachePut(key, bmp)
+end
+
 -- 关键修复：图片背景也要加圆角和边框（真机用 LuaBitmapDrawable，工具改为
 --   先用 Canvas 把图片裁成圆角矩形，再叠加边框描边），不能像旧代码那样直接返回
 --   无圆角的 BitmapDrawable。
@@ -2069,16 +2176,29 @@ local function roundedBitmap(bmp, radiusPx, strokeWpx, strokeColor)
     return out
 end
 
+-- 圆角/描边结果同样缓存：同一张键背景图在 36 个键上会被裁 36 次，
+-- 每次都新建一张同尺寸 Bitmap + Canvas（内存与耗时都是 36 倍）。
+local function roundedCached(path, bmp, radiusPx, strokeWpx, strokeColor)
+    local key = "r|" .. tostring(path) .. "|" .. tostring(radiusPx) .. "|"
+        .. tostring(strokeWpx) .. "|" .. tostring(strokeColor)
+    local hit = bmpCache[key]
+    if hit ~= nil then return hit or nil end
+    local ok, rb = pcall(roundedBitmap, bmp, radiusPx, strokeWpx, strokeColor)
+    if not ok or not rb then bmpCachePut(key, false); return nil end
+    return bmpCachePut(key, rb)
+end
+
 function makeKeyBackground(stName, bg, radius, strokeW, strokeColor)
     local radiusPx = dp(tonumber(radius) or 0)          -- 与真机一致：不乘缩放系数
     local strokeWpx = dp(tonumber(strokeW) or 0)
     if type(bg) == "string" then
         local p = findImage(bg)
         if p then
-            local bmp = BitmapFactory.decodeFile(p)
+            -- 单个键的显示尺寸约 100~150 px，按 160dp 采样已足够清晰
+            local bmp = decodeImage(p, dp(160), dp(160))
             if bmp then
-                local rb = roundedBitmap(bmp, radiusPx, strokeWpx, strokeColor)
-                return BitmapDrawable(activity.getResources(), rb)
+                local rb = roundedCached(p, bmp, radiusPx, strokeWpx, strokeColor)
+                if rb then return BitmapDrawable(activity.getResources(), rb) end
             end
         end
     end
@@ -2531,7 +2651,7 @@ function renderPreviewImpl()
             iv.setLayoutParams(FrameLayout.LayoutParams(-1, -1))
             iv.setScaleType(ImageView.ScaleType.FIT_XY)
             pcall(function()
-                local bmp = BitmapFactory.decodeFile(p)
+                local bmp = decodeImage(p, W, previewBox.getHeight())
                 if bmp then iv.setImageBitmap(bmp) end
             end)
             previewBox.addView(iv)
@@ -2601,7 +2721,7 @@ function renderPreviewImpl()
     if type(kbg) == "string" then
         local p = findImage(kbg)
         if p then pcall(function()
-            local bmp = BitmapFactory.decodeFile(p)
+            local bmp = decodeImage(p, W, kbH)
             if bmp then kb.setBackgroundDrawable(BitmapDrawable(activity.getResources(), bmp)) end
         end) end
     elseif type(kbg) == "number" then
@@ -2781,7 +2901,44 @@ function renderPreviewImpl()
     end
 end
 
+-- 【渲染节流】拖动颜色/尺寸滑块时，每个 onTouch 帧都会调 renderPreview：
+-- 一次全量渲染要重建整棵预览树（几十个键 × 若干 View）并解码全部背景图，
+-- 连续触发会把主线程占满几十秒 —— 表现为「卡死」，严重时被系统判 ANR 杀掉。
+-- 这里把 60 ms 内的多次请求合并成一次；合并后一定执行，读取的是当时的内存值，
+-- 因此最终画面始终正确，只是少了中间帧。
+-- 真实时钟（毫秒）。os.clock() 是 CPU 时间：主线程空闲时它几乎不走，
+-- 用它做节流会把"间隔很久"误判成"刚刚渲染过"，导致画面一直慢半拍。
+local JSystem = nil
+pcall(function() JSystem = luajava.bindClass("java.lang.System") end)
+local function wallMs()
+    if JSystem then
+        local ok, v = pcall(function() return JSystem.currentTimeMillis() end)
+        if ok and type(v) == "number" then return v end
+    end
+    return os.time() * 1000
+end
+
+local renderQueued, renderLastT = false, 0
 renderPreview = function()
+    -- 工具界面已销毁（用户退出）后不再碰 View：Activity 已 detach 时做 addView/layout
+    -- 会抛 BadTokenException / IllegalStateException，逃到 Handler 的 Runnable 里
+    -- 就是进程级未捕获异常（同进程 = 输入法一起挂）。
+    if type(activityDead) == "function" and activityDead() then return end
+    local t = wallMs()
+    if t - renderLastT < 50 then
+        if not renderQueued then
+            renderQueued = true
+            uiHandler.postDelayed(function()
+                renderQueued = false
+                if type(activityDead) == "function" and activityDead() then return end
+                renderLastT = wallMs()
+                local ok, e = pcall(renderPreviewImpl)
+                if not ok then logErr("预览渲染", e) end
+            end, 60)
+        end
+        return
+    end
+    renderLastT = t
     local ok, e = pcall(renderPreviewImpl)
     if not ok then
         logErr("预览渲染", e)
@@ -3022,11 +3179,23 @@ function colorDialog(title, curNum, onPick)
     local function buildSvBitmap()
         local ok, bmp = pcall(function()
             local b0 = Bitmap.createBitmap(SV_N, SV_N, Bitmap.Config.ARGB_8888)
+            -- 【必须批量写】旧实现逐像素 setPixel：96×96 = 9216 次 JNI 调用/帧，
+            -- 色相条一拖就是每秒几十万次跨语言调用 → 主线程被钉死，输入法同进程一起卡/ANR。
+            -- 改成先在 Lua 表里算完，再一次性 setPixels 送过去（LuaJ 不支持时回退逐个写）。
+            local px, i = {}, 1
             for y = 0, SV_N - 1 do
                 local vv = 1 - y / (SV_N - 1)
                 for x = 0, SV_N - 1 do
                     local rr, gg, bb = hsvToRgb(h, x / (SV_N - 1), vv)
-                    b0.setPixel(x, y, 0xFF000000 + rr * 0x10000 + gg * 0x100 + bb)
+                    px[i] = 0xFF000000 + rr * 0x10000 + gg * 0x100 + bb
+                    i = i + 1
+                end
+            end
+            local okSet = pcall(function() b0.setPixels(px, 0, SV_N, 0, 0, SV_N, SV_N) end)
+            if not okSet then
+                i = 1
+                for y = 0, SV_N - 1 do
+                    for x = 0, SV_N - 1 do b0.setPixel(x, y, px[i]); i = i + 1 end
                 end
             end
             return b0
@@ -3086,11 +3255,20 @@ function colorDialog(title, curNum, onPick)
         end
         return true
     end)
+    -- 色相条拖动：色板必须跟着变，但重建 96×96 位图有成本。限制到 ~14 fps，
+    -- 中间帧只更新指示线与数值，手感不受影响，主线程也不会被占满。
+    local lastSvT = -1000
     hueBox.setOnTouchListener(function(view, event)
         local act = event.getAction()
         if act == 0 or act == 2 then
             h = math.min(360, math.max(0, event.getY() / view.getHeight() * 360))
-            refreshAll(true)
+            local t = wallMs()
+            if act == 0 or t - lastSvT >= 70 then
+                lastSvT = t
+                refreshAll(true)
+            else
+                refreshAll(false)
+            end
         end
         return true
     end)
@@ -5660,6 +5838,7 @@ end
 function loadVariant(variant, bridgeStyle)
     if not themeDir then return end
     clearOwnStyles()         -- 换配色：专属样式表取自旧 styleEnv，一并作废
+    fontIndex = nil          -- 配色目录也参与字体查找，索引一并作废
     currentVariant = variant
     -- 【首选】Java 桥接的真实配色数据（输入法正在用的），优先于沙箱执行
     if bridgeStyle and type(bridgeStyle) == "table" and next(bridgeStyle) ~= nil then
@@ -5768,7 +5947,7 @@ function loadTheme(name)
     end
     buildPresetKeys()
     buildLabelImgIndex()
-    buildFontIndex()
+    fontIndex = nil          -- 换了主题：字体索引作废，等真正用到字体时再建（懒加载）
     styleEdits, kbdEdits, kbdOps = {}, {}, {}
     dirtyCount = 0
     refreshDirty()
@@ -6234,18 +6413,33 @@ end
 local okBoot, bootErr = pcall(safeBoot)
 if not okBoot then logErr("启动", bootErr) end
 
--- 启动完成后同步读一次真机键盘 View 显示文本（顶层必达，不依赖 postDelayed）。
--- 真机键盘此时通常已显示；读不到也会把原因写进 load.txt。
-pcall(function()
+-- 【启动减负】读真机键盘 View 的文字，改为首帧之后再读。
+-- 顶层代码在 LuaActivity 还没完成首次布局时执行，此时同步遍历输入法整棵 View 树
+-- （最多 600 个节点，每个节点多次 JNI 取 getText/getWidth…）会把主线程占住几百毫秒，
+-- 首屏白屏、严重时 ANR —— 而 ANR 的后果是【同进程的输入法一起被系统杀掉】。
+-- 放到 postDelayed 后，界面先出来，这次遍历只是补一次文字源；失败也不影响可用性。
+local function dumpLiveTexts()
     local okr, r = pcall(dumpKbViewTexts)
-    if not okr then r = "dumpKbViewTexts 异常：" .. tostring(r) end
+    if not okr then
+        logErr("View文本", "dumpKbViewTexts 异常：" .. tostring(r))
+        return false
+    end
     -- 文本可能较长，按行拆成多条，避免单条过长被面板截断。
     local n = 0
     for line in tostring(r):gmatch("[^\n]+") do
         n = n + 1
         if n <= 40 then logErr("View文本", line) end
     end
-    -- 【真机文字源】顶层同步 dump 是「必达」入口（延迟回调常不执行，见用户日志只有此段）。
+    -- 【真机文字源】解析出每键真实文字后重渲染
     pcall(applyLiveFromRaw, r)
+    return liveKeyTexts ~= nil
+end
+pcall(function()
+    uiHandler.postDelayed(function()
+        -- 第一次没解析出来（键盘还没画完/服务未就绪）再补一次，不无限重试
+        if not dumpLiveTexts() then
+            uiHandler.postDelayed(dumpLiveTexts, 1200)
+        end
+    end, 200)
 end)
 
