@@ -1,7 +1,7 @@
 diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	1970-01-01 08:00:00.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-22 13:50:15.615578437 +0800
-@@ -0,0 +1,766 @@
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-22 22:35:00.000000000 +0800
+@@ -0,0 +1,880 @@
 +/*
 + * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
 + *
@@ -706,6 +706,120 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +    /** 兼容别名：早期工具端调用此方法，实际返回整个 root 的文本 */
 +    public static String dumpKeyboardTexts() {
 +        return dumpRootTexts();
++    }
++
++    // =====================================================================
++    // 【r27】结构化键盘导出 —— 工具"直接复刻缓存的整棵 KeyView 树"的权威数据源。
++    //
++    // 旧的 dumpRootTexts() 把整棵树拍平成缩进文本，工具侧要反推"哪些行属于同一个键"
++    // （靠 @0,0 锚点/缩进）和"每个角标是哪个方向"（靠 cx/cy 比例猜）——换主题/分辨率
++    // 必错（用户实测"原主题有偏移的全部居中"）。这里改由 Java 在编译期直接按 KeyView
++    // 结构导出，字段全部是真机实际布局的权威值：
++    //   · 方向 = 角标 TextView 的 FrameLayout.LayoutParams.gravity（真机 addHint 设的位）
++    //   · 坐标 = getLeft/getTop + getTranslationX/Y（最终视觉位置，工具直接当 margins 用）
++    //   · 文本 = getText()（Rime 转换后的最终显示文字）
++    //   · 顺序 = keyRoot 子节点 addView 顺序（mClick → long_click → hint → up/down/left/right）
++    // 全程只读 View 属性，无任何 native 引擎调用，和 dumpRootTexts 一样安全。
++    //
++    // 输出格式（纯 ASCII 键值，便于 Lua pattern 稳定解析）：
++    //   KS ROOT <SimpleName>
++    //   KSKEY <seq> box=<l>,<t>,<w>,<h>
++    //   KSCLICK <seq> g=<gravity> xy=<x>,<y>,<w>,<h> vis=<0|4|8> txt=[<escaped>]
++    //   KSCORNER <seq> d=<TOP|BOTTOM|LEFT|RIGHT> xy=<x>,<y>,<w>,<h> cls=<name> txt=[<escaped>]
++    //   KSDONE n=<keyCount>
++    // 工具旧 APK 没有此方法时 pcall 失败，自动回退 dumpRootTexts + parseRootDumpToKeys。
++    // =====================================================================
++    public static String dumpKeyboardStructure() {
++        StringBuilder out = new StringBuilder();
++        try {
++            TrimeService svc = TrimeService.getInstance();
++            View root = (svc == null) ? null : svc.getRootView();
++            if (root == null) {
++                out.append("ERR: RootInputView 为空（输入法服务未启动？）");
++                return out.toString();
++            }
++            out.append("KS ROOT ").append(root.getClass().getSimpleName()).append('\n');
++            final int[] seq = {0};
++            collectKeyStructs(root, out, seq, 0);
++            out.append("KSDONE n=").append(seq[0]);
++        } catch (Throwable t) {
++            out.append("ERR: ").append(t);
++        }
++        return out.toString();
++    }
++
++    /** 深度优先找每一个 KeyView；找到后不再深入其内部（避免把 popup 键盘重复计入）。 */
++    private static void collectKeyStructs(View v, StringBuilder out, int[] seq, int depth) {
++        if (v == null || depth > 24 || seq[0] > 200) return;
++        try {
++            String cn = v.getClass().getName();
++            if (v instanceof ViewGroup && (cn.endsWith("KeyView") || cn.contains(".KeyView"))) {
++                seq[0]++;
++                int s = seq[0];
++                out.append("KSKEY ").append(s)
++                    .append(" box=").append(v.getLeft()).append(',').append(v.getTop())
++                    .append(',').append(v.getWidth()).append(',').append(v.getHeight())
++                    .append('\n');
++                ViewGroup keyRoot = null;
++                try { keyRoot = (ViewGroup) ((ViewGroup) v).getChildAt(0); } catch (Throwable ignore) {}
++                if (keyRoot != null) {
++                    int n = keyRoot.getChildCount();
++                    for (int i = 0; i < n; i++) {
++                        View c = keyRoot.getChildAt(i);
++                        if (!(c instanceof TextView)) continue;
++                        int vis = c.getVisibility();
++                        CharSequence cs = ((TextView) c).getText();
++                        String txt = cs == null ? "" : cs.toString().replace("\n", "\\n")
++                                .replace("[", "%5B").replace("]", "%5D");
++                        int g = 0;
++                        try {
++                            ViewGroup.LayoutParams lp = c.getLayoutParams();
++                            if (lp instanceof android.widget.FrameLayout.LayoutParams)
++                                g = ((android.widget.FrameLayout.LayoutParams) lp).gravity;
++                        } catch (Throwable ignore) {}
++                        // 最终视觉坐标 = 布局坐标 + translation；工具当 LP margins 直接搬。
++                        int vx = Math.round(c.getLeft() + c.getTranslationX());
++                        int vy = Math.round(c.getTop() + c.getTranslationY());
++                        if (i == 0) {
++                            // keyRoot 的第一个 TextView 恒为 mClick（initView 里最先 addView）。
++                            out.append("KSCLICK ").append(s)
++                                .append(" g=").append(g)
++                                .append(" xy=").append(vx).append(',').append(vy)
++                                .append(',').append(c.getWidth()).append(',').append(c.getHeight())
++                                .append(" vis=").append(vis)
++                                .append(" txt=[").append(txt).append("]\n");
++                        } else if (vis == View.VISIBLE && txt.length() > 0) {
++                            String dir = gravityDir(g);
++                            if (!dir.isEmpty()) {
++                                out.append("KSCORNER ").append(s)
++                                    .append(" d=").append(dir)
++                                    .append(" xy=").append(vx).append(',').append(vy)
++                                    .append(',').append(c.getWidth()).append(',').append(c.getHeight())
++                                    .append(" cls=").append(c.getClass().getSimpleName())
++                                    .append(" txt=[").append(txt).append("]\n");
++                            }
++                        }
++                    }
++                }
++                return;
++            }
++            if (v instanceof ViewGroup) {
++                ViewGroup g = (ViewGroup) v;
++                for (int i = 0; i < g.getChildCount(); i++)
++                    collectKeyStructs(g.getChildAt(i), out, seq, depth + 1);
++            }
++        } catch (Throwable ignore) {
++            // 单个 View 失败不影响整体
++        }
++    }
++
++    /** 由 LayoutParams.gravity 的位标志还原真机角标方向。 */
++    private static String gravityDir(int g) {
++        if ((g & android.view.Gravity.TOP) == android.view.Gravity.TOP) return "TOP";
++        if ((g & android.view.Gravity.BOTTOM) == android.view.Gravity.BOTTOM) return "BOTTOM";
++        if ((g & android.view.Gravity.LEFT) == android.view.Gravity.LEFT) return "LEFT";
++        if ((g & android.view.Gravity.RIGHT) == android.view.Gravity.RIGHT) return "RIGHT";
++        return "";
 +    }
 +
 +    private static void walkView(View v, StringBuilder out, int depth, int[] count, String region) {
