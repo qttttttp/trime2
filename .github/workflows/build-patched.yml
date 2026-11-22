@@ -142,26 +142,18 @@ jobs:
           done
           git status --short | head -20
 
-      # 16 号只做接入，工具文件靠 builtin-tools/ 复制，两样必须同批提交。
-      # 只更新补丁会在编译到 ToolActivity 时才报 cannot find symbol BuiltinTools，
-      # 白跑几分钟；这里提前拦住并指明要覆盖哪些路径。
-      - name: 检查 16 号补丁的配套文件
-        run: |
-          if [ -f patches/16-builtin-tools.patch ] && [ ! -d builtin-tools/app ]; then
-            echo "::error::patches/16-builtin-tools.patch 缺少配套目录 builtin-tools/app/"
-            echo "  请用 trime2-ci-sync.zip 整包覆盖仓库根，不要只更新 patches/："
-            echo "    .github/workflows/build-patched.yml"
-            echo "    patches/16-builtin-tools.patch"
-            echo "    builtin-tools/"
-            exit 1
-          fi
-          echo "OK: 16 号补丁与 builtin-tools/ 配套"
-
       - name: 应用补丁
         run: |
           set -e
           shopt -s nullglob
           found=0
+          # 16 号只做接入，工具文件在 builtin-tools/。仓库里没有工具包时
+          # 连 16 号一起跳过，这样没有工具的仓库也能正常出包，不会编译到
+          # ToolActivity 才报 cannot find symbol BuiltinTools。
+          has_tools=0
+          if [ -f builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java ]; then
+            has_tools=1
+          fi
           for p in patches/*.patch; do
             name=$(basename "$p")
             case "$name" in
@@ -169,6 +161,18 @@ jobs:
               *android9*|*安卓9*)
                 echo "跳过 $name (安卓 9 专用)"
                 continue
+                ;;
+              # 15 号（工具栏间距）已废弃：间距直接读 toolbar.elevation。
+              # 仓库里残留这个补丁也不再应用，避免旧包把布局改回去。
+              15-toolbar-margin*)
+                echo "跳过 $name (已废弃，间距用 toolbar.elevation)"
+                continue
+                ;;
+              16-builtin-tools.patch)
+                if [ "$has_tools" -eq 0 ]; then
+                  echo "跳过 $name (没有 builtin-tools/，本次不内置工具)"
+                  continue
+                fi
                 ;;
             esac
             found=1
@@ -194,16 +198,19 @@ jobs:
           fi
           git status --short | head -30
 
-      # 内置工具的 Lua 脚本和安装器不写进补丁：补丁里只留 25 行接入改动，
-      # 文件按 app/src/main 的目录结构放在 builtin-tools/ 下，构建时整目录覆盖过来。
-      # 这样改脚本就是改普通文件，diff 可读、补丁不会随脚本膨胀到几百 KB。
-      - name: 铺设内置工具文件（复制 builtin-tools/，不打进补丁）
+      # 内置工具的脚本和安装器不写进补丁：补丁只留接入改动，文件按
+      # app/src/main 的结构放在 builtin-tools/ 下。这里自动扫工具目录，
+      # 新增一个含 main.lua 的目录就会被复制进包，不用改 workflow 或清单。
+      - name: 铺设内置工具（有工具包才复制，新增目录自动加入）
         run: |
           set -e
           SRC=builtin-tools/app
-          if [ ! -d "$SRC" ]; then
-            echo "::error::缺少 $SRC 目录：内置工具应放在仓库根 builtin-tools/app 下"
-            exit 1
+          LIST=/tmp/builtin-tools-installed.txt
+          : > "$LIST"
+          JAVA="$SRC/src/main/java/com/osfans/trime/BuiltinTools.java"
+          if [ ! -f "$JAVA" ]; then
+            echo "::notice::没有 $JAVA，跳过内置工具；本次构建不含「一键更新」「主题工作室」"
+            exit 0
           fi
           # 白名单：只允许安装器 Java 与 assets/tools 下的工具文件，
           # 防止有人顺手把别的源码塞进来，覆盖掉上游文件还没人发现。
@@ -215,10 +222,34 @@ jobs:
             echo "$BAD"
             exit 1
           fi
-          cp -a "$SRC"/. app/
+          mkdir -p app/src/main/java/com/osfans/trime
+          cp -a "$JAVA" app/src/main/java/com/osfans/trime/
+          A="$SRC/src/main/assets/tools"
+          if [ -d "$A" ]; then
+            mkdir -p app/src/main/assets/tools
+            if [ -f "$A/manifest.txt" ]; then
+              cp -a "$A/manifest.txt" app/src/main/assets/tools/
+            fi
+            echo "=== 检测到的工具包 ==="
+            for d in "$A"/*/; do
+              [ -d "$d" ] || continue
+              name=$(basename "$d")
+              if [ ! -f "$d/main.lua" ]; then
+                echo "::warning::跳过 $name：根级没有 main.lua"
+                continue
+              fi
+              if [ -d "app/src/main/assets/tools/$name" ]; then
+                echo "  更新 $name"
+              else
+                echo "  新增 $name"
+              fi
+              mkdir -p "app/src/main/assets/tools/$name"
+              cp -a "$d". "app/src/main/assets/tools/$name/"
+              echo "$name" >> "$LIST"
+            done
+          fi
           echo "=== 已落地 ==="
-          find app/src/main/assets/tools -type f -printf '%8s  %p\n' | sort -k2
-          ls -l app/src/main/java/com/osfans/trime/BuiltinTools.java
+          cat "$LIST"
 
       - name: 补丁落地自检（每个补丁必须真正生效）
         run: |
@@ -257,27 +288,24 @@ jobs:
                 "sLoadedKeyboard" "14 键盘解析保护"
           check app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java \
                 "readKeyboardName" "14 对话框不执行键盘脚本"
-          check app/src/main/java/com/osfans/trime/candidate/ToolbarView.java \
-                "toolbarMargins" "15 工具栏与按键区间距"
-          check app/src/main/java/com/osfans/trime/BuiltinTools.java \
-                "ensureInstalled" "16 内置工具安装器"
-          check app/src/main/java/com/osfans/trime/BuiltinTools.java \
-                "collectTargets" "16 新工具自动发现"
-          check app/src/main/AndroidManifest.xml \
-                "REQUEST_INSTALL_PACKAGES" "16 安装权限"
-          check app/src/main/assets/tools/manifest.txt \
-                "yijian-update" "16 内置工具清单"
-          check app/src/main/assets/tools/yijian-update/main.lua \
-                "一键更新" "16 一键更新脚本"
-          check app/src/main/assets/tools/theme-studio/main.lua \
-                "主题工作室" "16 主题工作室脚本"
-          # 16 号补丁只留接入改动；工具文件应来自 builtin-tools/，
-          # 若补丁里又出现 main.lua，说明有人把脚本塞回去了，补丁会重新膨胀。
-          if grep -q 'assets/tools/.*\.lua' patches/16-builtin-tools.patch 2>/dev/null; then
-            echo "::error::16 号补丁里又内嵌了 Lua 脚本，请改放到 builtin-tools/app/src/main/assets/tools/"
-            exit 1
+          # 16 号只在有工具包时应用；没有工具包时相关自检整体跳过。
+          if [ -f builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java ]; then
+            check app/src/main/java/com/osfans/trime/BuiltinTools.java \
+                  "ensureInstalled" "16 内置工具安装器"
+            check app/src/main/java/com/osfans/trime/BuiltinTools.java \
+                  "collectTargets" "16 新工具自动发现"
+            check app/src/main/AndroidManifest.xml \
+                  "REQUEST_INSTALL_PACKAGES" "16 安装权限"
+            # 16 号补丁只留接入改动；工具文件应来自 builtin-tools/，
+            # 若补丁里又出现 main.lua，说明有人把脚本塞回去了，补丁会重新膨胀。
+            if grep -q 'assets/tools/.*\.lua' patches/16-builtin-tools.patch 2>/dev/null; then
+              echo "::error::16 号补丁里又内嵌了 Lua 脚本，请改放到 builtin-tools/app/src/main/assets/tools/"
+              exit 1
+            fi
+            echo "OK: 16 号补丁未内嵌工具脚本"
+          else
+            echo "跳过 16 自检（本次没有内置工具包）"
           fi
-          echo "OK: 16 号补丁未内嵌工具脚本"
 
       - name: 工具版本自检（防止仓库里只更新了一半）
         run: |
@@ -302,20 +330,26 @@ jobs:
           need tools/postprocess-apk.sh "patch-dex-https.py" "postprocess 串联 patch"
           # 内置工具源文件 → app/ 必须逐字节一致：复制路径写错时不会报错，
           # 只会把旧脚本打进包，装到手机上才发现没更新。
-          while IFS= read -r f; do
-            src="builtin-tools/app/$f"
-            dst="app/$f"
-            if [ ! -f "$dst" ]; then
-              echo "::error::内置工具未落地：$dst"
+          if [ -f builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java ]; then
+            if ! cmp -s builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java \
+                        app/src/main/java/com/osfans/trime/BuiltinTools.java; then
+              echo "::error::BuiltinTools.java 复制后内容不一致"
               exit 1
             fi
-            if ! cmp -s "$src" "$dst"; then
-              echo "::error::内置工具复制后内容不一致：$dst"
-              exit 1
+            if [ -s /tmp/builtin-tools-installed.txt ]; then
+              while IFS= read -r name; do
+                [ -n "$name" ] || continue
+                if ! diff -r "builtin-tools/app/src/main/assets/tools/$name" \
+                            "app/src/main/assets/tools/$name" >/dev/null; then
+                  echo "::error::工具包 $name 复制后内容不一致"
+                  exit 1
+                fi
+              done < /tmp/builtin-tools-installed.txt
             fi
-          done < <(cd builtin-tools/app && find src/main/assets/tools \
-                     src/main/java/com/osfans/trime/BuiltinTools.java -type f)
-          echo "OK: 内置工具复制一致"
+            echo "OK: 内置工具复制一致"
+          else
+            echo "跳过内置工具比对（本次没有工具包）"
+          fi
           for p in patches/07-boost-vmd.patch patches/08-opencc-missing-dict.patch; do
             if [ ! -f "$p" ]; then
               echo "::error::缺少补丁 $p"
@@ -561,17 +595,24 @@ jobs:
             exit 1
           fi
           echo "::notice::librime_jni.so 大小仅记录不比较：子模块已 pin 一致，剩余差异来自 CI 工具链，与下载链路无关"
-          echo "=== 内置工具自检（16 号补丁）==="
-          for t in assets/tools/manifest.txt assets/tools/yijian-update/main.lua \
-                   assets/tools/yijian-update/init.lua assets/tools/theme-studio/main.lua \
-                   assets/tools/theme-studio/init.lua; do
-            if unzip -l "$APK" | grep -qF "$t"; then
-              echo "  OK $t"
-            else
-              echo "::error::APK 里缺少 $t，16 号补丁未生效"
+          echo "=== 内置工具自检（按实际铺设清单）==="
+          if [ -s /tmp/builtin-tools-installed.txt ]; then
+            if ! unzip -l "$APK" | grep -qF "assets/tools/manifest.txt"; then
+              echo "::error::APK 里缺少 assets/tools/manifest.txt"
               exit 1
             fi
-          done
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              if unzip -l "$APK" | grep -qF "assets/tools/$name/main.lua"; then
+                echo "  OK assets/tools/$name"
+              else
+                echo "::error::APK 里缺少 assets/tools/$name/main.lua，工具包 $name 未打进包"
+                exit 1
+              fi
+            done < /tmp/builtin-tools-installed.txt
+          else
+            echo "  本次没有内置工具，跳过"
+          fi
           echo "=== manifest 地址自检（4 个 pack × [本地, 官方 https]）==="
           APK="$APK" python3 - <<'PYEOF'
           import zipfile, json, os, sys
@@ -642,7 +683,6 @@ jobs:
               12-InputView*)          echo "键盘快照|记住已加载的键盘，schema 未就绪时不再回落 36 键" ;;
               13-TrimeService*)       echo "根视图快照|根视图重建时保留键盘状态" ;;
               14-KeyboardDefaultFix*) echo "默认键盘与按键滑动|打开「默认键盘」不再改动当前键盘、不再让按键滑动失效；解析顺序改为 偏好 → 方案同名 → 主题 → qwerty36" ;;
-              15-toolbar-margin*)    echo "工具栏间距|工具栏与按键区之间支持独立留白（toolbar.margins.bottom），不必再借阴影高度" ;;
               16-builtin-tools*)     echo "内置工具|「一键更新」「主题工作室」随 APK 分发，装完在「工具」里直接可用；工具脚本改为从仓库 builtin-tools/ 直接复制（不再塞进补丁），补丁只保留接入改动。并补上安装权限，一键更新可直接拉起安装器" ;;
               *)                      echo "${1%.patch}|" ;;
             esac
@@ -674,7 +714,7 @@ jobs:
 
             if [ -n "$PREV_FORK" ] && git cat-file -e "${PREV_FORK}^{commit}" 2>/dev/null; then
               CHANGED=$(git diff --name-only --diff-filter=AM "${PREV_FORK}..${CUR}" -- patches 2>/dev/null \
-                          | grep '\.patch$' || true)
+                          | grep '\.patch$' | grep -v '15-toolbar-margin' || true)
               # 只改脚本（builtin-tools/）时补丁文件没变，也要算作 16 号有更新
               if [ -n "$(git diff --name-only --diff-filter=AM "${PREV_FORK}..${CUR}" -- builtin-tools 2>/dev/null)" ]; then
                 if ! printf '%s\n' "$CHANGED" | grep -q '16-builtin-tools'; then
@@ -700,11 +740,13 @@ jobs:
             fi
             echo
 
-            TOTAL=$(find patches -maxdepth 1 -name '*.patch' | wc -l | tr -d ' ')
+            TOTAL=$(find patches -maxdepth 1 -name '*.patch' \
+                      ! -name '15-toolbar-margin*' | wc -l | tr -d ' ')
             echo "<details><summary>构建内含全部补丁（${TOTAL} 个）</summary>"
             echo
             for p in patches/*.patch; do
               [ -f "$p" ] || continue
+              case "$(basename "$p")" in 15-toolbar-margin*) continue;; esac
               item_short "$(basename "$p")"
             done
             echo
