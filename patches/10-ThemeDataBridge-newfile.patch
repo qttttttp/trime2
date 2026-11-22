@@ -1,7 +1,7 @@
 diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	1970-01-01 08:00:00.000000000 +0800
 +++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-22 13:50:15.615578437 +0800
-@@ -0,0 +1,750 @@
+@@ -0,0 +1,766 @@
 +/*
 + * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
 + *
@@ -681,9 +681,16 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +    public static String dumpRootTexts() {
 +        StringBuilder out = new StringBuilder();
 +        try {
-+            View root = TrimeService.getCurrentRootView();
++            // 【r25 根因】旧代码调用 TrimeService.getCurrentRootView()——真机源码里
++            // 根本没有这个方法（只有实例方法 getRootView()），一调用就抛
++            // NoSuchMethodError，被外层 catch 成 "ERR:" 空串 → 工具 liveN=0，
++            // 整条真机坐标链从未生效。改用现成的静态单例 getInstance().getRootView()：
++            // sInstance 在 onCreate 赋值、仅 onDestroy 才清空，普通收键盘不销毁，
++            // 所以键盘收起时这块缓存的整棵 View 树依旧可读。
++            TrimeService svc = TrimeService.getInstance();
++            View root = (svc == null) ? null : svc.getRootView();
 +            if (root == null) {
-+                out.append("ERR: RootInputView 为空（输入法视图尚未就绪？）");
++                out.append("ERR: RootInputView 为空（输入法服务未启动？）");
 +                return out.toString();
 +            }
 +            String cls = root.getClass().getName();
@@ -726,7 +733,16 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +                   .append('@').append(v.getLeft()).append(',').append(v.getTop())
 +                   .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
 +                   .append(img ? " [IMG]" : " [TXT]")
-+                   .append(" = [").append(txt).append("]\n");
++                   .append(" = [").append(txt).append(']');
++                // 【r25】getLeft/getTop 是布局坐标，真机角标最终位置还叠加了
++                // setTranslationX/Y(offset_x/offset_y)。把 translation 一起 dump 出来，
++                // 工具按 视觉位置 = getTop + translationY 摆放，才能逐像素复现真机——
++                // 否则主题用 offset_y 定位角标时，照搬 getTop(=0) 仍会贴顶。
++                float tx = v.getTranslationX();
++                float ty = v.getTranslationY();
++                if (tx != 0f || ty != 0f)
++                    out.append(" tr=(").append(Math.round(tx)).append(',').append(Math.round(ty)).append(')');
++                out.append('\n');
 +                count[0]++;
 +            }
 +            try {
