@@ -1791,7 +1791,10 @@ local function downloadFile(url, path, filename)
     local downloadManager = activity.getSystemService(Context.DOWNLOAD_SERVICE)
     local dlurl = Uri.parse(url)
     local request = DownloadManager.Request(dlurl)
-    request.setAllowedNetworkTypes(DownloadManager.Request.NETWORK_MOBILE | DownloadManager.Request.NETWORK_WIFI)
+    -- Lua 5.1 / LuaJ 没有按位或（'|' 是语法错误，整个脚本会加载失败）：
+    -- NETWORK_MOBILE=1、NETWORK_WIFI=2，相加即 3，与 1|2 等价。
+    request.setAllowedNetworkTypes(DownloadManager.Request.NETWORK_MOBILE
+        + DownloadManager.Request.NETWORK_WIFI)
 
     -- 使用绝对路径
     local destFile = File(path, filename)
