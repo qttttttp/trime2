@@ -6490,6 +6490,12 @@ function dumpToolRenderedTexts()
     out[#out + 1] = string.format("[DIAG] liveN=%s rendered=%s ltHit=%s cornerXY=%s",
         tostring(liveKeyTextsN or 0), tostring(d.rendered or 0),
         tostring(d.ltHit or 0), tostring(d.cornerWithXY or 0))
+    -- 【r27】结构化数据源状态：n>0 corners>0 即 Java 权威结构已生效；
+    -- 空则为旧 APK（回退扁平解析），下次 dump 一眼可辨。
+    if _G.__ksDiag then out[#out + 1] = "[DIAG] KS " .. tostring(_G.__ksDiag) end
+    -- 【r25.1】桥接返回摘要（本轮真实值），判断桥接是否拿到真机 view：
+    -- ERR=[...] 非空=桥接调用失败；ROOT=[...] 非空=桥接通；kb/tv=读到的键盘文本行数。
+    if _G.__bridgeDiag then out[#out + 1] = "[DIAG] BRIDGE " .. _G.__bridgeDiag end
     local rl = d.relabel or {}
     if #rl > 0 then out[#out + 1] = "[DIAG] relabel=" .. table.concat(rl, ", ") end
     -- 【r24】角标样式推导参数（纯 Lua，键盘收起也可用）：gravity/offset 是否与真机一致，
@@ -6499,7 +6505,12 @@ function dumpToolRenderedTexts()
         out[#out + 1] = string.format("[CORNER] n=%d（通道 grav offset dump 文字）", #cd)
         for _, line in ipairs(cd) do out[#out + 1] = "[CORNER] " .. line end
     end
-    out[#out + 1] = "---- TOOL DONE ----"
+    -- 【r25.2】桥接状态塞进最后 emit 的这一行，确保诊断视图截断后仍可见。
+    -- 这一行直接定死桥接有没有拿到真机 view：
+    --   ERR=[非空] → 桥接调用失败（APK 桥接类不对 / 服务未就绪）
+    --   ROOT=[非空] kb>0 → 桥接通、读到键盘 view
+    --   ROOT=[非空] kb=0 → 桥接通但键盘区无文本（视图未 load / 类名匹配不上）
+    out[#out + 1] = "---- TOOL DONE ---- BRIDGE[" .. tostring(_G.__bridgeDiag or "nil") .. "]"
     return table.concat(out, "\n")
 end
 
@@ -6519,9 +6530,101 @@ function dumpKbViewTexts()
         r = r2
     end
     -- 同时附上【工具自渲染】View 树，与真机 dump 对照，一次定死 ▼ / 上标差异。
+    -- 【r25.2 诊断】桥接摘要必须在这里（生成工具段之前）算好：dumpToolRenderedTexts
+    -- 会把摘要塞进最后 emit 的 ---- TOOL DONE ---- 行。诊断视图只留末尾若干行，
+    -- 单独的 BRIDGE/[DIAG] 行在 emit 顺序前部会被工具段 150 行冲掉，只有 TOOL DONE 可见。
+    do
+        local rs = tostring(r)
+        local errLine = rs:match("(ERR:%s*[^\r\n]+)")
+        local rootLine = rs:match("(ROOT:%s*[^\r\n]+)")
+        local kb, tv = 0, 0
+        for _ in rs:gmatch("%[KEYBOARD%]") do kb = kb + 1 end
+        for _ in rs:gmatch("[Tt]extView@") do tv = tv + 1 end
+        _G.__bridgeDiag = string.format("ERR=[%s] ROOT=[%s] kb=%d tv=%d len=%d",
+            tostring(errLine or ""), tostring(rootLine or ""), kb, tv, #rs)
+        -- 【r26.1】存真机 KEYBOARD 区前若干行原文（保留缩进），供工具诊断视图显示，
+        -- 一次定死真实缩进/层级/坐标结构，据此修正解析规则。
+        _G.__realKbSample = {}
+        local n = 0
+        for line in rs:gmatch("[^\r\n]+") do
+            if line:find("[KEYBOARD]", 1, true) then
+                n = n + 1
+                if n <= 24 then
+                    _G.__realKbSample[#_G.__realKbSample + 1] = line
+                end
+            end
+        end
+    end
+    -- 【r27】结构化导出：Java 按缓存的 KeyView 树直接导出每个键的主标签 +
+    -- 各方向角标的权威 gravity/坐标/文本。工具据此 1:1 复刻，零猜测。
+    -- 旧 APK 没有 dumpKeyboardStructure 方法时 pcall 失败 → ksRaw 为空 → 自动回退扁平解析。
+    local ksRaw = ""
+    pcall(function() ksRaw = Bridge.dumpKeyboardStructure() or "" end)
+    _G.__ksRaw = ksRaw
+    local ksN = tonumber(ksRaw:match("KSDONE%s+n=(%d+)")) or 0
+    local ksCorners = 0
+    for _ in ksRaw:gmatch("KSCORNER%s") do ksCorners = ksCorners + 1 end
+    _G.__ksDiag = string.format("n=%d corners=%d", ksN, ksCorners)
     local toolDump = dumpToolRenderedTexts()
     return "===== 真机 root =====" .. tostring(r)
+        .. "\n\n===== 结构化 =====\n" .. tostring(ksRaw)
         .. "\n\n===== 工具自渲染 =====" .. toolDump
+end
+
+-- ===== 【r27 权威数据源】解析结构化键盘导出（Java dumpKeyboardStructure）=====
+-- 格式见 ThemeDataBridge.dumpKeyboardStructure 注释。产出与 parseRootDumpToKeys
+-- 完全同构的 {keys={[seq]={label,top,bottom,corners={{grav,txt,x,y,w,h}}}}, n}，
+-- 因此 makeKeyView 里按 gravity 分通道 + 用 c.x/c.y 权威坐标定位的消费代码无需改动。
+-- 关键：方向来自真机 LayoutParams.gravity（非 cx/cy 猜），坐标来自 getLeft+translation
+-- （最终视觉位置，直接当 LP margins），文本来自 getText（Rime 转换后的显示文字）。
+function parseKeyStructure(raw)
+    if type(raw) ~= "string" or raw == "" then return nil end
+    local keys, maxSeq = {}, 0
+    local function ensure(seq)
+        local e = keys[seq]
+        if not e then
+            e = { label = nil, top = nil, bottom = nil, corners = {} }
+            keys[seq] = e
+            if seq > maxSeq then maxSeq = seq end
+        end
+        return e
+    end
+    for line in raw:gmatch("[^\r\n]+") do
+        local ks = tonumber(line:match("^KSKEY%s+(%d+)"))
+        if ks then
+            ensure(ks)
+        else
+            local cs = tonumber(line:match("^KSCLICK%s+(%d+)"))
+            local cr = tonumber(line:match("^KSCORNER%s+(%d+)"))
+            if cs or cr then
+                local seq = cs or cr
+                local e = ensure(seq)
+                local x, y, w, h = line:match("xy=(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+)")
+                local txt = line:match("txt=%[(.*)%]")
+                if txt then txt = txt:gsub("%%5B", "["):gsub("%%5D", "]") end
+                if cs then
+                    if txt and txt ~= "" then e.label = txt end
+                elseif cr then
+                    local d = line:match("d=(%a+)")
+                    if d and x then
+                        e.corners[#e.corners + 1] = {
+                            grav = d, txt = txt or "",
+                            x = tonumber(x), y = tonumber(y),
+                            w = tonumber(w) or 0, h = tonumber(h) or 0,
+                        }
+                        if d == "TOP" and not e.top then e.top = txt end
+                        if d == "BOTTOM" and not e.bottom then e.bottom = txt end
+                    end
+                end
+            end
+        end
+    end
+    if maxSeq <= 0 then return nil end
+    local out = {}
+    for i = 1, maxSeq do
+        out[i] = keys[i] or { label = nil, top = nil, bottom = nil, corners = {} }
+    end
+    return { keys = out, n = #out }
 end
 
 -- ===== 【权威文字源】把真机 root dump 解析成每个键实际显示的文字 =====
@@ -6566,12 +6669,14 @@ function parseRootDumpToKeys(raw)
         end
     end
     if #recs == 0 then return nil end
-    -- 锚点索引。注意：不能加 `and r.w > 0`——真机 dump 里大量占位/隐藏键的锚点是
-    -- "@0,0 0x0"，它们同样是键盘里的真实格子（预览端空白键也会渲染并占一个 seq）。
-    -- 旧版用 w>0 过滤，只解析出 31 键，而预览有 44 键，导致键数门控永远失败。
+    -- 【r26 真根因】桥接 walkView 的 pad(depth) 每级 2 个空格（偶数：0/2/4/6...），
+    -- 而旧代码硬编码 ind==15 / ind==17（奇数）—— anchors 永远为空 → liveN=0。
+    -- 桥接 dump 实测 kb=106/tv=119/len=8113，真机数据一直都在，全被这两行挡在门外。
+    -- 改为结构识别：@0,0 即键主标签锚点（主标签 MATCH_PARENT keyRoot，左上角），与缩进无关。
+    -- 注意不能加 `and r.w > 0`：占位/隐藏键锚点是 "@0,0 0x0"，同样是键盘真实格子。
     local anchors = {}
     for i, r in ipairs(recs) do
-        if r.ind == 15 and r.x == 0 and r.y == 0 then anchors[#anchors + 1] = i end
+        if r.x == 0 and r.y == 0 then anchors[#anchors + 1] = i end
     end
     if #anchors == 0 then return nil end
     local keys = {}
@@ -6586,10 +6691,13 @@ function parseRootDumpToKeys(raw)
         -- 真机一次 dump 里数字键 RIGHT 角标 left=81（键宽约116），旧阈值 x>=95 不成立 →
         -- 角标被当成主标签邻项丢弃，回退成上次键盘文字；换主题/换分辨率都会踩到。
         local kW, kH = tonumber(recs[aiPos].w) or 0, tonumber(recs[aiPos].h) or 0
+        -- 【r26】锚点缩进（桥接 pad 每级 2 空格）。角标 = 比锚点更深一层的行。
+        -- 不再硬编码 17——新桥接 pad(depth) 是偶数缩进，17 永远匹配不上。
+        local anchorInd = recs[aiPos].ind or 0
         local cand = {}
         for p = startPos, aiPos do
             local r = recs[p]
-            if r.ind == 17 then
+            if p ~= aiPos and r.ind > anchorInd then
                 if r.x + r.w > kW then kW = r.x + r.w end
                 if r.y + r.h > kH then kH = r.y + r.h end
                 if r.txt ~= "" then cand[#cand + 1] = { p = p, r = r } end
@@ -6597,17 +6705,22 @@ function parseRootDumpToKeys(raw)
         end
         local function cxOf(r) return kW > 0 and (r.x + r.w / 2) / kW or 0.5 end
         local function cyOf(r) return kH > 0 and (r.y + r.h / 2) / kH or 0.5 end
-        -- 主标签定位：最贴近键中心的普通 TextView（排除左右/上下贴边的角标）。
+        -- 【r26】主标签 = 锚点行(@0,0)自身的文本。真机主标签是 MATCH_PARENT 铺满 keyRoot
+        -- 的那个 TextView，dump 里它就在锚点@0,0 上；角标都在锚点之前(更深缩进)。
+        -- 旧逻辑从更深层 TextView 里挑"最居中"的，会把左滑角标(如 ¹ @x=4)误当主标签。
         local labelPos = nil
-        local bestD = math.huge
-        for _, e in ipairs(cand) do
-            local r = e.r
-            if r.cls == "TextView" then
-                local d = math.abs(cxOf(r) - 0.5) + math.abs(cyOf(r) - 0.5)
-                if d < bestD then bestD = d; labelPos = e.p; k.label = r.txt end
+        k.label = recs[aiPos].txt
+        -- 锚点文本为空(0x0 占位键)时，才退而求其次从角标里挑一个居中的普通 TextView。
+        if not k.label or k.label == "" then
+            local bestD = math.huge
+            for _, e in ipairs(cand) do
+                local r = e.r
+                if r.cls == "TextView" then
+                    local d = math.abs(cxOf(r) - 0.5) + math.abs(cyOf(r) - 0.5)
+                    if d < bestD then bestD = d; labelPos = e.p; k.label = r.txt end
+                end
             end
         end
-        if not k.label or k.label == "" then k.label = recs[aiPos].txt end
         for _, e in ipairs(cand) do
             local r = e.r
             if e.p ~= labelPos then
@@ -6646,10 +6759,22 @@ end
 -- 真正刷新预览（此前只有延迟回调做解析，而它常常不执行，导致有 dump 无 LiveText）。
 function applyLiveFromRaw(raw)
     local s = tostring(raw)
-    local a = s:find("===== 真机 root =====", 1, true)
-    local b = s:find("===== 工具自渲染 =====", 1, true)
-    local dumpPart = (a and b and b > a) and s:sub(a, b - 1) or s
-    local parsed = parseRootDumpToKeys(dumpPart)
+    -- 【r27】首选结构化段（Java 按 KeyView 树导出，方向/坐标/文本全是权威值）。
+    local parsed = nil
+    local ks = s:find("===== 结构化 =====", 1, true)
+    local kt = s:find("===== 工具自渲染 =====", 1, true)
+    if ks and kt and kt > ks then
+        parsed = parseKeyStructure(s:sub(ks, kt - 1))
+    end
+    -- 结构化不可用（旧 APK / 解析失败）→ 回退旧的扁平缩进 dump 解析。
+    if not parsed or parsed.n <= 0 then
+        local a = s:find("===== 真机 root =====", 1, true)
+        local b = s:find("===== 工具自渲染 =====", 1, true)
+        local bs = s:find("===== 结构化 =====", 1, true)
+        if bs and (not b or bs < b) then b = bs end   -- 排除结构化段，只留真机扁平 dump
+        local dumpPart = (a and b and b > a) and s:sub(a, b - 1) or s
+        parsed = parseRootDumpToKeys(dumpPart)
+    end
     if not parsed or parsed.n <= 0 then
         liveKeyTexts, liveKeyTextsN = nil, 0
         return nil
@@ -7697,6 +7822,18 @@ local function dumpLiveTexts()
     local b = s:find("===== 工具自渲染 =====", 1, true)
     local realPart = (a and b and b > a) and s:sub(a, b - 1) or s
     local toolPart = (a and b and b > a) and s:sub(b) or ""
+    -- 【r25.1 诊断】真机段会被工具段 151 行刷屏顶掉，用户看不到。把桥接返回的
+    -- 关键摘要提取到全局，塞进 [DIAG]（在工具段末尾、用户可见），一次定死桥接状态：
+    -- 有 ERR=桥接调用失败；ROOT=桥接通了；KB=n=读到几个键盘 TextView。
+    do
+        local _, _, errLine = realPart:find("(ERR:%s*[^\r\n]+)")
+        local _, _, rootLine = realPart:find("(ROOT:%s*[^\r\n]+)")
+        local kb, tv = 0, 0
+        for _ in realPart:gmatch("%[KEYBOARD%]") do kb = kb + 1 end
+        for _ in realPart:gmatch("[Tt]extView@") do tv = tv + 1 end
+        _G.__bridgeDiag = string.format("ERR=[%s] ROOT=[%s] kb=%d tv=%d len=%d",
+            tostring(errLine or ""), tostring(rootLine or ""), kb, tv, #realPart)
+    end
     local function emit(part, tag, cap)
         local n = 0
         for line in part:gmatch("[^\n]+") do
@@ -7707,8 +7844,23 @@ local function dumpLiveTexts()
             logErr("View文本", tag .. string.format("...（已省略 %d 行，仅显示前 %d 行）", n - cap, cap))
         end
     end
+    -- 【r25.1】桥接摘要单独 emit，放在真机段最前面。即使真机段/工具段被面板
+    -- 折叠，这一行在最前，一定能看到桥接到底有没有拿到真机 view。
+    logErr("View文本", "[真机] BRIDGE " .. tostring(_G.__bridgeDiag or "nil"))
     emit(realPart, "[真机] ", 120)
-    if toolPart ~= "" then emit(toolPart, "[工具] ", 120) end
+    -- 工具段提到 200 行：40 个 [CORNER] + 主标签 + [DIAG] 共约 151 行，
+    -- 旧 cap=120 会把末尾的 [DIAG]/BRIDGE 摘要截掉，用户正好看不到诊断。
+    if toolPart ~= "" then emit(toolPart, "[工具] ", 200) end
+    -- 【r26.1】真机 KEYBOARD 区前 24 行原文，最后 emit → 倒序视图里排最上面，必可见。
+    -- 这是解析规则的唯一依据：真实缩进/层级/坐标一眼定死。
+    local sample = _G.__realKbSample or {}
+    for i = 1, #sample do
+        logErr("View文本", "[REAL] " .. sample[i])
+    end
+    if #sample > 0 then
+        logErr("View文本", string.format("[REAL] ---- sample %d lines (kb=%s) ----",
+            #sample, tostring(_G.__bridgeDiag or "?")))
+    end
     -- 【真机文字源】解析出每键真实文字后重渲染
     pcall(applyLiveFromRaw, r)
     return liveKeyTexts ~= nil
