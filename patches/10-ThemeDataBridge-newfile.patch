@@ -1,7 +1,7 @@
 diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	1970-01-01 08:00:00.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-22 22:35:00.000000000 +0800
-@@ -0,0 +1,880 @@
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-23 08:10:00.000000000 +0800
+@@ -0,0 +1,952 @@
 +/*
 + * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
 + *
@@ -725,8 +725,10 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +    //   KS ROOT <SimpleName>
 +    //   KSKEY <seq> box=<l>,<t>,<w>,<h>
 +    //   KSCLICK <seq> g=<gravity> xy=<x>,<y>,<w>,<h> vis=<0|4|8> txt=[<escaped>]
-+    //   KSCORNER <seq> d=<TOP|BOTTOM|LEFT|RIGHT> xy=<x>,<y>,<w>,<h> cls=<name> txt=[<escaped>]
-+    //   KSDONE n=<keyCount>
++    //   KSCORNER <seq> r=<KEYBOARD|TOOLBAR> ch=<click|long_click|swipe_left|swipe_right|swipe_up|swipe_down> d=<TOP|BOTTOM|LEFT|RIGHT> xy=<x>,<y>,<w>,<h> cls=<name> txt=[<escaped>]
++    //   KSDONE n=<keyCount> kb=<键盘键数> tb=<工具栏键数>
++    // ch= 来自反射 KeyView.mHints[] 的索引（真机 HINT=click / HINT_LONG=long_click /
++    // SWIPE_*），零猜测地区分重力相同的 click(BOTTOM) 与 swipe_down(BOTTOM)。
 +    // 工具旧 APK 没有此方法时 pcall 失败，自动回退 dumpRootTexts + parseRootDumpToKeys。
 +    // =====================================================================
 +    public static String dumpKeyboardStructure() {
@@ -740,29 +742,59 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +            }
 +            out.append("KS ROOT ").append(root.getClass().getSimpleName()).append('\n');
 +            final int[] seq = {0};
-+            collectKeyStructs(root, out, seq, 0);
-+            out.append("KSDONE n=").append(seq[0]);
++            final int[] kbCount = {0};
++            final int[] tbCount = {0};
++            collectKeyStructs(root, out, seq, kbCount, tbCount, 0, "");
++            out.append("KSDONE n=").append(seq[0]).append(" kb=").append(kbCount[0]).append(" tb=").append(tbCount[0]);
 +        } catch (Throwable t) {
 +            out.append("ERR: ").append(t);
 +        }
 +        return out.toString();
 +    }
 +
-+    /** 深度优先找每一个 KeyView；找到后不再深入其内部（避免把 popup 键盘重复计入）。 */
-+    private static void collectKeyStructs(View v, StringBuilder out, int[] seq, int depth) {
-+        if (v == null || depth > 24 || seq[0] > 200) return;
++    /**
++     * 深度优先找每一个 KeyView；找到后不再深入其内部（避免把 popup 键盘重复计入）。
++     * 【r27.5】工具栏按键用的也是 com.osfans.trime.keyboard.KeyView，必须照常采集，
++     * 否则工具栏角标拿不到真机权威数据、显示和真机不一致。但要按区域分开：
++     *  · region 由【祖先容器】决定（ToolbarView→TOOLBAR，键盘容器→KEYBOARD），
++     *    不能被 KeyView 自身类名里的 "keyboard" 覆盖。
++     *  · 每条 KSKEY/KSCLICK/KSCORNER 带 r=KEYBOARD|TOOLBAR，seq 全树统一递增。
++     *  · 工具端按 r= 拆两组：键盘组喂 makeKeyView、工具栏组喂工具栏预览，互不串位。
++     */
++    private static void collectKeyStructs(View v, StringBuilder out, int[] seq,
++                                          int[] kbCount, int[] tbCount, int depth, String region) {
++        if (v == null || depth > 24 || seq[0] > 240) return;
 +        try {
 +            String cn = v.getClass().getName();
-+            if (v instanceof ViewGroup && (cn.endsWith("KeyView") || cn.contains(".KeyView"))) {
++            String lc = cn.toLowerCase();
++            boolean isKeyView = v instanceof ViewGroup && (cn.endsWith("KeyView") || cn.contains(".KeyView"));
++            // 区域由祖先容器推断；KeyView 自身类名含 keyboard，不能拿来覆盖父级 toolbar 判定。
++            String here = region;
++            if (!isKeyView && v instanceof ViewGroup) {
++                if (lc.contains("toolbar")) here = "TOOLBAR";
++                else if (lc.contains("candidate")) here = "CANDIDATE";
++                else if (lc.contains("composition") || lc.contains("preedit")) here = "COMPOSITION";
++                else if (lc.contains("keyboard") || lc.contains("keyview")) here = "KEYBOARD";
++            }
++            // 候选/Composition 区没有 KeyView，走到这里的 ViewGroup 正常递归即可。
++            if (isKeyView) {
++                String reg = ("TOOLBAR".equals(here)) ? "TOOLBAR" : "KEYBOARD";
 +                seq[0]++;
 +                int s = seq[0];
-+                out.append("KSKEY ").append(s)
++                if ("TOOLBAR".equals(reg)) tbCount[0]++; else kbCount[0]++;
++                out.append("KSKEY ").append(s).append(" r=").append(reg)
 +                    .append(" box=").append(v.getLeft()).append(',').append(v.getTop())
 +                    .append(',').append(v.getWidth()).append(',').append(v.getHeight())
 +                    .append('\n');
 +                ViewGroup keyRoot = null;
 +                try { keyRoot = (ViewGroup) ((ViewGroup) v).getChildAt(0); } catch (Throwable ignore) {}
 +                if (keyRoot != null) {
++                    // 【r27.5】反射 KeyView.mHints[]，建立 TextView 引用 → 权威通道名。
++                    // 真机 mHints[HINT=0]=click 角标、[HINT_LONG=1]=long_click、
++                    // [SWIPE_LEFT=2]/[RIGHT=3]/[UP=4]/[DOWN=5]。用引用相等匹配 keyRoot 子 View，
++                    // 零猜测地区分重力相同的 click(BOTTOM) 与 swipe_down(BOTTOM)。
++                    // 反射失败返回空表，回退 gravityDir（旧行为，不崩）。
++                    java.util.Map<View, String> chanOf = hintChannelsOf(v);
 +                    int n = keyRoot.getChildCount();
 +                    for (int i = 0; i < n; i++) {
 +                        View c = keyRoot.getChildAt(i);
@@ -780,9 +812,10 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +                        // 最终视觉坐标 = 布局坐标 + translation；工具当 LP margins 直接搬。
 +                        int vx = Math.round(c.getLeft() + c.getTranslationX());
 +                        int vy = Math.round(c.getTop() + c.getTranslationY());
-+                        if (i == 0) {
++                        String ch = chanOf.get(c);
++                        if (i == 0 || "label".equals(ch)) {
 +                            // keyRoot 的第一个 TextView 恒为 mClick（initView 里最先 addView）。
-+                            out.append("KSCLICK ").append(s)
++                            out.append("KSCLICK ").append(s).append(" r=").append(reg)
 +                                .append(" g=").append(g)
 +                                .append(" xy=").append(vx).append(',').append(vy)
 +                                .append(',').append(c.getWidth()).append(',').append(c.getHeight())
@@ -791,7 +824,10 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +                        } else if (vis == View.VISIBLE && txt.length() > 0) {
 +                            String dir = gravityDir(g);
 +                            if (!dir.isEmpty()) {
-+                                out.append("KSCORNER ").append(s)
++                                // ch 权威通道；反射失败时用方向兜底（click↔BOTTOM 等）。
++                                if (ch == null || ch.isEmpty()) ch = chOfGravity(dir);
++                                out.append("KSCORNER ").append(s).append(" r=").append(reg)
++                                    .append(" ch=").append(ch)
 +                                    .append(" d=").append(dir)
 +                                    .append(" xy=").append(vx).append(',').append(vy)
 +                                    .append(',').append(c.getWidth()).append(',').append(c.getHeight())
@@ -806,7 +842,7 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +            if (v instanceof ViewGroup) {
 +                ViewGroup g = (ViewGroup) v;
 +                for (int i = 0; i < g.getChildCount(); i++)
-+                    collectKeyStructs(g.getChildAt(i), out, seq, depth + 1);
++                    collectKeyStructs(g.getChildAt(i), out, seq, kbCount, tbCount, depth + 1, here);
 +            }
 +        } catch (Throwable ignore) {
 +            // 单个 View 失败不影响整体
@@ -820,6 +856,42 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +        if ((g & android.view.Gravity.LEFT) == android.view.Gravity.LEFT) return "LEFT";
 +        if ((g & android.view.Gravity.RIGHT) == android.view.Gravity.RIGHT) return "RIGHT";
 +        return "";
++    }
++
++    /**
++     * 【r27.5】反射 KeyView.mHints[] 建立 TextView 实例 → 权威通道名映射。
++     * 真机 KeyView 常量：HINT=KeyEventType.CLICK.ordinal()=0（click 角标/底部小字），
++     * HINT_LONG=LONG_CLICK.ordinal()=1，SWIPE_LEFT=2, SWIPE_RIGHT=3, SWIPE_UP=4, SWIPE_DOWN=5。
++     * 用 System.identityHashCode 无关的引用相等（IdentityHashMap）匹配 keyRoot 子 View。
++     * 任何反射异常都返回空表，调用方回退 gravity 方向，绝不因此崩溃。
++     */
++    private static java.util.Map<View, String> hintChannelsOf(View keyView) {
++        java.util.Map<View, String> m = new java.util.IdentityHashMap<View, String>();
++        try {
++            java.lang.reflect.Field f = keyView.getClass().getDeclaredField("mHints");
++            f.setAccessible(true);
++            Object arr = f.get(keyView);
++            if (!(arr instanceof TextView[])) return m;
++            TextView[] hints = (TextView[]) arr;
++            // 与 KeyEventType 枚举顺序一致；索引 6/7 无对应通道。
++            String[] names = {"click", "long_click", "swipe_left", "swipe_right",
++                    "swipe_up", "swipe_down", "", ""};
++            for (int i = 0; i < hints.length && i < names.length; i++) {
++                if (hints[i] != null && !names[i].isEmpty()) m.put(hints[i], names[i]);
++            }
++        } catch (Throwable ignore) {
++            // 反射不可用（混淆/机型差异）→ 空表，走方向回退。
++        }
++        return m;
++    }
++
++    /** 反射失败时的方向兜底：把重力方向映射到最常见通道。 */
++    private static String chOfGravity(String dir) {
++        if ("BOTTOM".equals(dir)) return "click";
++        if ("TOP".equals(dir)) return "long_click";
++        if ("LEFT".equals(dir)) return "swipe_left";
++        if ("RIGHT".equals(dir)) return "swipe_right";
++        return "click";
 +    }
 +
 +    private static void walkView(View v, StringBuilder out, int depth, int[] count, String region) {
