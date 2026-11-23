@@ -1092,7 +1092,7 @@ index 0000000..cda5250
 +    }
 +}
 diff --git a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
-index 37c3fa8..d6a12eb 100644
+index df68c3b..d6a12eb 100644
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
 +++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
 @@ -21,10 +21,15 @@ import android.util.DisplayMetrics;
@@ -1111,24 +1111,7 @@ index 37c3fa8..d6a12eb 100644
  import com.osfans.trime.Config;
  import com.osfans.trime.Key;
  import com.osfans.trime.TrimeService;
-@@ -388,15 +393,7 @@ public class ThemeManager {
-             return null;
-         LuaValue f = mGlobals.get(s);
-         if (f.isfunction()) {
--            try {
--                return f.jcall(args);
--            } catch (Throwable e) {
--                // 主题脚本里的 Lua 错误(如 attempt to index nil)原来会直接穿透
--                // 到调用方所在的主线程,变成 FATAL EXCEPTION 让输入法崩掉。
--                // 这里统一吞掉并记录:message 里带 chunk 和行号,方便定位。
--                Log.e("ThemeManager", "callFunction " + s + " failed: " + e.getMessage(), e);
--                return null;
--            }
-+            return f.jcall(args);
-         }
-         return null;
-     }
-@@ -435,6 +432,93 @@ public class ThemeManager {
+@@ -427,6 +432,93 @@ public class ThemeManager {
          mAsrClient = null;
          LuaValue aiConfig = mGlobals.get("asr_config");
          if (aiConfig.istable()) {
@@ -1222,16 +1205,3 @@ index 37c3fa8..d6a12eb 100644
              LuaValue base_url = aiConfig.get("base_url");
              if (!base_url.isstring() || base_url.length() == 0)
                  return;
-@@ -450,12 +534,6 @@ public class ThemeManager {
- 
-             mAsrClient = new AiClient(base_url.tojstring(), key.tojstring());
-             mAsrClient.setModel(model.tojstring());
--            // 可选:api="transcriptions" 强制走 /audio/transcriptions;
--            // 留空则按模型名自动判断(SenseVoice / whisper / ASR 视为专用识别模型)
--            LuaValue api = aiConfig.get("api");
--            if (api.isstring() && api.length() > 0) {
--                mAsrClient.setTranscribeMode(api.tojstring().toLowerCase().contains("transcri"));
--            }
-             if (mPrompt.isstring() && mPrompt.length() > 0) {
-                 mAsrClient.setPrompt(mPrompt.tojstring());
-             }
