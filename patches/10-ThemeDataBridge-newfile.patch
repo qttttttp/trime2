@@ -1,7 +1,7 @@
 diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	1970-01-01 08:00:00.000000000 +0800
 +++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-23 08:10:00.000000000 +0800
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,961 @@
 +/*
 + * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
 + *
@@ -823,9 +823,18 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +                                .append(" txt=[").append(txt).append("]\n");
 +                        } else if (vis == View.VISIBLE && txt.length() > 0) {
 +                            String dir = gravityDir(g);
-+                            if (!dir.isEmpty()) {
++                            // 【r27.24】居中角标（gravity=CENTER，典型如空格长按"语音"）的
++                            // gravityDir 返回空串，旧版 if(!dir.isEmpty()) 直接丢弃 → 工具永远
++                            // 拿不到这类角标的权威 ch/xy，只能靠主题瞎猜位置，换主题就错位。
++                            // 现在有反射权威通道 ch（mHints[]）就照常输出；方向缺失写 CENTER，
++                            // 工具端按 ch=long_click 精确匹配、用 xy= 绝对定位，不再依赖方向。
++                            // 仅当既无方向又无权威通道（反射失败且 CENTER）才跳过，避免把
++                            // 无关居中的 TextView 误当角标。
++                            boolean hasChan = (ch != null && !ch.isEmpty());
++                            if (!dir.isEmpty() || hasChan) {
 +                                // ch 权威通道；反射失败时用方向兜底（click↔BOTTOM 等）。
-+                                if (ch == null || ch.isEmpty()) ch = chOfGravity(dir);
++                                if (!hasChan) ch = chOfGravity(dir);
++                                if (dir.isEmpty()) dir = "CENTER";
 +                                out.append("KSCORNER ").append(s).append(" r=").append(reg)
 +                                    .append(" ch=").append(ch)
 +                                    .append(" d=").append(dir)

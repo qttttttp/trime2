@@ -1,0 +1,1237 @@
+diff --git a/app/src/main/assets/themes/default/main.lua b/app/src/main/assets/themes/default/main.lua
+index ed832ed..f815f06 100644
+--- a/app/src/main/assets/themes/default/main.lua
++++ b/app/src/main/assets/themes/default/main.lua
+@@ -31,6 +31,10 @@ ai_config = {
+ --     或 Qwen/Qwen3-ASR-1.7B，自动走 /v1/audio/transcriptions
+ --  2) 多模态理解模型:model 填 qwen3-omni 等,走 /v1/chat/completions 的音频输入
+ asr_config = {
++    -- ASR 类型: "ai"(默认, HTTP multipart) 或 "db"(db ASR, WebSocket+Protobuf)
++    type="ai",
++
++    -- === AI ASR 配置（type="ai" 时使用）===
+     base_url="",--api地址，如 https://api.siliconflow.cn/v1
+     model="",--模型名称
+     key="",--鉴权key
+@@ -38,6 +42,38 @@ asr_config = {
+     prompt="",--提示词（仅多模态模式使用）
+     system_prompt="",--系统参数，可以指定识别偏好（仅多模态模式使用）
+     extra_params="",--扩展参数，json字符串或table（仅多模态模式使用）
++
++    -- === db ASR 协议配置（type="db" 时使用）===
++    -- 所有协议细节在此配置，公开版不含任何协议具体参数值，用户自行承担配置与使用的风险
++    ws_url="",--db ASR WebSocket 地址（必填）
++    device_id="",--设备标识
++    token="",--鉴权token
++    user_agent="",--User-Agent
++    aid=0,--应用标识aid
++    app_package="",--应用包名
++    register_url="",--设备注册地址
++    settings_url="",--设置地址
++    ws_proto_version="",--WebSocket协议版本头
++    ws_keepalive="",--WebSocket KeepAlive头
++    register_query_params={},--注册查询参数表
++    register_body_template="",--注册体模板，占位符 {openudid} {clientudid} {cdid} {aid} {app_package}
++    token_body="",--Token请求体
++    session_config_template="",--会话配置模板，占位符 {channels} {sample_rate} {app_name} {device_id}
++    service_name="",--服务名
++    method_start_task="",--StartTask方法名
++    method_start_session="",--StartSession方法名
++    method_finish_session="",--FinishSession方法名
++    method_task_request="",--TaskRequest方法名
++    frame_state_unspecified=0,--帧状态:未指定
++    frame_state_first=1,--帧状态:首帧
++    frame_state_middle=2,--帧状态:中间帧
++    frame_state_last=3,--帧状态:末帧
++    opus_bitrate=0,--Opus码率
++    opus_frame_estimate_bytes=0,--Opus单帧估算字节
++    sample_rate=16000,--采样率
++    channels=1,--声道数
++    frame_duration_ms=20,--帧时长(毫秒)
++    app_name="",--应用名称
+ }
+ 
+ action_labels = {
+diff --git a/app/src/main/java/com/osfans/trime/DbASRClient.java b/app/src/main/java/com/osfans/trime/DbASRClient.java
+new file mode 100644
+index 0000000..08288ae
+--- /dev/null
++++ b/app/src/main/java/com/osfans/trime/DbASRClient.java
+@@ -0,0 +1,859 @@
++package com.osfans.trime;
++
++import android.media.MediaCodec;
++import android.media.MediaFormat;
++import android.os.Handler;
++import android.os.Looper;
++import android.util.Log;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.security.MessageDigest;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.TimeUnit;
++
++import okhttp3.Headers;
++import okhttp3.HttpUrl;
++import okhttp3.MediaType;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.RequestBody;
++import okhttp3.Response;
++import okhttp3.WebSocket;
++import okhttp3.WebSocketListener;
++import okio.ByteString;
++
++/**
++ * db ASR 客户端，继承 AiClient，通过 WebSocket + Protobuf 协议进行语音识别。
++ * 协议来源：zhuiyue132/db-asr
++ * 源码仅作支持，所有 API 配置通过主题 asr_config 外置。
++ */
++public class DbASRClient extends AiClient {
++
++    // ===== 协议配置（全部外置于 DbProtocolConfig，代码不保留任何db协议参数值） =====
++    private final DbProtocolConfig cfg;
++
++    // ===== 配置字段（由 DbProtocolConfig 派生，便于内部引用） =====
++    private final String wsUrl;
++    private final String deviceId;
++    private final String token;
++    private final String userAgent;
++    private final int sampleRate;
++    private final int channels;
++    private final int frameDurationMs;
++    private final String appName;
++
++    // ===== 内部状态 =====
++    private final OkHttpClient wsHttpClient;
++    private final Handler mainHandler = new Handler(Looper.getMainLooper());
++
++    /**
++     * 构造方法：传入db ASR 协议配置（全部协议细节由配置承载）
++     *
++     * @param cfg DbProtocolConfig，包含连接、凭据、端点、请求头、
++     *            注册/会话模板、消息类型、帧状态、音频编码等全部协议配置
++     */
++    public DbASRClient(DbProtocolConfig cfg) {
++        super(cfg.wsUrl, cfg.token); // 复用父类构造（baseUrl/apiKey 占位）
++        this.cfg = cfg;
++        this.wsUrl = cfg.wsUrl;
++        this.deviceId = cfg.deviceId;
++        this.token = cfg.token;
++        this.userAgent = cfg.userAgent;
++        this.sampleRate = cfg.sampleRate;
++        this.channels = cfg.channels;
++        this.frameDurationMs = cfg.frameDurationMs;
++        this.appName = cfg.appName;
++
++        this.wsHttpClient = new OkHttpClient.Builder()
++                .connectTimeout(120, TimeUnit.SECONDS)
++                .readTimeout(120, TimeUnit.SECONDS)
++                .pingInterval(30, TimeUnit.SECONDS)
++                .build();
++    }
++
++    // =========================================================================
++    //  重写 recognizeAudio：走 WebSocket + Protobuf 协议
++    // =========================================================================
++
++    @Override
++    public AiSession recognizeAudio(byte[] audioBytes, AiCallback callback) {
++        // 在后台线程执行完整的 WebSocket 识别流程
++        Thread worker = new Thread(() -> {
++            try {
++                // 1. 确保凭据可用
++                String[] creds = ensureCredentials();
++                String finalDeviceId = creds[0];
++                String finalToken = creds[1];
++
++                // 2. 构建完整 WebSocket URL
++                String fullWsUrl = wsUrl + "?aid=" + cfg.aid
++                        + "&device_id=" + finalDeviceId;
++
++                // 3. 构建 WebSocket 请求头
++                Headers wsHeaders = new Headers.Builder()
++                        .add("User-Agent", userAgent)
++                        .add("proto-version", cfg.wsProtoVersion)
++                        .add("x-custom-keepalive", cfg.wsKeepalive)
++                        .build();
++
++                // 4. WAV → PCM → Opus
++                byte[] pcmData = wavToPcm(audioBytes);
++                byte[] opusFrames = encodeOpus(pcmData);
++
++                // 5. 构建会话配置 JSON
++                String sessionConfigJson = buildSessionConfig(finalDeviceId);
++
++                // 6. 生成请求 ID
++                String requestId = UUID.randomUUID().toString();
++
++                // 7. 连接 WebSocket
++                Request wsRequest = new Request.Builder()
++                        .url(fullWsUrl)
++                        .headers(wsHeaders)
++                        .build();
++
++                wsHttpClient.newWebSocket(wsRequest, new DbWebSocketListener(
++                        callback, opusFrames, requestId, finalToken, sessionConfigJson));
++
++            } catch (Exception e) {
++                postFailure(callback, e);
++            }
++        }, "DbASR");
++        worker.setDaemon(true);
++        worker.start();
++
++        // Speech.java 不使用返回值，返回 null 即可
++        return null;
++    }
++
++    // =========================================================================
++    //  凭据管理：设备注册 / Token 获取
++    // =========================================================================
++
++    /**
++     * 确保凭据可用：deviceId 或 token 为空时自动注册/获取
++     */
++    private String[] ensureCredentials() throws Exception {
++        String finalDeviceId = deviceId;
++        String finalToken = token;
++
++        if (finalDeviceId == null || finalDeviceId.isEmpty()) {
++            finalDeviceId = registerDevice();
++        }
++        if (finalToken == null || finalToken.isEmpty()) {
++            finalToken = getAsrToken(finalDeviceId);
++        }
++        return new String[]{finalDeviceId, finalToken};
++    }
++
++    /**
++     * 注册设备，获取 device_id
++     */
++    private String registerDevice() throws Exception {
++        String cdid = UUID.randomUUID().toString();
++        String openudid = randomHex(8);
++        String clientudid = UUID.randomUUID().toString();
++
++        String body = buildRegisterBody(cdid, openudid, clientudid);
++
++        HttpUrl baseUrl = HttpUrl.parse(cfg.registerUrl);
++        HttpUrl.Builder urlBuilder = baseUrl.newBuilder();
++        // 从配置 Map 遍历添加查询参数，值支持 {aid} / {app_package} 占位符
++        for (Map.Entry<String, String> entry : cfg.registerQueryParams.entrySet()) {
++            String key = entry.getKey();
++            // cdid 与 _rticket 由代码动态生成，跳过配置中的同名项避免重复
++            if ("cdid".equals(key) || "_rticket".equals(key)) {
++                continue;
++            }
++            String value = entry.getValue()
++                    .replace("{aid}", String.valueOf(cfg.aid))
++                    .replace("{app_package}", cfg.appPackage);
++            urlBuilder.addQueryParameter(key, value);
++        }
++        // 动态添加时间戳与设备标识
++        urlBuilder.addQueryParameter("_rticket", String.valueOf(System.currentTimeMillis()))
++                .addQueryParameter("cdid", cdid);
++
++        Request request = new Request.Builder()
++                .url(urlBuilder.build())
++                .header("User-Agent", userAgent)
++                .post(RequestBody.create(body, MediaType.get("application/json; charset=utf-8")))
++                .build();
++
++        try (Response response = wsHttpClient.newCall(request).execute()) {
++            String respBody = response.body() != null ? response.body().string() : "";
++            java.util.regex.Matcher m = java.util.regex.Pattern
++                    .compile("\"device_id\"\\s*:\\s*(\\d+)")
++                    .matcher(respBody);
++            if (m.find()) {
++                return m.group(1);
++            }
++            throw new IOException("Device registration failed: " + respBody);
++        }
++    }
++
++    /**
++     * 获取 ASR Token
++     */
++    private String getAsrToken(String deviceId) throws Exception {
++        String cdid = UUID.randomUUID().toString();
++
++        HttpUrl baseUrl = HttpUrl.parse(cfg.settingsUrl);
++        HttpUrl.Builder urlBuilder = baseUrl.newBuilder();
++        // 复用注册查询参数配置，值支持 {aid} / {app_package} 占位符
++        for (Map.Entry<String, String> entry : cfg.registerQueryParams.entrySet()) {
++            String key = entry.getKey();
++            if ("cdid".equals(key) || "_rticket".equals(key) || "device_id".equals(key)) {
++                continue;
++            }
++            String value = entry.getValue()
++                    .replace("{aid}", String.valueOf(cfg.aid))
++                    .replace("{app_package}", cfg.appPackage);
++            urlBuilder.addQueryParameter(key, value);
++        }
++        urlBuilder.addQueryParameter("_rticket", String.valueOf(System.currentTimeMillis()))
++                .addQueryParameter("cdid", cdid)
++                .addQueryParameter("device_id", deviceId);
++
++        String bodyStr = cfg.tokenBody;
++        String xSsStub = md5Hex(bodyStr).toUpperCase();
++
++        Request request = new Request.Builder()
++                .url(urlBuilder.build())
++                .header("User-Agent", userAgent)
++                .header("x-ss-stub", xSsStub)
++                .post(RequestBody.create(bodyStr, MediaType.get("application/x-www-form-urlencoded")))
++                .build();
++
++        try (Response response = wsHttpClient.newCall(request).execute()) {
++            String respBody = response.body() != null ? response.body().string() : "";
++            java.util.regex.Matcher m = java.util.regex.Pattern
++                    .compile("\"app_key\"\\s*:\\s*\"([^\"]+)\"")
++                    .matcher(respBody);
++            if (m.find()) {
++                return m.group(1);
++            }
++            throw new IOException("Token fetch failed: " + respBody);
++        }
++    }
++
++    /**
++     * 构建设备注册请求体 JSON：渲染配置模板，占位符替换为实际值
++     * 模板占位符：{openudid} {clientudid} {cdid} {aid} {app_package}
++     */
++    private String buildRegisterBody(String cdid, String openudid, String clientudid) {
++        return renderTemplate(cfg.registerBodyTemplate, cdid, openudid, clientudid);
++    }
++
++    /**
++     * 渲染模板：替换协议占位符
++     */
++    private String renderTemplate(String template, String cdid,
++                                  String openudid, String clientudid) {
++        if (template == null || template.isEmpty()) {
++            return "";
++        }
++        return template
++                .replace("{openudid}", openudid)
++                .replace("{clientudid}", clientudid)
++                .replace("{cdid}", cdid)
++                .replace("{aid}", String.valueOf(cfg.aid))
++                .replace("{app_package}", cfg.appPackage);
++    }
++    /**
++     * 渲染会话配置模板：替换协议占位符
++     * 模板占位符：{channels} {sample_rate} {app_name} {device_id}
++     */
++    private String renderSessionTemplate(String template, String deviceId) {
++        if (template == null || template.isEmpty()) {
++            return "";
++        }
++        return template
++                .replace("{channels}", String.valueOf(channels))
++                .replace("{sample_rate}", String.valueOf(sampleRate))
++                .replace("{app_name}", appName)
++                .replace("{device_id}", deviceId);
++    }
++
++    /**
++     * 构建会话配置 JSON：渲染配置模板
++     */
++    private String buildSessionConfig(String deviceId) {
++        return renderSessionTemplate(cfg.sessionConfigTemplate, deviceId);
++    }
++
++    // =========================================================================
++    //  音频处理：WAV → PCM → Opus
++    // =========================================================================
++
++    /**
++     * WAV 字节数组转为 PCM（16-bit 小端序）
++     */
++    private byte[] wavToPcm(byte[] wavData) {
++        if (wavData == null || wavData.length <= 44) {
++            return new byte[0];
++        }
++        // 检查是否为 WAV 格式（RIFF....WAVE）
++        boolean isWav = wavData.length >= 12
++                && wavData[0] == 'R' && wavData[1] == 'I'
++                && wavData[2] == 'F' && wavData[3] == 'F'
++                && wavData[8] == 'W' && wavData[9] == 'A'
++                && wavData[10] == 'V' && wavData[11] == 'E';
++
++        if (isWav) {
++            // 遍历 WAV 头，找到 "data" 块
++            int dataOffset = 44;
++            for (int i = 12; i < wavData.length - 8; i++) {
++                if (wavData[i] == 'd' && wavData[i + 1] == 'a'
++                        && wavData[i + 2] == 't' && wavData[i + 3] == 'a') {
++                    // data 块长度在 i+4 ~ i+7（小端序 int32）
++                    int dataLen = (wavData[i + 7] & 0xFF) << 24
++                            | (wavData[i + 6] & 0xFF) << 16
++                            | (wavData[i + 5] & 0xFF) << 8
++                            | (wavData[i + 4] & 0xFF);
++                    dataOffset = i + 8;
++                    int pcmLen = Math.min(dataLen, wavData.length - dataOffset);
++                    byte[] pcm = new byte[pcmLen];
++                    System.arraycopy(wavData, dataOffset, pcm, 0, pcmLen);
++                    return pcm;
++                }
++            }
++            // 未找到 data 块，默认跳过 44 字节头
++            byte[] pcm = new byte[wavData.length - dataOffset];
++            System.arraycopy(wavData, dataOffset, pcm, 0, pcm.length);
++            return pcm;
++        }
++        // 已经是 PCM
++        return wavData;
++    }
++
++    /**
++     * PCM → Opus 编码，返回拼接的 Opus 帧数据
++     * 使用 Android MediaCodec 编码器
++     */
++    private byte[] encodeOpus(byte[] pcmData) {
++        if (pcmData == null || pcmData.length == 0) {
++            return new byte[0];
++        }
++
++        int samplesPerFrame = sampleRate * frameDurationMs / 1000;
++        int bytesPerFrame = samplesPerFrame * 2; // 16-bit
++
++        ByteArrayOutputStream opusOut = new ByteArrayOutputStream();
++        MediaCodec encoder = null;
++
++        try {
++            encoder = MediaCodec.createEncoderByType("audio/opus");
++            MediaFormat format = MediaFormat.createAudioFormat("audio/opus",
++                    sampleRate, channels);
++            format.setInteger(MediaFormat.KEY_BIT_RATE, cfg.opusBitrate);
++            format.setInteger(MediaFormat.KEY_AAC_PROFILE, 0);
++            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
++            encoder.start();
++
++            int frameIndex = 0;
++            int offset = 0;
++
++            while (offset < pcmData.length) {
++                int chunkLen = Math.min(bytesPerFrame, pcmData.length - offset);
++                byte[] chunk = new byte[chunkLen];
++                System.arraycopy(pcmData, offset, chunk, 0, chunkLen);
++                // 不足一帧则补零
++                if (chunkLen < bytesPerFrame) {
++                    byte[] padded = new byte[bytesPerFrame];
++                    System.arraycopy(chunk, 0, padded, 0, chunkLen);
++                    chunk = padded;
++                }
++
++                // 送入编码器
++                int inIdx = encoder.dequeueInputBuffer(10000);
++                if (inIdx >= 0) {
++                    android.media.MediaCodec.BufferInfo inInfo = new android.media.MediaCodec.BufferInfo();
++                    // 使用 getInputBuffer（API 21+）
++                    java.nio.ByteBuffer inputBuf;
++                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
++                        inputBuf = encoder.getInputBuffer(inIdx);
++                    } else {
++                        inputBuf = encoder.getInputBuffers()[inIdx];
++                    }
++                    inputBuf.clear();
++                    inputBuf.put(chunk);
++                    long pts = frameIndex * frameDurationMs;
++                    encoder.queueInputBuffer(inIdx, 0, chunk.length, pts, 0);
++                    frameIndex++;
++                }
++
++                // 取出编码后的 Opus 数据
++                while (true) {
++                    android.media.MediaCodec.BufferInfo outInfo = new android.media.MediaCodec.BufferInfo();
++                    int outIdx = encoder.dequeueOutputBuffer(outInfo, 10000);
++                    if (outIdx >= 0) {
++                        java.nio.ByteBuffer outputBuf;
++                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
++                            outputBuf = encoder.getOutputBuffer(outIdx);
++                        } else {
++                            outputBuf = encoder.getOutputBuffers()[outIdx];
++                        }
++                        if (outputBuf != null && outInfo.size > 0) {
++                            byte[] opusFrame = new byte[outInfo.size];
++                            outputBuf.position(0);
++                            outputBuf.get(opusFrame);
++                            opusOut.write(opusFrame, 0, opusFrame.length);
++                        }
++                        encoder.releaseOutputBuffer(outIdx, false);
++                    } else {
++                        break;
++                    }
++                }
++
++                offset += bytesPerFrame;
++            }
++
++            // 通知编码器结束
++            int inIdx = encoder.dequeueInputBuffer(10000);
++            if (inIdx >= 0) {
++                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
++                    encoder.getInputBuffer(inIdx).clear();
++                } else {
++                    encoder.getInputBuffers()[inIdx].clear();
++                }
++                encoder.queueInputBuffer(inIdx, 0, 0, 0,
++                        MediaCodec.BUFFER_FLAG_END_OF_STREAM);
++            }
++
++            // 取出剩余数据
++            while (true) {
++                android.media.MediaCodec.BufferInfo outInfo = new android.media.MediaCodec.BufferInfo();
++                int outIdx = encoder.dequeueOutputBuffer(outInfo, 10000);
++                if (outIdx >= 0) {
++                    java.nio.ByteBuffer outputBuf;
++                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
++                        outputBuf = encoder.getOutputBuffer(outIdx);
++                    } else {
++                        outputBuf = encoder.getOutputBuffers()[outIdx];
++                    }
++                    if (outputBuf != null && outInfo.size > 0) {
++                        byte[] opusFrame = new byte[outInfo.size];
++                        outputBuf.position(0);
++                        outputBuf.get(opusFrame);
++                        opusOut.write(opusFrame, 0, opusFrame.length);
++                    }
++                    encoder.releaseOutputBuffer(outIdx, false);
++                } else {
++                    break;
++                }
++            }
++
++        } catch (Exception e) {
++            Log.e("DbASR", "Opus encode failed: " + e.getMessage(), e);
++        } finally {
++            if (encoder != null) {
++                try {
++                    encoder.stop();
++                    encoder.release();
++                } catch (Exception e) {
++                    Log.e("DbASR", "Encoder release failed: " + e.getMessage());
++                }
++            }
++        }
++
++        return opusOut.toByteArray();
++    }
++
++    // =========================================================================
++    //  WebSocket 监听器
++    // =========================================================================
++
++    private class DbWebSocketListener extends WebSocketListener {
++        private final AiCallback callback;
++        private final byte[] opusFrames;
++        private final String requestId;
++        private final String token;
++        private final String sessionConfigJson;
++        private final StringBuilder finalText = new StringBuilder();
++        private WebSocket webSocket;
++        private int frameIndex = 0;
++        private int framesPerBatch;
++
++        DbWebSocketListener(AiCallback callback, byte[] opusFrames,
++                                String requestId, String token, String sessionConfigJson) {
++            this.callback = callback;
++            this.opusFrames = opusFrames;
++            this.requestId = requestId;
++            this.token = token;
++            this.sessionConfigJson = sessionConfigJson;
++            // 每帧 Opus 约 60 字节（20ms @ 24kbps），按此估算帧数
++            this.framesPerBatch = opusFrames.length > 0 ? 1 : 0;
++        }
++
++        @Override
++        public void onOpen(WebSocket ws, Response response) {
++            this.webSocket = ws;
++
++            // 1. Send StartTask
++            ws.send(ByteString.of(buildProtobufRequest(
++                    token, cfg.serviceName, cfg.methodStartTask, null, null,
++                    requestId, cfg.frameStateUnspecified)));
++
++            // 2. Send StartSession
++            ws.send(ByteString.of(buildProtobufRequest(
++                    token, cfg.serviceName, cfg.methodStartSession, sessionConfigJson, null,
++                    requestId, cfg.frameStateUnspecified)));
++
++            // 3. Send audio frames
++            sendAudioFrames(ws);
++
++            // 4. Send FinishSession
++            ws.send(ByteString.of(buildProtobufRequest(
++                    token, cfg.serviceName, cfg.methodFinishSession, null, null,
++                    requestId, cfg.frameStateUnspecified)));
++        }
++
++        private void sendAudioFrames(WebSocket ws) {
++            if (opusFrames == null || opusFrames.length == 0) {
++                // 发送一个空 LAST 帧
++                String payload = "{\"extra\":{},\"timestamp_ms\":"
++                        + System.currentTimeMillis() + "}";
++                ws.send(ByteString.of(buildProtobufRequest(
++                        token, cfg.serviceName, cfg.methodTaskRequest, payload,
++                        new byte[0], requestId, cfg.frameStateLast)));
++                return;
++            }
++
++            // 将 Opus 数据按帧分割发送
++            // 每帧 Opus 编码后大小不确定，按配置的估算字节数分割帧
++            // 实际 Opus 帧更小，但服务器按帧状态识别
++            int estimatedFrameSize = Math.max(1, cfg.opusFrameEstimateBytes);
++            int totalFrames = Math.max(1, opusFrames.length / estimatedFrameSize);
++            long timestamp = System.currentTimeMillis();
++
++            for (int i = 0; i < totalFrames; i++) {
++                int start = i * estimatedFrameSize;
++                int end = Math.min(start + estimatedFrameSize, opusFrames.length);
++                byte[] frame = new byte[end - start];
++                System.arraycopy(opusFrames, start, frame, 0, end - start);
++
++                int frameState;
++                if (i == 0) {
++                    frameState = cfg.frameStateFirst;
++                } else if (i == totalFrames - 1) {
++                    frameState = cfg.frameStateLast;
++                } else {
++                    frameState = cfg.frameStateMiddle;
++                }
++
++                String payload = "{\"extra\":{},\"timestamp_ms\":"
++                        + (timestamp + i * frameDurationMs) + "}";
++
++                ws.send(ByteString.of(buildProtobufRequest(
++                        token, cfg.serviceName, cfg.methodTaskRequest, payload,
++                        frame, requestId, frameState)));
++            }
++
++            // 如果最后一段不足，补一个 LAST 帧
++            if (opusFrames.length % estimatedFrameSize != 0) {
++                int start = totalFrames * estimatedFrameSize;
++                byte[] remaining = new byte[opusFrames.length - start];
++                System.arraycopy(opusFrames, start, remaining, 0, remaining.length);
++                String payload = "{\"extra\":{},\"timestamp_ms\":"
++                        + (timestamp + totalFrames * frameDurationMs) + "}";
++                ws.send(ByteString.of(buildProtobufRequest(
++                        token, cfg.serviceName, cfg.methodTaskRequest, payload,
++                        remaining, requestId, cfg.frameStateLast)));
++            }
++        }
++
++        @Override
++        public void onMessage(WebSocket ws, String text) {
++            // db协议使用二进制消息，忽略文本消息
++        }
++
++        @Override
++        public void onMessage(WebSocket ws, ByteString bytes) {
++            try {
++                byte[] data = bytes.toByteArray();
++                String resultJson = parseProtobufResponse(data);
++
++                if (resultJson == null || resultJson.isEmpty()) {
++                    return;
++                }
++
++                // 检查 message_type
++                com.google.gson.JsonObject jsonObj =
++                        com.google.gson.JsonParser.parseString(resultJson).getAsJsonObject();
++
++                if (jsonObj.has("message_type")) {
++                    String msgType = jsonObj.get("message_type").getAsString();
++                    if ("SessionFinished".equals(msgType)) {
++                        String text = finalText.toString();
++                        ws.close(1000, "Done");
++                        postSuccess(callback, text);
++                        return;
++                    }
++                    if ("TaskFailed".equals(msgType) || "SessionFailed".equals(msgType)) {
++                        String errMsg = jsonObj.has("status_message")
++                                ? jsonObj.get("status_message").getAsString() : "ASR error";
++                        ws.close(1000, "Error");
++                        postFailure(callback, new Exception(errMsg));
++                        return;
++                    }
++                }
++
++                // 解析识别结果
++                if (jsonObj.has("results")) {
++                    com.google.gson.JsonArray results = jsonObj.getAsJsonArray("results");
++                    for (com.google.gson.JsonElement el : results) {
++                        com.google.gson.JsonObject r = el.getAsJsonObject();
++                        if (r.has("text")) {
++                            String text = r.get("text").getAsString();
++                            boolean isInterim = r.has("is_interim")
++                                    && !r.get("is_interim").isJsonNull()
++                                    && r.get("is_interim").getAsBoolean();
++                            boolean vadFinished = r.has("is_vad_finished")
++                                    && !r.get("is_vad_finished").isJsonNull()
++                                    && r.get("is_vad_finished").getAsBoolean();
++                            boolean nonstream = r.has("extra")
++                                    && r.getAsJsonObject("extra").has("nonstream_result")
++                                    && r.getAsJsonObject("extra").get("nonstream_result").getAsBoolean();
++
++                            if (nonstream || (!isInterim && vadFinished)) {
++                                finalText.setLength(0);
++                                finalText.append(text);
++                            } else {
++                                finalText.setLength(0);
++                                finalText.append(text);
++                            }
++                        }
++                    }
++                }
++            } catch (Exception e) {
++                Log.w("DbASR", "Parse response failed: " + e.getMessage());
++            }
++        }
++
++        @Override
++        public void onClosing(WebSocket ws, int code, String reason) {
++            ws.close(1000, null);
++        }
++
++        @Override
++        public void onClosed(WebSocket ws, int code, String reason) {
++            String text = finalText.toString();
++            postSuccess(callback, text);
++        }
++
++        @Override
++        public void onFailure(WebSocket ws, Throwable t, Response response) {
++            postFailure(callback, new Exception("Db ASR WebSocket error: "
++                    + (t != null ? t.getMessage() : "unknown"), t));
++        }
++    }
++
++    // =========================================================================
++    //  Protobuf 编码（手写二进制，不引入 protobuf 依赖）
++    // =========================================================================
++
++    /**
++     * 构建 Protobuf AsrRequest 消息
++     */
++    private byte[] buildProtobufRequest(
++            String token, String serviceName, String methodName,
++            String payload, byte[] audioData, String requestId, int frameState) {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++
++        // 字段 2: token (string, tag=0x12)
++        if (token != null && !token.isEmpty()) {
++            writeTag(out, 2, 2);
++            writeString(out, token);
++        }
++        // 字段 3: service_name (string, tag=0x1A)
++        if (serviceName != null && !serviceName.isEmpty()) {
++            writeTag(out, 3, 2);
++            writeString(out, serviceName);
++        }
++        // 字段 5: method_name (string, tag=0x2A)
++        if (methodName != null && !methodName.isEmpty()) {
++            writeTag(out, 5, 2);
++            writeString(out, methodName);
++        }
++        // 字段 6: payload (string, tag=0x32)
++        if (payload != null && !payload.isEmpty()) {
++            writeTag(out, 6, 2);
++            writeString(out, payload);
++        }
++        // 字段 7: audio_data (bytes, tag=0x3A)
++        if (audioData != null && audioData.length > 0) {
++            writeTag(out, 7, 2);
++            writeBytes(out, audioData);
++        }
++        // 字段 8: request_id (string, tag=0x42)
++        if (requestId != null && !requestId.isEmpty()) {
++            writeTag(out, 8, 2);
++            writeString(out, requestId);
++        }
++        // 字段 9: frame_state (enum, tag=0x48, varint)
++        if (frameState != cfg.frameStateUnspecified) {
++            writeTag(out, 9, 0);
++            writeVarint(out, frameState);
++        }
++
++        return out.toByteArray();
++    }
++
++    /**
++     * 解析 Protobuf AsrResponse 消息
++     */
++    private static String parseProtobufResponse(byte[] data) {
++        if (data == null || data.length == 0) {
++            return null;
++        }
++        int pos = 0;
++        String messageType = "";
++        String resultJson = "";
++        String statusMessage = "";
++
++        while (pos < data.length) {
++            int[] tagResult = readVarint(data, pos);
++            int tag = tagResult[0];
++            pos = tagResult[1];
++            int fieldNum = tag >> 3;
++            int wireType = tag & 0x07;
++
++            switch (fieldNum) {
++                case 4: // message_type (string)
++                    String[] v4 = readString(data, pos, wireType);
++                    messageType = v4[0];
++                    pos = Integer.parseInt(v4[1]);
++                    break;
++                case 6: // status_message (string)
++                    String[] v6 = readString(data, pos, wireType);
++                    statusMessage = v6[0];
++                    pos = Integer.parseInt(v6[1]);
++                    break;
++                case 7: // result_json (string)
++                    String[] v7 = readString(data, pos, wireType);
++                    resultJson = v7[0];
++                    pos = Integer.parseInt(v7[1]);
++                    break;
++                default:
++                    pos = skipField(data, pos, wireType);
++                    break;
++            }
++        }
++
++        // 优先返回 result_json（识别结果）
++        if (resultJson != null && !resultJson.isEmpty()) {
++            return resultJson;
++        }
++        // 否则返回 message_type
++        if (messageType != null && !messageType.isEmpty()) {
++            return messageType;
++        }
++        return statusMessage;
++    }
++
++    // ===== Protobuf 编码辅助方法 =====
++
++    private static void writeTag(ByteArrayOutputStream out, int fieldNum, int wireType) {
++        writeVarint(out, (fieldNum << 3) | wireType);
++    }
++
++    private static void writeVarint(ByteArrayOutputStream out, int value) {
++        while ((value & 0xFFFFFF80) != 0) {
++            out.write((value & 0x7F) | 0x80);
++            value >>>= 7;
++        }
++        out.write(value & 0x7F);
++    }
++
++    private static void writeString(ByteArrayOutputStream out, String s) {
++        byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
++        writeVarint(out, bytes.length);
++        out.write(bytes, 0, bytes.length);
++    }
++
++    private static void writeBytes(ByteArrayOutputStream out, byte[] data) {
++        writeVarint(out, data.length);
++        out.write(data, 0, data.length);
++    }
++
++    private static int[] readVarint(byte[] data, int pos) {
++        int value = 0;
++        int shift = 0;
++        int startPos = pos;
++        while (pos < data.length) {
++            byte b = data[pos];
++            value |= (b & 0x7F) << shift;
++            pos++;
++            if ((b & 0x80) == 0) {
++                break;
++            }
++            shift += 7;
++        }
++        return new int[]{value, pos};
++    }
++
++    private static String[] readString(byte[] data, int pos, int wireType) {
++        if (wireType == 2) {
++            int[] lenResult = readVarint(data, pos);
++            int len = lenResult[0];
++            int dataStart = lenResult[1];
++            if (dataStart + len <= data.length) {
++                String s = new String(data, dataStart, len,
++                        java.nio.charset.StandardCharsets.UTF_8);
++                return new String[]{s, String.valueOf(dataStart + len)};
++            }
++        }
++        return new String[]{"", String.valueOf(pos)};
++    }
++
++    private static int skipField(byte[] data, int pos, int wireType) {
++        switch (wireType) {
++            case 0: // varint
++                return readVarint(data, pos)[1];
++            case 1: // 64-bit
++                return pos + 8;
++            case 2: // length-delimited
++                int[] len = readVarint(data, pos);
++                return len[1] + len[0];
++            case 5: // 32-bit
++                return pos + 4;
++            default:
++                return data.length;
++        }
++    }
++
++    // =========================================================================
++    //  辅助方法
++    // =========================================================================
++
++    private static String randomHex(int len) {
++        StringBuilder sb = new StringBuilder();
++        for (int i = 0; i < len; i++) {
++            sb.append(String.format("%02x", (int) (Math.random() * 256)));
++        }
++        return sb.toString();
++    }
++
++    private static String md5Hex(String s) throws Exception {
++        MessageDigest md = MessageDigest.getInstance("MD5");
++        byte[] digest = md.digest(s.getBytes());
++        StringBuilder sb = new StringBuilder();
++        for (byte b : digest) {
++            sb.append(String.format("%02x", b));
++        }
++        return sb.toString();
++    }
++
++    private void postSuccess(final AiCallback callback, final String result) {
++        if (callback == null) return;
++        mainHandler.post(() -> callback.onSuccess(result));
++    }
++
++    private void postFailure(final AiCallback callback, final Exception e) {
++        if (callback == null) return;
++        mainHandler.post(() -> callback.onFailure(e));
++    }
++}
+diff --git a/app/src/main/java/com/osfans/trime/DbProtocolConfig.java b/app/src/main/java/com/osfans/trime/DbProtocolConfig.java
+new file mode 100644
+index 0000000..cda5250
+--- /dev/null
++++ b/app/src/main/java/com/osfans/trime/DbProtocolConfig.java
+@@ -0,0 +1,168 @@
++/*
++ * SPDX-FileCopyrightText: 2015 - 2026 Rime community
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++package com.osfans.trime;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * db ASR 协议配置：所有经逆向工程获得的协议细节均在此配置，
++ * 代码中不保留任何db协议的具体参数值。
++ * 用户在主题 asr_config 中自行填写，公开版 patch 不包含任何协议实现细节。
++ */
++public class DbProtocolConfig {
++
++    // ===== 连接配置（必填） =====
++    public final String wsUrl;
++
++    // ===== 凭据（可选，空则自动注册/获取） =====
++    public final String deviceId;
++    public final String token;
++    public final String userAgent;
++
++    // ===== 协议标识 =====
++    public final int aid;
++    public final String appPackage;
++
++    // ===== 服务端点 =====
++    public final String registerUrl;
++    public final String settingsUrl;
++
++    // ===== WebSocket 请求头 =====
++    public final String wsProtoVersion;
++    public final String wsKeepalive;
++
++    // ===== 设备注册查询参数（Map 灵活配置） =====
++    public final Map<String, String> registerQueryParams;
++
++    // ===== 设备注册请求体 JSON 模板（占位符: {openudid} {clientudid} {cdid} {aid} {app_package}） =====
++    public final String registerBodyTemplate;
++
++    // ===== Token 获取 =====
++    public final String tokenBody;
++
++    // ===== 会话配置 JSON 模板（占位符: {channels} {sample_rate} {app_name} {device_id}） =====
++    public final String sessionConfigTemplate;
++
++    // ===== 消息类型 =====
++    public final String serviceName;
++    public final String methodStartTask;
++    public final String methodStartSession;
++    public final String methodFinishSession;
++    public final String methodTaskRequest;
++
++    // ===== 帧状态枚举 =====
++    public final int frameStateUnspecified;
++    public final int frameStateFirst;
++    public final int frameStateMiddle;
++    public final int frameStateLast;
++
++    // ===== 音频编码 =====
++    public final int opusBitrate;
++    public final int opusFrameEstimateBytes;
++
++    // ===== 音频参数 =====
++    public final int sampleRate;
++    public final int channels;
++    public final int frameDurationMs;
++    public final String appName;
++
++    /**
++     * 构造方法：从 Lua 配置表构建协议配置
++     *
++     * @param wsUrl       WebSocket 地址（必填）
++     * @param deviceId    设备 ID（空则自动注册获取）
++     * @param token       ASR Token（空则自动获取）
++     * @param userAgent   User-Agent
++     * @param aid         应用 ID
++     * @param appPackage  应用包名
++     * @param registerUrl 设备注册 URL
++     * @param settingsUrl Token 获取 URL
++     * @param wsProtoVersion   WebSocket proto-version 头值
++     * @param wsKeepalive      WebSocket x-custom-keepalive 头值
++     * @param registerQueryParams 设备注册查询参数 Map
++     * @param registerBodyTemplate  设备注册请求体 JSON 模板
++     * @param tokenBody       Token 获取请求体
++     * @param sessionConfigTemplate  会话配置 JSON 模板
++     * @param serviceName     服务名
++     * @param methodStartTask  StartTask 方法名
++     * @param methodStartSession StartSession 方法名
++     * @param methodFinishSession FinishSession 方法名
++     * @param methodTaskRequest TaskRequest 方法名
++     * @param frameStateUnspecified 帧状态：未指定
++     * @param frameStateFirst        帧状态：首帧
++     * @param frameStateMiddle       帧状态：中间帧
++     * @param frameStateLast         帧状态：末帧
++     * @param opusBitrate     Opus 编码比特率
++     * @param opusFrameEstimateBytes Opus 单帧估算字节数
++     * @param sampleRate     采样率
++     * @param channels       声道数
++     * @param frameDurationMs 帧时长（毫秒）
++     * @param appName        作用应用包名
++     */
++    public DbProtocolConfig(
++            String wsUrl,
++            String deviceId,
++            String token,
++            String userAgent,
++            int aid,
++            String appPackage,
++            String registerUrl,
++            String settingsUrl,
++            String wsProtoVersion,
++            String wsKeepalive,
++            Map<String, String> registerQueryParams,
++            String registerBodyTemplate,
++            String tokenBody,
++            String sessionConfigTemplate,
++            String serviceName,
++            String methodStartTask,
++            String methodStartSession,
++            String methodFinishSession,
++            String methodTaskRequest,
++            int frameStateUnspecified,
++            int frameStateFirst,
++            int frameStateMiddle,
++            int frameStateLast,
++            int opusBitrate,
++            int opusFrameEstimateBytes,
++            int sampleRate,
++            int channels,
++            int frameDurationMs,
++            String appName) {
++
++        this.wsUrl = wsUrl;
++        this.deviceId = deviceId;
++        this.token = token;
++        this.userAgent = userAgent;
++        this.aid = aid;
++        this.appPackage = appPackage;
++        this.registerUrl = registerUrl;
++        this.settingsUrl = settingsUrl;
++        this.wsProtoVersion = wsProtoVersion;
++        this.wsKeepalive = wsKeepalive;
++        this.registerQueryParams = registerQueryParams != null
++                ? registerQueryParams : new HashMap<>();
++        this.registerBodyTemplate = registerBodyTemplate;
++        this.tokenBody = tokenBody;
++        this.sessionConfigTemplate = sessionConfigTemplate;
++        this.serviceName = serviceName;
++        this.methodStartTask = methodStartTask;
++        this.methodStartSession = methodStartSession;
++        this.methodFinishSession = methodFinishSession;
++        this.methodTaskRequest = methodTaskRequest;
++        this.frameStateUnspecified = frameStateUnspecified;
++        this.frameStateFirst = frameStateFirst;
++        this.frameStateMiddle = frameStateMiddle;
++        this.frameStateLast = frameStateLast;
++        this.opusBitrate = opusBitrate;
++        this.opusFrameEstimateBytes = opusFrameEstimateBytes;
++        this.sampleRate = sampleRate;
++        this.channels = channels;
++        this.frameDurationMs = frameDurationMs;
++        this.appName = appName;
++    }
++}
+diff --git a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
+index 37c3fa8..d6a12eb 100644
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
+@@ -21,10 +21,15 @@ import android.util.DisplayMetrics;
+ import android.util.Log;
+ import android.util.TypedValue;
+ 
++import java.util.HashMap;
++import java.util.Map;
++
+ import com.androlua.LuaApplication;
+ import com.androlua.LuaUtil;
+ import com.osfans.trime.AiClient;
+ import com.osfans.trime.BuildConfig;
++import com.osfans.trime.DbASRClient;
++import com.osfans.trime.DbProtocolConfig;
+ import com.osfans.trime.Config;
+ import com.osfans.trime.Key;
+ import com.osfans.trime.TrimeService;
+@@ -388,15 +393,7 @@ public class ThemeManager {
+             return null;
+         LuaValue f = mGlobals.get(s);
+         if (f.isfunction()) {
+-            try {
+-                return f.jcall(args);
+-            } catch (Throwable e) {
+-                // 主题脚本里的 Lua 错误(如 attempt to index nil)原来会直接穿透
+-                // 到调用方所在的主线程,变成 FATAL EXCEPTION 让输入法崩掉。
+-                // 这里统一吞掉并记录:message 里带 chunk 和行号,方便定位。
+-                Log.e("ThemeManager", "callFunction " + s + " failed: " + e.getMessage(), e);
+-                return null;
+-            }
++            return f.jcall(args);
+         }
+         return null;
+     }
+@@ -435,6 +432,93 @@ public class ThemeManager {
+         mAsrClient = null;
+         LuaValue aiConfig = mGlobals.get("asr_config");
+         if (aiConfig.istable()) {
++            LuaValue type = aiConfig.get("type");
++            String asrType = (type.isstring() && type.length() > 0)
++                    ? type.tojstring() : "ai";
++
++            if ("db".equals(asrType)) {
++                // db ASR：WebSocket + Protobuf 协议
++                // 所有协议细节从 asr_config 读取，构建 DbProtocolConfig 传入
++                LuaValue wsUrl = aiConfig.get("ws_url");
++                if (!wsUrl.isstring() || wsUrl.length() == 0)
++                    return;
++
++                // 读取全部协议配置字段
++                LuaValue deviceId = aiConfig.get("device_id");
++                LuaValue token = aiConfig.get("token");
++                LuaValue userAgent = aiConfig.get("user_agent");
++                LuaValue aidVal = aiConfig.get("aid");
++                LuaValue appPackage = aiConfig.get("app_package");
++                LuaValue registerUrl = aiConfig.get("register_url");
++                LuaValue settingsUrl = aiConfig.get("settings_url");
++                LuaValue wsProtoVersion = aiConfig.get("ws_proto_version");
++                LuaValue wsKeepalive = aiConfig.get("ws_keepalive");
++                LuaValue registerQueryParamsTable = aiConfig.get("register_query_params");
++                LuaValue registerBodyTemplate = aiConfig.get("register_body_template");
++                LuaValue tokenBody = aiConfig.get("token_body");
++                LuaValue sessionConfigTemplate = aiConfig.get("session_config_template");
++                LuaValue serviceName = aiConfig.get("service_name");
++                LuaValue methodStartTask = aiConfig.get("method_start_task");
++                LuaValue methodStartSession = aiConfig.get("method_start_session");
++                LuaValue methodFinishSession = aiConfig.get("method_finish_session");
++                LuaValue methodTaskRequest = aiConfig.get("method_task_request");
++                LuaValue frameStateUnspecified = aiConfig.get("frame_state_unspecified");
++                LuaValue frameStateFirst = aiConfig.get("frame_state_first");
++                LuaValue frameStateMiddle = aiConfig.get("frame_state_middle");
++                LuaValue frameStateLast = aiConfig.get("frame_state_last");
++                LuaValue opusBitrate = aiConfig.get("opus_bitrate");
++                LuaValue opusFrameEstimateBytes = aiConfig.get("opus_frame_estimate_bytes");
++                LuaValue sampleRate = aiConfig.get("sample_rate");
++                LuaValue channels = aiConfig.get("channels");
++                LuaValue frameMs = aiConfig.get("frame_duration_ms");
++                LuaValue appName = aiConfig.get("app_name");
++
++                // 构建注册查询参数 Map
++                Map<String, String> queryParams = new HashMap<>();
++                if (registerQueryParamsTable.istable()) {
++                    for (LuaValue k : ((LuaTable) registerQueryParamsTable).keys()) {
++                        queryParams.put(k.tojstring(), registerQueryParamsTable.get(k).tojstring());
++                    }
++                }
++
++                // 构建协议配置
++                DbProtocolConfig cfg = new DbProtocolConfig(
++                        wsUrl.tojstring(),
++                        deviceId.isstring() ? deviceId.tojstring() : null,
++                        token.isstring() ? token.tojstring() : null,
++                        userAgent.isstring() ? userAgent.tojstring() : null,
++                        aidVal.tonumber().toint(),
++                        appPackage.isstring() ? appPackage.tojstring() : "",
++                        registerUrl.isstring() ? registerUrl.tojstring() : "",
++                        settingsUrl.isstring() ? settingsUrl.tojstring() : "",
++                        wsProtoVersion.isstring() ? wsProtoVersion.tojstring() : "",
++                        wsKeepalive.isstring() ? wsKeepalive.tojstring() : "",
++                        queryParams,
++                        registerBodyTemplate.isstring() ? registerBodyTemplate.tojstring() : "",
++                        tokenBody.isstring() ? tokenBody.tojstring() : "",
++                        sessionConfigTemplate.isstring() ? sessionConfigTemplate.tojstring() : "",
++                        serviceName.isstring() ? serviceName.tojstring() : "",
++                        methodStartTask.isstring() ? methodStartTask.tojstring() : "",
++                        methodStartSession.isstring() ? methodStartSession.tojstring() : "",
++                        methodFinishSession.isstring() ? methodFinishSession.tojstring() : "",
++                        methodTaskRequest.isstring() ? methodTaskRequest.tojstring() : "",
++                        frameStateUnspecified.tonumber().toint(),
++                        frameStateFirst.tonumber().toint(),
++                        frameStateMiddle.tonumber().toint(),
++                        frameStateLast.tonumber().toint(),
++                        opusBitrate.tonumber().toint(),
++                        opusFrameEstimateBytes.tonumber().toint(),
++                        sampleRate.tonumber().toint(),
++                        channels.tonumber().toint(),
++                        frameMs.tonumber().toint(),
++                        appName.isstring() ? appName.tojstring() : ""
++                );
++
++                mAsrClient = new DbASRClient(cfg);
++                return;
++            }
++
++            // 默认 AI ASR：HTTP multipart 上传
+             LuaValue base_url = aiConfig.get("base_url");
+             if (!base_url.isstring() || base_url.length() == 0)
+                 return;
+@@ -450,12 +534,6 @@ public class ThemeManager {
+ 
+             mAsrClient = new AiClient(base_url.tojstring(), key.tojstring());
+             mAsrClient.setModel(model.tojstring());
+-            // 可选:api="transcriptions" 强制走 /audio/transcriptions;
+-            // 留空则按模型名自动判断(SenseVoice / whisper / ASR 视为专用识别模型)
+-            LuaValue api = aiConfig.get("api");
+-            if (api.isstring() && api.length() > 0) {
+-                mAsrClient.setTranscribeMode(api.tojstring().toLowerCase().contains("transcri"));
+-            }
+             if (mPrompt.isstring() && mPrompt.length() > 0) {
+                 mAsrClient.setPrompt(mPrompt.tojstring());
+             }
