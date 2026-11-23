@@ -1,7 +1,7 @@
 diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	1970-01-01 08:00:00.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-23 08:10:00.000000000 +0800
-@@ -0,0 +1,961 @@
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeDataBridge.java	2026-11-23 21:43:32.285827869 +0800
+@@ -0,0 +1,1013 @@
 +/*
 + * ThemeDataBridge —— 主题工作室（tools Lua）数据桥接
 + *
@@ -798,6 +798,19 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +                    int n = keyRoot.getChildCount();
 +                    for (int i = 0; i < n; i++) {
 +                        View c = keyRoot.getChildAt(i);
++                        // 【r27.25 诊断】把 keyRoot 的每一个直接子节点都打一行，不受
++                        // instanceof TextView / visibility 过滤影响。用于定位"语音"这类
++                        // 节点：到底是 TextView 还是容器、vis 是多少、gravity 多少、反射
++                        // mHints 是否匹配到权威通道。一次抓日志即可定案，不再靠猜。
++                        // 容器节点再递归一层列出它的直接子 View（缩进 cls 里体现层级）。
++                        emitKSCView(out, s, reg, i, c, chanOf.get(c));
++                        if (c instanceof ViewGroup) {
++                            ViewGroup vg = (ViewGroup) c;
++                            for (int j = 0; j < vg.getChildCount(); j++) {
++                                View inner = vg.getChildAt(j);
++                                emitKSCView(out, s, reg, i, inner, chanOf.get(inner));
++                            }
++                        }
 +                        if (!(c instanceof TextView)) continue;
 +                        int vis = c.getVisibility();
 +                        CharSequence cs = ((TextView) c).getText();
@@ -865,6 +878,45 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeDataB
 +        if ((g & android.view.Gravity.LEFT) == android.view.Gravity.LEFT) return "LEFT";
 +        if ((g & android.view.Gravity.RIGHT) == android.view.Gravity.RIGHT) return "RIGHT";
 +        return "";
++    }
++
++    /**
++     * 【r27.25 诊断】输出 keyRoot 任一子节点的结构快照，不受任何过滤影响。
++     * 格式：KSVIEW <seq> r=<reg> idx=<i> cls=<simpleName> isTV=<0|1> vis=<v>
++     *       g=<gravity> xy=<x,y,w,h> ch=<channel|-> txt=[<escaped>]
++     * 其中 ch 来自反射 mHints[] 的匹配结果（非 TextView 节点一般为 '-'）。
++     * 工具端解析会忽略未知行，故不影响现有 KSCLICK/KSCORNER 行为。
++     */
++    private static void emitKSCView(StringBuilder out, int s, String reg, int idx,
++                                    View c, String ch) {
++        if (c == null) return;
++        boolean isTV = c instanceof android.widget.TextView;
++        String cls = c.getClass().getSimpleName();
++        int vis = c.getVisibility();
++        String txt = "";
++        if (isTV) {
++            CharSequence cs = ((android.widget.TextView) c).getText();
++            txt = cs == null ? "" : cs.toString().replace("\n", "\\n")
++                    .replace("[", "%5B").replace("]", "%5D");
++        }
++        int g = 0;
++        try {
++            ViewGroup.LayoutParams lp = c.getLayoutParams();
++            if (lp instanceof android.widget.FrameLayout.LayoutParams)
++                g = ((android.widget.FrameLayout.LayoutParams) lp).gravity;
++        } catch (Throwable ignore) {}
++        int vx = Math.round(c.getLeft() + c.getTranslationX());
++        int vy = Math.round(c.getTop() + c.getTranslationY());
++        out.append("KSVIEW ").append(s).append(" r=").append(reg)
++           .append(" idx=").append(idx)
++           .append(" cls=").append(cls)
++           .append(" isTV=").append(isTV ? 1 : 0)
++           .append(" vis=").append(vis)
++           .append(" g=").append(g)
++           .append(" xy=").append(vx).append(',').append(vy)
++           .append(',').append(c.getWidth()).append(',').append(c.getHeight())
++           .append(" ch=").append((ch == null || ch.isEmpty()) ? "-" : ch)
++           .append(" txt=[").append(txt).append("]\n");
 +    }
 +
 +    /**
