@@ -646,6 +646,74 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 90
 
+      # 让 GitHub 自动生成的 Source code 包包含「全部」源码（含子模块、补丁、工具、AAR）。
+      # 原理：自动归档 = git archive(tag 指向 commit 的 tree)；子模块在 tree 里是
+      # gitlink(160000)，归档只有空目录。所以这里在发布前构造一个「扁平化」commit：
+      # 把整个工作区(已打补丁/铺工具/pin 子模块/生成离线 AAR)复制成干净树，
+      # 剥离所有 .git 元数据让子模块内容变普通文件，排除敏感文件与构建产物，
+      # 提交成一个新 commit 并让 patched-latest 指向它。GitHub 归档这个 commit 即可得到完整源码。
+      - name: 生成完整源码快照并指向 patched-latest
+        if: startsWith(github.ref, 'refs/tags/') == false
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/src-snapshot"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          # 只复制源码相关文件：排除 .git 元数据、构建产物、Gradle 缓存，
+          # 以及所有含签名密钥/密码的敏感文件。
+          tar --exclude-vcs \
+              --exclude='.git' --exclude='*/.git' --exclude='*/.git/*' \
+              --exclude='*/build' --exclude='*/.cxx' --exclude='.gradle' \
+              --exclude='*.keystore' --exclude='gradle.properties' \
+              --exclude='local.properties' --exclude='app/prebuilt' \
+              --exclude='offline-aar' --exclude='digital-ink-recognition-19.0.0.aar' \
+              --exclude='release-body.md' --exclude='.gitmodules' \
+              -cf - . | (cd "$STAGE" && tar -xf -)
+
+          # 安全兜底：敏感文件绝不能进快照
+          LEAK=$(cd "$STAGE" && find . \( -name '*.keystore' -o -name 'gradle.properties' \
+                   -o -name 'local.properties' \) -print)
+          if [ -n "$LEAK" ]; then
+            echo "::error::源码快照里出现敏感文件，终止发布"; echo "$LEAK"; exit 1
+          fi
+          # 完整性兜底：源码主体 + 补丁 + 子模块内容 + 内置工具必须在
+          for must in app/src/main/ patches/16-builtin-tools.patch \
+                      app/src/main/jni/librime/CMakeLists.txt; do
+            [ -e "$STAGE/$must" ] || { echo "::error::源码快照缺少 $must"; exit 1; }
+          done
+          if [ -d "$STAGE/builtin-tools/app/src/main/assets/tools/theme-studio" ]; then
+            echo "OK: 含内置工具 theme-studio"
+          fi
+
+          # 在临时树里提交：子模块内容已是普通文件，tree 里不再有 gitlink
+          git -C "$STAGE" init -q
+          git -C "$STAGE" config user.name "github-actions[bot]"
+          git -C "$STAGE" config user.email "github-actions[bot]@users.noreply.github.com"
+          # -f 强制加入被 .gitignore 忽略但编译必需的文件(如 app/libs/*.aar)
+          git -C "$STAGE" add -A -f
+          git -C "$STAGE" commit -qm "完整源码快照 r${GITHUB_RUN_NUMBER} (上游 ${UPSTREAM_SHA:0:7})"
+          GITLINK=$(git -C "$STAGE" ls-tree -r HEAD | grep -c '^160000' || true)
+          [ "$GITLINK" -eq 0 ] || { echo "::error::快照里仍有 $GITLINK 个 gitlink 子模块"; exit 1; }
+          echo "快照文件数: $(git -C "$STAGE" ls-tree -r HEAD | wc -l), gitlink: $GITLINK"
+
+          # 把快照 commit 作为一个对象推到本仓库(用一个专用 ref 保存)，
+          # 再让 patched-latest 指向它 —— GitHub 归档该 tag 即得到完整源码。
+          SNAP_SHA=$(git -C "$STAGE" rev-parse HEAD)
+          REMOTE="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$STAGE" remote add origin "$REMOTE"
+          git -C "$STAGE" push -q --force origin "$SNAP_SHA:refs/heads/patched-src"
+          git -C "$STAGE" push -q --force origin "$SNAP_SHA:refs/tags/patched-latest"
+          echo "patched-latest -> $SNAP_SHA (完整源码快照)"
+
+          # 历史 Release 的 tag：日期 + 上游短 sha，让每次构建都能在发布页留下一条。
+          # 也指向同一份扁平化快照，因此每条历史 Release 的自动源码包同样完整。
+          HIST_TAG="patched-$(TZ=Asia/Shanghai date +%Y%m%d)-${UPSTREAM_SHA:0:7}"
+          if git -C "$STAGE" ls-remote --exit-code --tags origin "refs/tags/$HIST_TAG" >/dev/null 2>&1; then
+            HIST_TAG="${HIST_TAG}-r${GITHUB_RUN_NUMBER}"
+          fi
+          git -C "$STAGE" push -q --force origin "$SNAP_SHA:refs/tags/$HIST_TAG"
+          echo "HIST_TAG=$HIST_TAG" >> "$GITHUB_ENV"
+          echo "历史 Release tag -> $HIST_TAG (同样指向完整源码快照)"
+
       # Release 页面的「更新记录」：每个功能写一句「改了什么」，并链到对应补丁，
       # 完整清单折叠起来。只给名字看不出做了什么，容易误解。
       # 机器可读字段放在 HTML 注释里：页面不显示，但 check job 仍能解析。
@@ -670,7 +738,8 @@ jobs:
           # 补丁文件名 -> 功能名|一句话改进（只写这一版实际做的事，不写空话）
           describe() {
             case "$1" in
-              01-voice-asr*)          echo "语音输入与剪贴板|语音识别结果直接写入输入框；剪贴板变化改发轻量广播，不再把全文塞进 Intent" ;;
+              01-asr-engine*)         echo "语音引擎|保留两套 AI 语音引擎选项；切换引擎立即生效，主题热改 asr_config 也能识别" ;;
+              03-clipboard-broadcast*) echo "剪贴板广播|剪贴板变化改发轻量广播，不再把全文塞进 Intent（已从 1 号补丁拆出独立应用）" ;;
               02-font-system-first*)  echo "字体加载|优先使用系统已装字体，缺失时才回落到随包字体" ;;
               04-http-stream*)        echo "HTTP 流式请求|下载改为边收边写盘，大响应不再整块读进内存" ;;
               05-file-offset*)        echo "大文件兼容|修正 32 位环境的文件偏移，读取大文件不再截断" ;;
@@ -755,6 +824,16 @@ jobs:
 
             echo "---"
             echo
+            echo "### 源码"
+            echo
+            echo "- **完整源码**：本页 GitHub 自动生成的 \`Source code (zip/tar.gz)\` 已是最新完整快照——含全部补丁、内置工具、定版子模块源码与离线 AAR，解压即可离线编译。"
+            echo "- 子模块已扁平化为普通目录（不再是空指针），因此归档里可直接拿到 librime / OpenCC / 词库等全部源码。"
+            echo
+            echo "### 发布历史"
+            echo
+            echo "- ** Latest**：本仓库的 \`patched-latest\` 是固定在发布页顶部的正式发布，永远指向最新一次构建，下载链接长期不变。"
+            echo "- **历史版本**：每次构建另发一条以 \`patched-日期-上游短sha\` 命名的正式 Release，在 [发布列表](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases) 里按时间排列，可下载任意旧版 APK 与对应完整源码。"
+            echo
             echo "上游 ${UP_LINK} ${UP_SUBJECT} ｜ 构建 [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) ｜ arm64-v8a ${SIZE_MB} MB"
             echo
             echo "<!-- 以下字段供 CI 比对，页面不显示 -->"
@@ -766,17 +845,32 @@ jobs:
           cat "$BODY"
           cat "$BODY" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
-      # 非 tag 构建统一发到固定 tag 的 rolling Release:
-      # 链接永久固定、公开仓库任何人无需登录即可下载、不受 artifact 90 天过期影响
-      - name: 发布到 patched-latest
+      # 固定 tag 的 rolling Release:链接永久固定、公开仓库任何人无需登录即可下载、
+      # 不受 artifact 90 天过期影响。设为正式发布并置顶为 Latest,
+      # 这样仓库主页和 /releases 页顶部直接显示"最新发布",不再藏在 tag 里。
+      - name: 发布 Latest(patched-latest)
         if: startsWith(github.ref, 'refs/tags/') == false
         uses: softprops/action-gh-release@v2
         with:
           tag_name: patched-latest
-          name: "跟随上游最新构建"
+          name: "跟随上游最新构建（Latest）"
           body_path: release-body.md
           files: app/build/outputs/apk/release/*.apk
-          prerelease: true
+          prerelease: false
+          make_latest: true
+
+      # 每次构建再发一条独立 Release(日期+上游短sha 的 tag),在发布页按时间累积成历史。
+      # make_latest:false 保证它不会抢走 patched-latest 的 Latest 标记；
+      # 历史 tag 已在"生成完整源码快照"步骤指向扁平化快照,故其自动源码包同样完整。
+      - name: 发布历史 Release
+        if: startsWith(github.ref, 'refs/tags/') == false && env.HIST_TAG != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.HIST_TAG }}
+          name: "构建快照 ${{ env.HIST_TAG }}"
+          body_path: release-body.md
+          files: app/build/outputs/apk/release/*.apk
+          prerelease: false
           make_latest: false
 
       - name: 发布 Release(打 tag 时)
