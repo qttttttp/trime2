@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!--
+SPDX-FileCopyrightText: 2015 - 2024 Rime community
+
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ML Kit 数字墨水要求 minSdk 23。本应用仍保持 21，仅在 23+ 上调用；
+         低版本系统只是不加载该功能，不影响输入法本身。 -->
+    <uses-sdk tools:overrideLibrary="com.google.mlkit.vision.digitalink.recognition,com.google.mlkit.digitalink.common" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Android 8+ 不声明这条，应用就无法拉起安装器（表现为「无安装权限」） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!--
+        Android 11+ 包可见性:不在这里声明的话,queryIntentServices 只能查到系统包,
+        第三方/厂商的语音识别服务(小爱、讯飞、Google 语音服务…)在引擎列表里会全部消失。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <package android:name="com.miui.voiceassist" />
+        <package android:name="com.google.android.googlequicksearchbox" />
+    </queries>
+
+    <application
+        android:name="com.androlua.LuaApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/trime_app_name"
+        android:requestLegacyExternalStorage="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.TrimeAppTheme"
+        android:enableOnBackInvokedCallback="true"
+        tools:targetApi="33">
+
+        <service
+            android:name="com.osfans.trime.TrimeService"
+            android:exported="true"
+            android:label="@string/trime_app_name"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+
+        <provider
+            android:name="android.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths" />
+        </provider>
+
+        <!-- Using an activity alias to disable/enable the app icon in the launcher -->
+        <activity
+            android:name="com.osfans.trime.PrefLauncher"
+            android:exported="true"
+            android:label="@string/trime_app_name"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name="com.osfans.trime.ToolActivity" />
+        <activity android:name="com.osfans.trime.editor.EditorActivity" android:exported="false" />
+        <activity
+            android:name="com.androlua.LuaActivity"
+            android:theme="@android:style/Theme.DeviceDefault"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <activity android:name="com.androlua.LuaEditorActivity"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name="com.androlua.LuaActivityX"
+            android:configChanges='orientation|screenSize|keyboardHidden'
+            android:documentLaunchMode="intoExisting"
+            android:excludeFromRecents="false"/>
+        <!-- All activities must be declared above <activity-alias> tag -->
+    </application>
+</manifest>

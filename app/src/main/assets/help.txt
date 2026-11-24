@@ -1,0 +1,209 @@
+入口文件
+Activity main.lua
+Service service.lua
+AccessibilityService accessibility.lua
+NotificationListenerService notification.lua
+WallpaperService wallpaper.lua
+服务可以使用setLuaDir(dir)设置运行目录，setEnabled(context)打开启动服务设置界面，getInstance()获取服务实例。
+
+# luaj nirenr修改版。
+### 优化lua++语法。
+
+** 可省略非必要关键字 **
+省略then
+if a then
+end
+-->
+if a
+end
+
+省略do
+while a do
+end
+-->
+while a
+end
+
+省略in
+for k,v in pairs(t) do
+end
+-->
+for k,v pairs(t)
+end
+
+支持?操作符
+?a print(1)`print(2)
+a=?a print(1)`print(2)
+
+支持switch
+switch a
+  case 1,3,5,7,9
+    print(1)
+  case 2,4,6,8
+    print(2)
+  case 0
+    print(0)
+  default
+    print(nil)
+end
+
+支持when
+a=when a
+   case 1,3,5,7,9
+     return 1
+   case 2,4,6,8
+     return 2
+   case 0
+     return 0
+   default
+     return nil
+ end
+
+支持continue
+
+for n=1,10
+  if n%2==0
+    continue
+ end
+ print(n)
+end
+
+
+** 支持foreach**
+for k,v : t
+end
+for k,v in t
+end
+
+
+** 支持defer **
+defer后语句将在函数结束时运行，多个defer将按照后入先出原则运行。
+
+function f()
+  defer print("defer")
+  print("func")
+end
+f()
+
+
+** 支持try-catch-finally **
+try
+  error("err")
+catch(m)
+  print("catch",m)
+finally
+  print("finally")
+end
+
+** 支持lambda **
+lambda a,b->a+b
+lambda a,b=>print(a+b)
+\ a,b->a+b
+\ a,b=>print(a+b)
+
+** 支持import **
+
+import将导入包并设置为局部变量，支持别名。
+import "java.lang.String"
+import str "java.lang.String"
+import "java.lang.String", "java.lang.Integer"
+
+支持导入java包。
+import "java.lang.*"
+
+支持导入并返回值，返回模式不设置局部变量或全局导入包。
+str=import "java.lang.String"
+lang=import "java.lang.*"
+
+
+** 支持module **
+module自带环境，默认设置环境表的metatable为自己，
+module "name"
+
+
+** 支持自赋值local **
+local:print
+将全局print设置为局部print
+
+
+** 调用java优化 **
+直接()构建实例或实现接口
+b=ArrayList()
+m=HashMap()
+i=interface{
+  methodname=function(arg)
+  end
+}
+
+支持覆盖方法
+list=ArrayList.override{
+  function add(a,s)
+    s(a)
+  end
+}()
+
+直接创建数组
+i=int[10]
+
+java 方法使用.调用
+b.add(1)
+
+java getter/setter
+b.setText("")
+-->
+b.text=""
+m.abc=1
+
+t=b.getText()
+-->
+t=b.text
+t=m.abc
+
+
+** 支持64位整数 **
+i=0xffffffffff
+
+** 支持+= -= *= /= %= ^= //= &= |= ~= <<= >>= ..=运算 **
+a+=1
+a-=1
+a*=1
+a/=1
+
+** 支持位运算 **
+
+按位与
+a=1&2
+
+按位或
+a=1|2
+
+按位异或
+a=1~2
+
+右移
+a=1>>8
+
+左移
+a=8<<2
+
+按位非
+a=~2
+
+** 支持增强型字符串格式化 **
+a/A 有符号十六进制浮点数，
+b 布尔值，
+B 无符号byte类型，
+c char类型，数字转文字，
+i/d 有符号整数类型，字符串转十进制，
+I 无符号int整数，
+e/E/f/g/G 有符号浮点数，
+o 八进制有符号整数，
+L 无符号长整数，
+u/U 字符串转u码，
+x/X 十六进制有符号整数，字符串转hex，
+r 解析字符串转义，
+q 格式化为合法字符串形式，
+s 转字符串，
+l url编码，
+
+lua标准库请参考官方文档。
