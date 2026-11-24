@@ -1,7 +1,7 @@
 diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
---- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-03 10:28:35.000000000 +0800
-+++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 17:50:52.018175564 +0800
-@@ -46,6 +46,16 @@
+--- a/app/src/main/java/com/osfans/trime/InputView.java
++++ b/app/src/main/java/com/osfans/trime/InputView.java
+@@ -47,6 +47,16 @@
      private Globals globals;
      private View oldView;
  
@@ -18,15 +18,15 @@ diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/InputView.java b
      public InputView(@NonNull Context context) {
          super(context);
          setClipChildren(false);
-@@ -146,6 +156,7 @@
-                 if (func.isfunction()) {
+@@ -151,6 +161,7 @@
                      LuaValue ret = func.call();
+                     try { LuaPatchManager.applyFile(globals, globals, base); }
+                     catch (Exception e) { ThemeManager.sendMsg("键盘补丁: " + e); }
++                    sCurrentKeyboardGlobals = globals;  // 主题工作室数据桥接
                      if (ret.isuserdata(View.class)) {
-+                        sCurrentKeyboardGlobals = globals;  // 主题工作室数据桥接
                          setKeyboardView(ret.touserdata(View.class));
                          return;
-                     }
-@@ -156,6 +167,8 @@
+@@ -162,6 +173,8 @@
                  ThemeManager.sendMsg("setKeyboard " + e);
              }
              //Log.w("TAG", "setKeyboard: "+globals.checktable().dump().tojstring() );
