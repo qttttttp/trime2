@@ -51,22 +51,34 @@ index 062fc80..6e20dc8 100644
          <activity
              android:name="com.osfans.trime.PrefLauncher"
 diff --git a/app/src/main/assets/themes/default/main.lua b/app/src/main/assets/themes/default/main.lua
-index 30c7ee7..ed832ed 100644
+index 30c7ee7..48e4117 100644
 --- a/app/src/main/assets/themes/default/main.lua
 +++ b/app/src/main/assets/themes/default/main.lua
-@@ -25,14 +25,19 @@ ai_config = {
+@@ -25,14 +25,32 @@ ai_config = {
      extra_params="",--扩展参数，json字符串或table
  }
  
 ---自定义asr语音识别配置，未做流式输出兼容，需关闭流式输出，需要支持input_audio的多模态
-+--自定义asr语音识别配置，未做流式输出兼容，需关闭流式输出
++--自定义asr语音识别配置（引擎 ai1），未做流式输出兼容，需关闭流式输出
++--语音引擎设置里：配了这份就显示 ai1，没配就不显示；括号里按 api 自动标注“转写/多模态”
 +--两种用法：
 +--  1) 专用识别模型(推荐,免费且无时长限制):model 填 FunAudioLLM/SenseVoiceSmall
 +--     或 Qwen/Qwen3-ASR-1.7B，自动走 /v1/audio/transcriptions
 +--  2) 多模态理解模型:model 填 qwen3-omni 等,走 /v1/chat/completions 的音频输入
  asr_config = {
--    base_url="",--api地址
 +    base_url="",--api地址，如 https://api.siliconflow.cn/v1
++    model="",--模型名称
++    key="",--鉴权key
++    api="",--留空按模型名自动判断；填 transcriptions 强制走专用转写接口，填 chat 强制走多模态
++    prompt="",--提示词（仅多模态模式使用）
++    system_prompt="",--系统参数，可以指定识别偏好（仅多模态模式使用）
++    extra_params="",--扩展参数，json字符串或table（仅多模态模式使用）
++}
++
++--第二套asr语音识别配置（引擎 ai2），字段与上面完全相同，可接另一家服务/另一种模式
++--配了这份，语音引擎设置里会多显示一个 ai2（按 api 标注转写/多模态）；没配就不显示
++asr_config2 = {
+     base_url="",--api地址
      model="",--模型名称
      key="",--鉴权key
 -    prompt="",--提示词
@@ -265,7 +277,7 @@ index 5882299..17bc332 100644
          }
  
 diff --git a/app/src/main/java/com/osfans/trime/Speech.java b/app/src/main/java/com/osfans/trime/Speech.java
-index ba2e2e6..4854484 100644
+index ba2e2e6..579209d 100644
 --- a/app/src/main/java/com/osfans/trime/Speech.java
 +++ b/app/src/main/java/com/osfans/trime/Speech.java
 @@ -26,8 +26,14 @@ import android.content.SharedPreferences;
@@ -358,28 +370,29 @@ index ba2e2e6..4854484 100644
          mSoundPool = new SoundPool(4, STREAM_MUSIC, 0);
          mSoundCancel = mSoundPool.load(context, R.raw.speech_recognition_cancel, 1);
          mSoundError = mSoundPool.load(context, R.raw.speech_recognition_error, 1);
-@@ -140,9 +112,109 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -140,8 +112,109 @@ class Speech implements RecognitionListener, RecognizerListener {
          mSoundSuccess = mSoundPool.load(context, R.raw.speech_recognition_success, 1);
          mSoundEnd = mSoundPool.load(context, R.raw.speech_speech_end, 1);
  
 +        initEngine();
-+    }
-+
+     }
+ 
 +    /**
 +     * 按当前 recognition_service 配置创建识别引擎。
 +     * 配置取值:
-+     *   "ai"              AI 大模型引擎(录音后自己发请求)
-+     *   "ai语音引擎"       ai语音引擎,另一套独立的 AI 引擎(录音后发请求)
++     *   "ai1"             第一套 AI 引擎,读主题 asr_config(录音后自己发请求)
++     *   "ai2"             第二套 AI 引擎,读主题 asr_config2(录音后自己发请求)
 +     *   "vivo"            vivo 语音 SDK
 +     *   "默认"             系统默认识别服务 SpeechRecognizer
 +     *   "显示名/包名/类名"  系统里某个具体的 RecognitionService(小爱、讯飞、Google 等)
 +     */
 +    private void initEngine() {
 +        releaseEngine();
-+        mAsrClient = ThemeManager.getAsrClient();
 +        String cfg = Function.getPref(context).getString("recognition_service", "vivo");
 +        mCfg = cfg;
 +        mAsrSig = ThemeManager.getAsrConfigSignature();
++        // 按引擎值选对应 client:ai1→asr_config,ai2→asr_config2(没配置则为 null)
++        mAsrClient = ThemeManager.getAsrClientForEngine(cfg);
 +
 +        // 用 lastIndexOf 解析:显示名里带 "/" 也不会错位(旧代码 split("/") 取 [1][2] 会崩)
 +        int p2 = cfg.lastIndexOf('/');
@@ -394,8 +407,8 @@ index ba2e2e6..4854484 100644
 +                Log.w(TAG, "指定识别服务不可用,回退系统默认: " + pkg + "/" + cls);
 +                speech = createRecognizer(null);
 +            }
-+        } else if ((cfg.equals("ai") || cfg.equals("ai语音引擎")) && mAsrClient != null) {
-+            // "ai" 与 "ai语音引擎" 是两套独立的引擎选项,都走 AI 录音识别路径。
++        } else if (mAsrClient != null) {
++            // ai1/ai2 都走 AI 录音识别路径,只是用的 client(配置)不同。
 +            mAudioRecorderHelper = new AudioRecorderHelper();
 +        } else if (cfg.equals("vivo")) {
 +            vSpeech = new VivoRecognizer(context, this);
@@ -446,9 +459,9 @@ index ba2e2e6..4854484 100644
 +        } catch (Exception e) {
 +            Log.w(TAG, "openPermissionSettings failed", e);
 +        }
-     }
- 
- 
++    }
++
++
 +    private SpeechRecognizer createRecognizer(ComponentName cn) {
 +        try {
 +            SpeechRecognizer r = (cn == null)
@@ -464,11 +477,10 @@ index ba2e2e6..4854484 100644
 +            return null;
 +        }
 +    }
-+
+ 
      private HashMap<String, ComponentName> getService(Context context) {
          HashMap<String, ComponentName> appMap = new HashMap<>();
-         ArrayList<String> list = new ArrayList<String>();
-@@ -166,7 +238,15 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -166,7 +239,15 @@ class Speech implements RecognitionListener, RecognizerListener {
      }
  
      private void playSound(int id) {
@@ -485,7 +497,7 @@ index ba2e2e6..4854484 100644
          vibrate();
      }
  
-@@ -181,10 +261,81 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -181,10 +262,81 @@ class Speech implements RecognitionListener, RecognizerListener {
          Toast.makeText(context, text, Toast.LENGTH_SHORT).show();
      }
  
@@ -569,7 +581,7 @@ index ba2e2e6..4854484 100644
              playSound(mSoundError);
              return;
          }
-@@ -214,9 +365,18 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -214,9 +366,18 @@ class Speech implements RecognitionListener, RecognizerListener {
          } else if (speech != null) {
              recognizerIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
              recognizerIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
@@ -590,7 +602,7 @@ index ba2e2e6..4854484 100644
              //recognizerIntent.putExtra(RecognizerIntent.EXTRA_PROMPT, "開始語音");
              speech.startListening(recognizerIntent);
              state = STATE_START;
-@@ -241,32 +401,17 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -241,32 +402,17 @@ class Speech implements RecognitionListener, RecognizerListener {
              state = STATE_END;
              playSound(mSoundEnd);
              byte[] bs = mAudioRecorderHelper.stopRecord();
@@ -627,7 +639,7 @@ index ba2e2e6..4854484 100644
                  }
  
                  @Override
-@@ -274,8 +419,17 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -274,8 +420,17 @@ class Speech implements RecognitionListener, RecognizerListener {
                      Log.w(TAG, "onFailure: " + e.getMessage());
                      state = STATE_ERROR;
                      playSound(mSoundError);
@@ -646,7 +658,7 @@ index ba2e2e6..4854484 100644
              return;
          }
          if (vSpeech != null)
-@@ -285,24 +439,34 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -285,24 +440,34 @@ class Speech implements RecognitionListener, RecognizerListener {
      }
  
      public void destroy() {
@@ -695,7 +707,7 @@ index ba2e2e6..4854484 100644
      }
  
      @Override
-@@ -312,20 +476,35 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -312,20 +477,35 @@ class Speech implements RecognitionListener, RecognizerListener {
  
      @Override
      public void onEndOfSpeech() {
@@ -740,7 +752,7 @@ index ba2e2e6..4854484 100644
      }
  
      @Override
-@@ -340,44 +519,39 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -340,44 +520,39 @@ class Speech implements RecognitionListener, RecognizerListener {
  
      @Override
      public void onReadyForSpeech(Bundle arg0) {
@@ -813,7 +825,7 @@ index ba2e2e6..4854484 100644
          }
      }
  
-@@ -430,11 +604,7 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -430,11 +605,7 @@ class Speech implements RecognitionListener, RecognizerListener {
  
      @Override
      public void onReady() {
@@ -826,7 +838,7 @@ index ba2e2e6..4854484 100644
      }
  
      @Override
-@@ -449,37 +619,29 @@ class Speech implements RecognitionListener, RecognizerListener {
+@@ -449,37 +620,29 @@ class Speech implements RecognitionListener, RecognizerListener {
  
      @Override
      public void onResult(String result) {
@@ -884,7 +896,7 @@ index ba2e2e6..4854484 100644
      }
  }
 diff --git a/app/src/main/java/com/osfans/trime/TrimeService.java b/app/src/main/java/com/osfans/trime/TrimeService.java
-index 0bf4c64..a337f77 100644
+index 0bf4c64..52bd9f0 100644
 --- a/app/src/main/java/com/osfans/trime/TrimeService.java
 +++ b/app/src/main/java/com/osfans/trime/TrimeService.java
 @@ -63,6 +63,7 @@ import com.osfans.trime.enums.InlineModeType;
@@ -981,10 +993,10 @@ index 0bf4c64..a337f77 100644
              android.util.Log.i(TAG, "onUp: " + keyCode + ":" + mSpeech.getState());
          if (mSpeech != null) {
 diff --git a/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java b/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
-index 264300e..72e1a8e 100644
+index 264300e..aea4827 100644
 --- a/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
 +++ b/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
-@@ -7,85 +7,155 @@ package com.osfans.trime.dialog;
+@@ -7,85 +7,164 @@ package com.osfans.trime.dialog;
  
  
  import android.app.AlertDialog;
@@ -1001,6 +1013,7 @@ index 264300e..72e1a8e 100644
 +import android.text.TextUtils;
  
  import com.androlua.LuaApplication;
++import com.osfans.trime.AiClient;
 +import com.osfans.trime.TrimeService;
  import com.osfans.trime.theme.ThemeManager;
  import com.osfans.trime.util.Function;
@@ -1021,8 +1034,8 @@ index 264300e..72e1a8e 100644
 -            list.add("AI大模型");
 -            list.add("ai");
 +        // label 是列表里显示的文字,value 是写进 recognition_service 的值。
-+        // 两个 AI 引擎选项("ai"、"ai语音引擎")是两套不同的引擎,必须都保留,
-+        // 不能因为名字相近就合并成一个。
++        // 两套 ASR 引擎按主题里的配置动态列出:配了 asr_config 显示 ai1,配了 asr_config2
++        // 显示 ai2;都没配就不显示。括号里注明该配置当前是转写还是多模态模式。
 +        ArrayList<String> labels = new ArrayList<>();
 +        ArrayList<String> values = new ArrayList<>();
 +
@@ -1041,13 +1054,16 @@ index 264300e..72e1a8e 100644
 +        labels.add("vivo 语音");
 +        values.add("vivo");
 +
-+        if (ThemeManager.getAsrClient() != null) {
-+            // 两套独立的 AI 语音引擎:存储值分别写 "ai" 与 "ai语音引擎",
-+            // Speech.initEngine() 对这两个值分别识别处理。
-+            labels.add("AI大模型");
-+            values.add("ai");
-+            labels.add("ai语音引擎");
-+            values.add("ai语音引擎");
++        // ai1 = 第一套 asr_config,ai2 = 第二套 asr_config2;各自配置了才列出
++        AiClient asr1 = ThemeManager.getAsrClient();
++        AiClient asr2 = ThemeManager.getAsrClient2();
++        if (asr1 != null) {
++            labels.add("ai1（" + modeLabel(asr1) + "）");
++            values.add("ai1");
++        }
++        if (asr2 != null) {
++            labels.add("ai2（" + modeLabel(asr2) + "）");
++            values.add("ai2");
          }
 -        String[] mEngines = new String[list.size()];
 -        list.toArray(mEngines);
@@ -1118,7 +1134,11 @@ index 264300e..72e1a8e 100644
 -            final ApplicationInfo appInfo = serviceInfo.applicationInfo;
 -            final String packageName = serviceInfo.packageName;
 -            final CharSequence title = resolveInfo.loadLabel(pm);
--
++    /** 选项括号里的模式说明:专用转写 / 多模态,跟随 client 实际判定的模式 */
++    private static String modeLabel(AiClient client) {
++        return client.isTranscribeMode() ? "转写" : "多模态";
++    }
+ 
 -            final boolean isSystemApp = ((appInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0);
 +    /**
 +     * 系统当前选定的默认识别服务,格式 "包名/类名";读不到返回 null。
@@ -1182,10 +1202,26 @@ index 264300e..72e1a8e 100644
  
      public void show() {
 diff --git a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
-index df68c3b..302e56b 100644
+index df68c3b..e854acc 100644
 --- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
 +++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
-@@ -388,7 +388,15 @@ public class ThemeManager {
+@@ -58,6 +58,7 @@ public class ThemeManager {
+     private static InlineModeType mInlineModeType = null;
+     private static AiClient mAiClient;
+     private static AiClient mAsrClient;
++    private static AiClient mAsrClient2;
+ 
+     public static ResourceFinder getFinder() {
+         return mResourceFinder;
+@@ -160,6 +161,7 @@ public class ThemeManager {
+         Key.presetKeys = getPresetKeys();
+         loadAiClient();
+         loadAsrClient();
++        loadAsrClient2();
+         //Style candidate = getStyle().getStyle("candidate");
+         //Rime.setRimeOption("_hide_candidate",!candidate.get("show").optboolean(true));
+         //Style comment = getStyle().getStyle("candidate").getStyle("comment");
+@@ -388,7 +390,15 @@ public class ThemeManager {
              return null;
          LuaValue f = mGlobals.get(s);
          if (f.isfunction()) {
@@ -1202,44 +1238,131 @@ index df68c3b..302e56b 100644
          }
          return null;
      }
-@@ -442,6 +450,12 @@ public class ThemeManager {
+@@ -424,36 +434,48 @@ public class ThemeManager {
+     }
  
-             mAsrClient = new AiClient(base_url.tojstring(), key.tojstring());
-             mAsrClient.setModel(model.tojstring());
-+            // 可选:api="transcriptions" 强制走 /audio/transcriptions;
-+            // 留空则按模型名自动判断(SenseVoice / whisper / ASR 视为专用识别模型)
-+            LuaValue api = aiConfig.get("api");
-+            if (api.isstring() && api.length() > 0) {
-+                mAsrClient.setTranscribeMode(api.tojstring().toLowerCase().contains("transcri"));
-+            }
-             if (mPrompt.isstring() && mPrompt.length() > 0) {
-                 mAsrClient.setPrompt(mPrompt.tojstring());
-             }
-@@ -463,4 +477,28 @@ public class ThemeManager {
+     private static void loadAsrClient() {
+-        mAsrClient = null;
+-        LuaValue aiConfig = mGlobals.get("asr_config");
+-        if (aiConfig.istable()) {
+-            LuaValue base_url = aiConfig.get("base_url");
+-            if (!base_url.isstring() || base_url.length() == 0)
+-                return;
+-            LuaValue model = aiConfig.get("model");
+-            if (!model.isstring() || model.length() == 0)
+-                return;
+-            LuaValue key = aiConfig.get("key");
+-            if (!key.isstring() || key.length() == 0)
+-                return;
+-            LuaValue mSystemPrompt = aiConfig.get("system_prompt");
+-            LuaValue mPrompt = aiConfig.get("prompt");
+-            LuaValue mExtraParams = aiConfig.get("extra_params");
++        mAsrClient = buildAsrClient("asr_config");
++    }
+ 
+-            mAsrClient = new AiClient(base_url.tojstring(), key.tojstring());
+-            mAsrClient.setModel(model.tojstring());
+-            if (mPrompt.isstring() && mPrompt.length() > 0) {
+-                mAsrClient.setPrompt(mPrompt.tojstring());
+-            }
+-            if (mSystemPrompt.isstring() && mSystemPrompt.length() > 0) {
+-                mAsrClient.setSystemPrompt(mSystemPrompt.tojstring());
+-            }
+-            if (mExtraParams.isstring()) {
+-                mAsrClient.setExtraParams(mExtraParams.tojstring());
+-            } else if (mExtraParams.istable()) {
+-                mAsrClient.setExtraParams(org.luaj.android.json.encode(mExtraParams));
+-            }
++    /** 第二套 ASR 配置,供语音引擎里的 ai2 选项使用;与 ai_config(聊天)完全隔离 */
++    private static void loadAsrClient2() {
++        mAsrClient2 = buildAsrClient("asr_config2");
++    }
++
++    /** 从主题里的某份 ASR 配置表创建 client;表缺失或字段不全返回 null(该引擎选项就不显示) */
++    private static AiClient buildAsrClient(String tableName) {
++        LuaValue aiConfig = mGlobals.get(tableName);
++        if (!aiConfig.istable()) return null;
++        LuaValue base_url = aiConfig.get("base_url");
++        if (!base_url.isstring() || base_url.length() == 0) return null;
++        LuaValue model = aiConfig.get("model");
++        if (!model.isstring() || model.length() == 0) return null;
++        LuaValue key = aiConfig.get("key");
++        if (!key.isstring() || key.length() == 0) return null;
++        LuaValue mSystemPrompt = aiConfig.get("system_prompt");
++        LuaValue mPrompt = aiConfig.get("prompt");
++        LuaValue mExtraParams = aiConfig.get("extra_params");
++
++        AiClient client = new AiClient(base_url.tojstring(), key.tojstring());
++        client.setModel(model.tojstring());
++        // 可选:api="transcriptions" 强制走 /audio/transcriptions;
++        // 留空则按模型名自动判断(SenseVoice / whisper / ASR 视为专用识别模型)
++        LuaValue api = aiConfig.get("api");
++        if (api.isstring() && api.length() > 0) {
++            client.setTranscribeMode(api.tojstring().toLowerCase().contains("transcri"));
++        }
++        if (mPrompt.isstring() && mPrompt.length() > 0) {
++            client.setPrompt(mPrompt.tojstring());
++        }
++        if (mSystemPrompt.isstring() && mSystemPrompt.length() > 0) {
++            client.setSystemPrompt(mSystemPrompt.tojstring());
+         }
++        if (mExtraParams.isstring()) {
++            client.setExtraParams(mExtraParams.tojstring());
++        } else if (mExtraParams.istable()) {
++            client.setExtraParams(org.luaj.android.json.encode(mExtraParams));
++        }
++        return client;
+     }
+ 
+     public static AiClient getAiClient() {
+@@ -463,4 +485,51 @@ public class ThemeManager {
      public static AiClient getAsrClient() {
          return mAsrClient;
      }
 +
-+    /** 供外部(如 Speech)在主题配置变化后强制重建 ASR 客户端 */
++    public static AiClient getAsrClient2() {
++        return mAsrClient2;
++    }
++
++    /**
++     * 按语音引擎存储值取对应 client:
++     *   "ai1"  → 第一套 asr_config
++     *   "ai2"  → 第二套 asr_config2
++     * 其它值返回 null(由 Speech 走 vivo/系统默认分支)。
++     */
++    public static AiClient getAsrClientForEngine(String engine) {
++        if ("ai1".equals(engine) || "ai".equals(engine)) return mAsrClient;       // "ai" 为旧值,兼容映射到第一套
++        if ("ai2".equals(engine) || "ai语音引擎".equals(engine)) return mAsrClient2; // "ai语音引擎" 为旧值,映射到第二套
++        return null;
++    }
++
++    /** 供外部(如 Speech)在主题配置变化后强制重建 ASR 客户端(两套一起重建) */
 +    public static void reloadAsrClient() {
 +        if (mGlobals != null) {
 +            loadAsrClient();
++            loadAsrClient2();
 +        }
 +    }
 +
 +    /**
-+     * 返回 asr_config 关键字段的签名字符串,供 Speech 在 start() 时比对,
-+     * 检测到 asr_config 内容变化就触发引擎重建,实现即时生效。
++     * 返回两份 ASR 配置关键字段的签名字符串,供 Speech 在 start() 时比对,
++     * 任一配置变化就触发两套 client 重建,实现即时生效。
 +     */
 +    public static String getAsrConfigSignature() {
 +        if (mGlobals == null) return "";
-+        LuaValue cfg = mGlobals.get("asr_config");
-+        if (!cfg.istable()) return "";
 +        StringBuilder sb = new StringBuilder();
 +        String[] keys = {"type", "base_url", "model", "key", "api", "prompt", "system_prompt"};
-+        for (String k : keys) {
-+            LuaValue v = cfg.get(k);
-+            sb.append(k).append('=').append(v.isstring() ? v.tojstring() : v.typename()).append(';');
++        for (String table : new String[]{"asr_config", "asr_config2"}) {
++            LuaValue cfg = mGlobals.get(table);
++            sb.append('[').append(table).append(']');
++            if (cfg.istable()) {
++                for (String k : keys) {
++                    LuaValue v = cfg.get(k);
++                    sb.append(k).append('=').append(v.isstring() ? v.tojstring() : v.typename()).append(';');
++                }
++            } else {
++                sb.append("none");
++            }
 +        }
 +        return sb.toString();
 +    }
