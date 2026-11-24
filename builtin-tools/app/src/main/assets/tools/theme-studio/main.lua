@@ -2591,8 +2591,11 @@ function buildToolbarPreview(W)
         end
         -- 【r27.32】桥接键数多于脚本键数时（真机 6 键 vs 脚本 4 键），把脚本没覆盖到的
         -- 尾部桥接键（如「悬浮关」「🐰 图片键」）按真机顺序补渲染，样式用默认 toolbar.key。
+        -- 【r27.50】真机最右的收起键 mHide 是独立 KeyView（ToolbarView.root 下最后一个
+        -- addView），桥接会把它当 toolbar 组最后一个键抓进来。工具下方已固定画了一个
+        -- hideText 键，这里若再补渲染一次，最右边就出现两个 ▽。故跳过最后一个桥接键。
         if liveTbN > tbSeq then
-            for i = tbSeq + 1, liveTbN do
+            for i = tbSeq + 1, liveTbN - 1 do
                 local le = liveTbEntry(i)
                 local lb = (le and le.label) or ""
                 local ll = liveTbLongText(le)
