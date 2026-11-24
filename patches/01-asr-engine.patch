@@ -980,17 +980,6 @@ index 0bf4c64..a337f77 100644
          if (BuildConfig.DEBUG)
              android.util.Log.i(TAG, "onUp: " + keyCode + ":" + mSpeech.getState());
          if (mSpeech != null) {
-@@ -1581,9 +1613,8 @@ public class TrimeService extends InputMethodService {
-                                 String text = addedText.toString();
-                                 addClipboard(text);
-                                 lastProcessTime = currentTime;
--                                // 剪贴板变化后发送本地广播
-+                                // 剪贴板变化后发送本地广播（不携带文本，避免大文本跨 Binder 拷贝/超限）
-                                 Intent clipIntent = new Intent("com.trime2.CLIP_CHANGED");
--                                clipIntent.putExtra("text", text);
-                                 clipIntent.setPackage(getPackageName());
-                                 sendBroadcast(clipIntent);
-                             }
 diff --git a/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java b/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
 index 264300e..72e1a8e 100644
 --- a/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java

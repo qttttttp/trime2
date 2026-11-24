@@ -1,0 +1,14 @@
+diff --git a/app/src/main/java/com/osfans/trime/TrimeService.java b/app/src/main/java/com/osfans/trime/TrimeService.java
+--- a/app/src/main/java/com/osfans/trime/TrimeService.java
++++ b/app/src/main/java/com/osfans/trime/TrimeService.java
+@@ -1579,6 +1579,10 @@
+                             if (!TextUtils.isEmpty(addedText)) {
+                                 String text = addedText.toString();
+                                 addClipboard(text);
+                                 lastProcessTime = currentTime;
++                                // 剪贴板变化后发送本地广播（不携带文本，避免大文本跨 Binder 拷贝/超限）
++                                Intent clipIntent = new Intent("com.trime2.CLIP_CHANGED");
++                                clipIntent.setPackage(getPackageName());
++                                sendBroadcast(clipIntent);
+                             }
+                         }
