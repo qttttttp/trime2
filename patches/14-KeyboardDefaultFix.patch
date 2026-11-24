@@ -92,8 +92,8 @@ diff -ruN a/app/src/main/java/com/osfans/trime/Config.java b/app/src/main/java/c
  
      public static String[] getKeyboards() {
 diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
---- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 20:08:37.027405776 +0800
-+++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java	2026-11-21 22:42:14.255683532 +0800
+--- a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
++++ b/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java
 @@ -15,22 +15,21 @@
  import com.osfans.trime.BuildConfig;
  import com.osfans.trime.Config;
@@ -169,7 +169,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
  
              // 4. 【核心】按显示名称进行本地化排序
              Collections.sort(KeyboardItems, new Comparator<KeyboardItem>() {
-@@ -148,41 +158,320 @@
+@@ -148,42 +158,349 @@
                      (dialog, index) -> {
                          dialog.dismiss();
                          String selectedId = sortedIds[index];
@@ -200,12 +200,18 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +        boolean hasLock;
 +    }
 +
-+    /**
+     /**
+-     * 私有工具方法：从 main.lua 中提取 name 变量
 +     * 从键盘脚本里读 name / lock，只做文本解析，不执行脚本。
 +     *
 +     * @param ignoreLock true 时不看 lock，直接给名字（列表为空时的兜底）
 +     * @return 显示名（带 id），不该出现在列表里时返回 null
-+     */
+      */
+-    private String getKeyboardNameFromLua(Globals globals, String keyboardId) {
+-        LuaTable env = new LuaTable();
+-        LuaTable mt = new LuaTable();
+-        mt.set("__index", globals);
+-        env.setmetatable(mt);
 +    private String readKeyboardName(String keyboardId, boolean ignoreLock) {
 +        String dir = Config.getKeyboardDir();
 +        LuaMeta meta = readMeta(new File(Config.getKeyboardPath(keyboardId)), new File(dir),
@@ -216,20 +222,14 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +        return name + " (" + keyboardId + ")";
 +    }
 +
-     /**
--     * 私有工具方法：从 main.lua 中提取 name 变量
++    /**
 +     * 读一个键盘脚本的 name / lock，并跟着 require 一路往下找。
 +     *
 +     * 键盘之间常常是复用的：某个键盘在自己的文件里只写「在 qwerty36 的基础上改几个键」，
 +     * name / lock（尤其是 lock = true）留在被 require 的文件里。只读自己这一份，
 +     * 这类键盘就会被当成「没有 lock」而整个从列表里消失。
 +     * 这里按文本跟进 require 链，缺什么补什么；自己显式写了的以自己为准。
-      */
--    private String getKeyboardNameFromLua(Globals globals, String keyboardId) {
--        LuaTable env = new LuaTable();
--        LuaTable mt = new LuaTable();
--        mt.set("__index", globals);
--        env.setmetatable(mt);
++     */
 +    private static LuaMeta readMeta(File file, File dir, Set<String> seen, int depth) {
 +        if (file == null || depth > 6) return null;
 +        String key;
@@ -249,6 +249,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 -            LuaValue chunk = globals.loadfilex(path, env);
 -            if (chunk.isfunction()) {
 -                chunk.call();
+-                com.osfans.trime.editor.LuaPatchManager.applyFile(globals,env,new java.io.File(path));
 -                LuaValue nameValue = env.get("name");
 -                if(!env.get("lock").toboolean())
 -                    return null;
@@ -270,6 +271,27 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 -            return keyboardId + " (" + e + ")";
          }
 -        return keyboardId;
++
++        // 【兼容上游编辑器 5025587b】编辑器把改动写进同名 .custom.lua sidecar
++        // （LuaPatchManager.file()）。上游原本在执行脚本后 applyFile 让补丁里的 name/lock
++        // 生效；这里不执行脚本，改为把 sidecar 当文本读进来，用同一套解析覆盖 name/lock。
++        // 这样「编辑器改过显示名的键盘」在选择列表里仍显示新名字，同时不触发脚本执行的
++        // 副作用（那正是本补丁要修的滑动失效问题）。sidecar 里的复杂 Lua 只当文本看，
++        // 解析不到就忽略，绝不影响主文件。
++        File side = sidecarOf(file);
++        if (side != null && side.isFile()) {
++            BufferedReader sr = null;
++            try {
++                sr = new BufferedReader(new InputStreamReader(new FileInputStream(side), "UTF-8"));
++                String line;
++                while ((line = sr.readLine()) != null) src.append(line).append('\n');
++            } catch (Exception ignored) {
++            } finally {
++                if (sr != null) {
++                    try { sr.close(); } catch (Exception ignored) {}
++                }
++            }
++        }
 +
 +        // 先整份去掉注释（含 --[[ ... ]] / --[==[ ... ]==] 块注释），再逐行看字段。
 +        // 块注释按行处理不了，里面出现的 name = "示例" / lock = true 会被当成真字段，
@@ -302,6 +324,14 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
 +            }
 +        }
 +        return meta;
++    }
++
++    /** 主键盘脚本对应的编辑器 sidecar: qwerty36.lua -> qwerty36.custom.lua */
++    private static File sidecarOf(File base) {
++        if (base == null) return null;
++        String n = base.getName();
++        if (!n.endsWith(".lua") || n.endsWith(".custom.lua")) return null;
++        return new File(base.getParentFile(), n.substring(0, n.length() - 4) + ".custom.lua");
 +    }
 +
 +    /** require 里的名字 -> 实际文件；兼容 "x"、"x.lua"、"keyboards/x" 三种写法 */
@@ -511,6 +541,7 @@ diff -ruN a/app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java b/app/
      }
  
      public void show() {
+
 diff -ruN a/app/src/main/java/com/osfans/trime/InputView.java b/app/src/main/java/com/osfans/trime/InputView.java
 --- a/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 20:08:37.027405776 +0800
 +++ b/app/src/main/java/com/osfans/trime/InputView.java	2026-11-21 21:17:41.815727385 +0800

@@ -1,14 +1,11 @@
 diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
-index 062fc80..6e20dc8 100644
+index 0dfe47a..a85d407 100644
 --- a/app/src/main/AndroidManifest.xml
 +++ b/app/src/main/AndroidManifest.xml
-@@ -6,7 +6,12 @@ SPDX-FileCopyrightText: 2015 - 2024 Rime community
- SPDX-License-Identifier: GPL-3.0-or-later
- -->
+@@ -8,6 +8,10 @@
  
--<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-+    xmlns:tools="http://schemas.android.com/tools">
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:tools="http://schemas.android.com/tools">
 +
 +    <!-- ML Kit 数字墨水要求 minSdk 23。本应用仍保持 21，仅在 23+ 上调用；
 +         低版本系统只是不加载该功能，不影响输入法本身。 -->
@@ -16,7 +13,7 @@ index 062fc80..6e20dc8 100644
      <uses-permission android:name="android.permission.INTERNET" />
      <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
      <uses-permission android:name="android.permission.VIBRATE" />
-@@ -16,6 +21,25 @@ SPDX-License-Identifier: GPL-3.0-or-later
+@@ -17,6 +21,25 @@
      <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
      <uses-permission android:name="android.permission.RECORD_AUDIO" />
      <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -42,7 +39,7 @@ index 062fc80..6e20dc8 100644
      <application
          android:name="com.androlua.LuaApplication"
          android:allowBackup="true"
-@@ -48,7 +72,6 @@ SPDX-License-Identifier: GPL-3.0-or-later
+@@ -52,7 +75,6 @@
                  android:resource="@xml/provider_paths" />
          </provider>
  
@@ -993,10 +990,10 @@ index 0bf4c64..52bd9f0 100644
              android.util.Log.i(TAG, "onUp: " + keyCode + ":" + mSpeech.getState());
          if (mSpeech != null) {
 diff --git a/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java b/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
-index 264300e..aea4827 100644
+index fdf2668..4aad1a4 100644
 --- a/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
 +++ b/app/src/main/java/com/osfans/trime/dialog/VoiceInputDialog.java
-@@ -7,85 +7,164 @@ package com.osfans.trime.dialog;
+@@ -7,86 +7,165 @@
  
  
  import android.app.AlertDialog;
@@ -1088,8 +1085,9 @@ index 264300e..aea4827 100644
              }
 +            labels.add(label);
 +            values.add(e[0] + "/" + e[1] + "/" + e[2]);
-+        }
-+
+         }
+ 
+-        mDig=new AlertDialog.Builder(context)
 +        String name = Function.getPref(context).getString("recognition_service", "vivo");
 +        int idx = values.indexOf(name);
 +        if (idx < 0 && !TextUtils.isEmpty(name)) {
@@ -1097,13 +1095,12 @@ index 264300e..aea4827 100644
 +            labels.add(name + "（当前设置）");
 +            values.add(name);
 +            idx = values.size() - 1;
-         }
++        }
 +        if (idx < 0) idx = 0;
 +
 +        final String[] mValues = values.toArray(new String[0]);
 +        final String[] mEngines = labels.toArray(new String[0]);
- 
--        mDig=new AlertDialog.Builder(context)
++
 +        mDig = new AlertDialog.Builder(context)
                  .setTitle("语音识别引擎")
                  .setSingleChoiceItems(mEngines, idx, new DialogInterface.OnClickListener() {
@@ -1115,6 +1112,7 @@ index 264300e..aea4827 100644
 +                        // 输入法服务未运行时 getInstance() 为 null,下次启动创建 Speech 时会读到新配置。
 +                        TrimeService svc = TrimeService.getInstance();
 +                        if (svc != null) svc.applySpeechEngineChange();
+                         dialog.dismiss();
                      }
                  })
 -                .setNegativeButton(android.R.string.cancel,null)
