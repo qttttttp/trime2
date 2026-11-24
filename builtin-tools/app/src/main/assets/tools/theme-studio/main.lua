@@ -24,10 +24,28 @@
   部署：rime/tools/主题工作室/main.lua（同目录 init.lua）
 --]]
 
+-- 【r27.33】角标水平微调（dp，正=右移）。仅作用于 long_click 的 label 与按键 hint
+-- （S.id=="click"，即 stPath="hint" 那类）——这两类实测偏左；上下左右滑动 hint
+-- （swipe_up/down/left/right）本来就正常，一律不偏移。也不影响 click 主标签。
+-- 默认 1dp；若觉得偏了直接改这个数字即可（含负数）。
+CORNER_X_NUDGE_DP = 1
+
 import "android.view.*"
 import "android.widget.*"
 import "android.graphics.*"
 import "android.graphics.drawable.*"
+import "android.text.*"
+import "android.text.style.*"
+-- ImageSpan/SpannableString 兜底：LuaJ 禁止对 import 注入的类名做全局赋值（
+-- 报 "can not assignment 'ImageSpan'"），故只用【局部别名】承接，缺类时再用 bindClass 补。
+local _ImageSpan = ImageSpan
+local _SpannableString = SpannableString
+local _Spannable = Spannable
+if _ImageSpan == nil then pcall(function() _ImageSpan = luajava.bindClass("android.text.style.ImageSpan") end) end
+if _SpannableString == nil then pcall(function() _SpannableString = luajava.bindClass("android.text.SpannableString") end) end
+if _Spannable == nil then pcall(function() _Spannable = luajava.bindClass("android.text.Spannable") end) end
+local _FgSpan = ForegroundColorSpan
+if _FgSpan == nil then pcall(function() _FgSpan = luajava.bindClass("android.text.style.ForegroundColorSpan") end) end
 -- androlua 专属类：import 必须在【顶层】直接调用（它依赖调用者环境绑定全局名，
 -- 包进 pcall 闭包会导致 LuaDialog/LuaAdapter 绑定不到全局 → onClick 报 call nil）。
 import "com.androlua.LuaDialog"
@@ -148,6 +166,63 @@ function readFileHead(p, n)
     local s = f:read(n or 32768)
     f:close()
     return s
+end
+-- 去掉 Lua 注释（单行 -- 与长注释 --[=[ ... ]=]），字符串原样保留，换行保留以维持行号。
+-- 注释内容替换成等长空格——这样后续对 name=/rows= 的匹配位置、诊断行号与原文完全一致。
+-- 所有"从脚本文本读 name="的地方都必须先过这一层，否则注释里的示例 name 会被当真值。
+function stripLuaComments(src)
+    if type(src) ~= "string" then return "" end
+    local out, i, n = {}, 1, #src
+    local function blank(s) return (s:gsub("[^\n]", " ")) end
+    while i <= n do
+        local c = src:sub(i, i)
+        if c == "-" and src:sub(i + 1, i + 1) == "-" then
+            -- 长注释 --[=*[
+            local b = i + 2
+            if src:sub(b, b) == "[" then
+                local j = b + 1
+                while src:sub(j, j) == "=" do j = j + 1 end
+                if src:sub(j, j) == "[" then
+                    local close = "]" .. src:sub(b + 1, j - 1) .. "]"
+                    local e = src:find(close, j + 1, true)
+                    local stop = e and (e + #close - 1) or n
+                    out[#out + 1] = blank(src:sub(i, stop))
+                    i = stop + 1
+                else
+                    local e = src:find("\n", i, true) or (n + 1)
+                    out[#out + 1] = blank(src:sub(i, e - 1)); i = e
+                end
+            else
+                local e = src:find("\n", i, true) or (n + 1)
+                out[#out + 1] = blank(src:sub(i, e - 1)); i = e
+            end
+        elseif c == '"' or c == "'" then
+            -- 普通字符串：原样扫到闭合引号（含反斜杠转义），里面的 -- 不是注释
+            local q, j = c, i + 1
+            while j <= n do
+                local d = src:sub(j, j)
+                if d == "\\" then j = j + 2
+                elseif d == q then j = j + 1 break
+                else j = j + 1 end
+            end
+            out[#out + 1] = src:sub(i, j - 1); i = j
+        elseif c == "[" then
+            -- 长字符串 [[...]] / [=[...]=]：原样保留
+            local j = i + 1
+            while src:sub(j, j) == "=" do j = j + 1 end
+            if src:sub(j, j) == "[" then
+                local close = "]" .. src:sub(i + 1, j - 1) .. "]"
+                local e = src:find(close, j + 1, true)
+                local stop = e and (e + #close - 1) or n
+                out[#out + 1] = src:sub(i, stop); i = stop + 1
+            else
+                out[#out + 1] = c; i = i + 1
+            end
+        else
+            out[#out + 1] = c; i = i + 1
+        end
+    end
+    return table.concat(out)
 end
 function writeFile(p, s)
     local f, err = io.open(p, "w")
@@ -922,7 +997,6 @@ local bridgeDiag = nil          -- 桥接诊断说明
 -- 强制忽略桥接键盘、改按主题声明/文件判定重载（诊断用）。
 -- 旧版桥接在偏好为空时会自己加载 qwerty36.lua 冒充"真机键盘"，工具无法分辨，
 -- 这个开关让用户能立刻验证"是不是桥接把 36 键塞进来的"。
-local ignoreBridgeKbd = false
 
 -- rows 下标是 1(string) 而非 1(number)）。序列化后 loadstring 回来仍是 string，
 -- 导致工具里所有 type(k)=="number" 判断失效：rowsCount 返回 0 → keyboardRowsOK 失败 →
@@ -1333,7 +1407,10 @@ function nativeTypefaceFor(styleNames)
         end
         return nil
     end)
-    if ok and tf then _nativeTfCache[key] = tf; return tf end
+    if ok and tf then
+        _nativeTfCache[key] = tf
+        return tf
+    end
     _nativeTfCache[key] = false
     return nil
 end
@@ -1344,21 +1421,52 @@ function nativeOffset(styleNames, key) return nil end
 -- 安全渲染：角标一律用纯文字绘制，不调真机 getSpan。
 function nativeSpan(text, styleNames, derive) return nil, false end
 
+-- 【r27.38】判定字符串是否为图片文件名。
+-- 致命坑：Lua 5.1（LuaJ）的 pattern【不支持 | 交替】。旧代码四处写
+--     s:match("%.(png|jpg|jpeg|webp|gif)$")
+-- 其字面含义是匹配 ".png|jpg|jpeg|webp|gif" 这个整串，对 bunny.png 恒为 false。
+-- 连锁后果：① 图片分支永不进入；② findLabelImage 把 bunny.png 拼成 bunny.png.png
+-- 查图返回 nil（日志 #6[bunny.png]TXT->nil 的根因）；③ 诊断把图片键误标成 TXT。
+-- 改为取扩展名后逐一比较，兼容大小写。
+local function isImageFileName(s)
+    if type(s) ~= "string" then return false end
+    local ext = s:match("%.([%w]+)$")
+    if not ext then return false end
+    ext = ext:lower()
+    return ext == "png" or ext == "jpg" or ext == "jpeg"
+        or ext == "webp" or ext == "gif"
+end
+
 function findLabelImage(label)
     if type(label) ~= "string" or label == "" then return nil end
-    -- 优先真机 Config.findImagePath：与 KeyStyle.getSpan 逐字一致，真机当图片就图片、
-    -- 当文字就文字。根治万象子目录五笔字根图被工具误命中的问题。
-    -- 查图完全走本地：样式目录 → 主题目录 → 数据目录（见下游三级路径）。
-    local name = label:match("%.png$") and label or (label .. ".png")
+    -- 是否显式图片文件名（bunny.png / x.webp …）。区分这两类很关键：
+    --  · 显式文件名 → 可放心走宽查找（主题各子目录 + 递归索引），因为用户已明确指名图片；
+    --  · 普通文字 label（含单字，如万象字根 "a"）→ 只走固定三级路径，
+    --    否则递归索引会命中子目录同名 a.png，造成字根图误命中（r13 曾踩过）。
+    local isFileName = isImageFileName(label)
+    local name = isFileName and label or (label .. ".png")
+    -- 固定三级路径（与真机 Config.findImagePath 逐字一致）
     if styleDir and fileExists(styleDir .. "/" .. name) then return styleDir .. "/" .. name end
     if themeDir then
         local p = themeDir .. "/images/" .. name
         if fileExists(p) then return p end
     end
-    local okD, dataDir = pcall(function() return Config.getDataDir() end)
-    if okD and dataDir then
-        local p = tostring(dataDir) .. "/images/" .. name
-        if fileExists(p) then return p end
+    if isFileName then
+        -- 【r27.33】显式文件名：宽查找兜底（主题根/各子目录/数据目录，findImage 已覆盖），
+        -- 再用递归索引（深度 4）找 images/子目录 里的图。修 png 不显示：
+        -- 旧实现只查 3 个固定路径，子目录 png 返回 nil → 落回显示文件名。
+        local p = findImage(name)
+        if p then return p end
+        if labelImgIndex then
+            local ip = labelImgIndex[name:lower()]
+            if ip then return ip end
+        end
+    else
+        local okD, dataDir = pcall(function() return Config.getDataDir() end)
+        if okD and dataDir then
+            local p = tostring(dataDir) .. "/images/" .. name
+            if fileExists(p) then return p end
+        end
     end
     return nil
 end
@@ -1969,7 +2077,9 @@ local showCandidateFlag = true  -- 真机输入界面默认显示候选栏（can
 -- ========== 事件通道定义（复刻 trime2 的 6 类按键事件）==========
 -- 每类通道：event 字段、提示文字字段、样式表相对路径、显示色（用于编辑区着色）
 local CHANNELS = {
-    { id = "click",      name = "点击",   ev = "click",       hint = nil,          stPath = "",              color = 0xFF3FB950 },
+    -- label = 该状态 view 上实际显示的文字字段（click→label；其余→ch.hint 角标文字字段）
+    -- hint  = click 专属：独立 hint（真机 mHints[0]="下标提示"）的显示文字字段
+    { id = "click",      name = "点击",   ev = "click",       label = "label",     hint = "hint",       stPath = "",              color = 0xFF3FB950 },
     { id = "long_click", name = "长按",   ev = "long_click",  hint = "hint_long",  stPath = "long_click",    color = 0xFFE3B341 },
     { id = "swipe_up",   name = "上滑",   ev = "swipe_up",    hint = "hint_up",    stPath = "hint.up",       color = 0xFF58A6FF },
     { id = "swipe_down", name = "下滑",   ev = "swipe_down",  hint = "hint_down",  stPath = "hint.down",     color = 0xFF58A6FF },
@@ -1995,7 +2105,73 @@ function newTightOrTextView()
     return TextView(activity)
 end
 
-function addLabelView(fl, label, textSizeSp, textColor, imgPadDp, fontName, gravity, offsetX, offsetY, imgLookup, nativeStyles, pxOffsets, wrapLp, derive, tight, absX, absY)
+-- 【r27.40 通用内容渲染入口】严格复刻真机 KeyStyle.getSpan(text) 的语义：
+--   内容是【桥接提供的文本】，查到图（path，由 findLabelImage 按真机 findImagePath 语义得到）
+--   就显示按字号缩放的图片，查不到就显示文字原文。与按键类别、是否文件名完全无关。
+-- 全工具所有显示入口（键盘主标签 / 各通道角标 / 工具栏主标签 / 工具栏角标）统一走这里，
+-- 因此任意键的内容——动态文字（单手开/关、悬浮开/关、剪贴板…）、图片文件名、恰好有
+-- 同名图的文字——都与真机一致；不再针对某个键或某种后缀做特判。
+-- text=显示的文字原文；path=findLabelImage 的结果；返回 true 表示显示了图片。
+function drawContentOnView(tv, text, path, textSizeSp)
+    local shown = false
+    if path then
+        -- 图标按 textSize 等比缩放（真机 getSpan 按 textSize 画 ImageSpan，不按原图像素）。
+        local targetPx = textSizeSp and math.ceil(dp(textSizeSp)) or 0
+        local function scaled(b)
+            if not b or targetPx <= 0 then return b end
+            local sw, sh = b.getWidth(), b.getHeight()
+            if sw <= 0 or sh <= 0 then return b end
+            local side = math.max(sw, sh)
+            if side == targetPx then return b end
+            local nw = math.max(1, math.floor(sw * targetPx / side + 0.5))
+            local nh = math.max(1, math.floor(sh * targetPx / side + 0.5))
+            local ok, nb = pcall(function() return Bitmap.createScaledBitmap(b, nw, nh, true) end)
+            return ok and nb or b
+        end
+        pcall(function()
+            local bmp = scaled(decodeImage(path))
+            if bmp then
+                local bd = BitmapDrawable(activity.getResources(), bmp)
+                bd.setBounds(0, 0, bmp.getWidth(), bmp.getHeight())
+                if _ImageSpan and _SpannableString and _Spannable then
+                    local ss = _SpannableString(" ")
+                    ss.setSpan(_ImageSpan(bd), 0, 1, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    tv.setText(ss)
+                    shown = true
+                end
+            end
+        end)
+        if not shown then
+            -- compound drawable 兜底（部分 ROM 上 ImageSpan 不显示时用）
+            pcall(function()
+                local bmp2 = scaled(decodeImage(path))
+                if bmp2 then
+                    local bd2 = BitmapDrawable(activity.getResources(), bmp2)
+                    bd2.setBounds(0, 0, bmp2.getWidth(), bmp2.getHeight())
+                    tv.setText("")
+                    tv.setCompoundDrawables(bd2, nil, nil, nil)
+                    shown = true
+                end
+            end)
+        end
+    end
+    if not shown then pcall(function() tv.setText(text) end) end
+    return shown
+end
+
+-- 【r27.42 统一判图】唯一查图入口：只有内容文本本身是【图片文件名后缀】才查图。
+-- 普通文字（"菜单"/"中文"/"▽"/候选词…）一律返回 nil → 显示文字，绝不因为恰好存在
+-- 同名 png 就被替换成图。这与用户要求一致：显图与否只看文字后缀，与键类别/通道无关。
+-- findLabelImage 内部对普通文字会加 .png 查固定路径（真机 getSpan 语义），这里在入口
+-- 用 isImageFileName 拦一道，把"文字查图"收敛为"文件名查图"。
+function lookupContentImage(text)
+    if not isImageFileName(text) then return nil end
+    local p = findLabelImage(text)
+    if not p and labelImgIndex then p = labelImgIndex[tostring(text):lower()] end
+    return p
+end
+
+function addLabelView(fl, label, textSizeSp, textColor, imgPadDp, fontName, gravity, offsetX, offsetY, imgLookup, nativeStyles, pxOffsets, wrapLp, derive, tight, absX, absY, absW, absH)
     -- derive：通道派生路径（"hint"/"long_click"/"hint.up"…），传给 nativeSpan 精确复现
     -- 真机 getSpan 用的 KeyStyle 实例——染色/尺寸必须取自正确实例（g 键 ▼ 就是被主 key
     -- style 染成白色大梯形，真机用 hint style 染成 27x25 灰三角）。nil=主 label。
@@ -2010,8 +2186,14 @@ function addLabelView(fl, label, textSizeSp, textColor, imgPadDp, fontName, grav
         -- 再 setLayoutParams——后者只是异步 requestLayout，dump 在同一帧取 getLeft 仍是旧值
         -- （r21 实测：事后改 LP 坐标纹丝不动）。gravity=TOP|LEFT + margins=(absX,absY)
         -- 使 view 左上角精确落在真机坐标，且 dump 打印一致。
+        -- 【r27.28】有桥接权威尺寸 absW/absH 时用固定尺寸（真机 getWidth/getHeight），
+        -- 不再用 WRAP_CONTENT 让工具字体重新测量。long_click「语 音」等纯文字角标
+        -- 原来走工具字体 → 测得宽度≠真机 dumpW → 文字在 view 内按 gravity 排版时视觉偏；
+        -- 固定成真机尺寸后，view 框与真机一致，文字排版基准相同。
         if absX ~= nil and absY ~= nil then
-            local lp = FrameLayout.LayoutParams(-2, -2)  -- WRAP_CONTENT
+            local useW = (type(absW) == "number" and absW > 0) and absW or -2
+            local useH = (type(absH) == "number" and absH > 0) and absH or -2
+            local lp = FrameLayout.LayoutParams(useW, useH)
             lp.gravity = bitOr(Gravity.TOP, Gravity.LEFT)
             lp.setMargins(absX, absY, 0, 0)
             v.setLayoutParams(lp)
@@ -2064,7 +2246,7 @@ function addLabelView(fl, label, textSizeSp, textColor, imgPadDp, fontName, grav
     -- 查图顺序与真机一致：样式目录 → 主题目录 → 数据目录 images，均按 text.png 精确匹配。
     -- 与真机 getSpan 的 findImagePath(text+".png") 逐字一致。不做任何按元素类别的特殊分支。
     -- 所有元素一视同仁：查到图 → 用真机【对应通道实例】的 getSpan（染色/尺寸正确）→ 显示图。
-    local imgPath = findLabelImage(lookupText)
+    local imgPath = lookupContentImage(lookupText)  -- 【r27.42】统一后缀判断，普通文字不查图
     if imgPath then
         -- 真机 getSpan 渲染结果：图已按该通道 KeyStyle 的 textColor 染色、缩放到 textSize、
         -- ALIGN_CENTER。derive 决定用哪个实例（hint / long_click / 方向），这是与真机一致的关键。
@@ -2091,13 +2273,21 @@ function addLabelView(fl, label, textSizeSp, textColor, imgPadDp, fontName, grav
         -- 让它落到下方纯文字分支，才是真机一致行为。
     end
     local tv = tight and newTightOrTextView() or TextView(activity)
-    tv.setText(label)
+    -- 【r27.40 通用内容渲染】触发条件不再是"label 是不是文件名"，而是
+    -- findLabelImage/lookupContentImage 是否查到图——这是真机 getSpan 的唯一判定：
+    -- 内容能查到图就显示图，查不到才显示文字。于是 bunny.png、任意带同名图的文字键、
+    -- 工具栏角标等所有入口统一受桥接内容驱动，不再逐个按键特判。
+    local usePath = imgPath or lookupContentImage(lookupText)
+    local imgShown = drawContentOnView(tv, label, usePath, textSizeSp)
     tv.setGravity(gravity or Gravity.CENTER)
     tv.setSingleLine(true)
     if textSizeSp then tv.setTextSize(textSizeSp) end
     if type(textColor) == "number" then pcall(function() tv.setTextColor(textColor) end) end
-    -- 字体：回到 r9「能正确显示」的直设逻辑 —— nativeFontOf 解析出的主题字体直接用，
-    -- 不再经 hasGlyph/私用区分流（那套误判会把正确字体丢掉、退回系统字体显示方框/豆腐）。
+    -- 字体：默认字体主题下真机与工具都用系统默认字体，字形本身一致。
+    -- r27.29 曾试图走 nativeTypefaceFor（ThemeManager.getStyle().getKeyStyle().getFont()）
+    -- 取真机完整 fallback 链，但工具进程拿不到真机 Style，43 次全 miss（hit=0 实测），
+    -- 纯属无效开销且带来误导诊断 —— r27.31 撤销，回到 nativeFontOf 直设。
+    -- 偏移与字体无关：坐标(e=0)/尺度(r=1.0)/尺寸(dumpW×dumpH)/gravity 均已数据核实对齐。
     local tfApplied = false
     if nativeStyles then
         local ntf = nativeFontOf(nativeStyles)
@@ -2135,6 +2325,26 @@ function buildToolbarPreview(W)
     if type(tbkeys) == "table" then for _ in pairs(tbkeys) do tbKeyCount = tbKeyCount + 1 end end
     local hasKeys = tbKeyCount > 0
     if not hasKeys and tb.schema_switches ~= true then return nil end
+
+    -- 【r27.32】工具栏改用桥接真机数据：liveKeyTexts.toolbar 是 Java 按 ToolbarView
+    -- 里每个 KeyView 输出的结构化快照，e.label=KSCLICK txt（真机最终显示文字，如
+    -- 「中文」「悬浮关」，而非脚本内部名 Mode_switch / 文件名 bunny.png）；
+    -- e.corners 里 ch=long_click 的 txt 是右上角标。桥接按 seq 顺序，与脚本 tbkeys
+    -- 的键顺序一致，按 index 一一对应。桥接某键无文字时回退脚本 evLabel。
+    local liveTb = (liveKeyTexts and liveKeyTexts.toolbar) or {}
+    local liveTbN = #liveTb
+    local function liveTbEntry(i)
+        if i >= 1 and i <= liveTbN then return liveTb[i] end
+        return nil
+    end
+    -- 桥接 long_click 角标文字（右上小字）
+    local function liveTbLongText(e)
+        if not e or type(e.corners) ~= "table" then return nil end
+        for _, c in ipairs(e.corners) do
+            if c.chan == "long_click" and c.txt and c.txt ~= "" then return c.txt end
+        end
+        return nil
+    end
 
     local tbH = dp((tonumber(getValue("candidate.height")) or 40) * math.min(1, keyboardHeightScale()))
     TB_PREVIEW_H = tbH          -- 供预览布局取工具栏实际高度（避免读 Java 字段）
@@ -2192,7 +2402,7 @@ function buildToolbarPreview(W)
         end
         wrap.setPadding(dp(tonumber(pad.left) or 0), dp(tonumber(pad.top) or 0),
                         dp(tonumber(pad.right) or 0), dp(tonumber(pad.bottom) or 0))
-        local isImg = findLabelImage(label or "") ~= nil
+        local isImg = lookupContentImage(label or "") ~= nil  -- 【r27.42】统一后缀判图
         if isImg then wrap.setMinimumWidth(tbH)
         else
             local n = 0
@@ -2242,16 +2452,19 @@ function buildToolbarPreview(W)
             local lbox = FrameLayout(activity)
             lbox.setLayoutParams(FrameLayout.LayoutParams(-2, -2, lgrav))
             local ltv = TextView(activity)
-            ltv.setText(longLabel)
             -- 与键盘角标一致：真机 mLongClick.setTextSize(mLongClickStyle.getTextSize(8))，
             -- 取 long_click 自己 style 的 text_size（默认 8），不是主文字 ts2 的一半。
             local lts = tonumber(channelField(stName, "long_click", "text_size")) or 8
+            -- 【r27.40】工具栏角标也走统一内容入口：桥接 long_click 文字能查到图就显示图，
+            -- 否则显示文字。与键盘角标/addLabelView 同一套真机 getSpan 语义，不再裸 setText。
+            local longPath = lookupContentImage(longLabel)
+            drawContentOnView(ltv, longLabel, longPath, lts)
             ltv.setTextSize(lts)
             if type(tc2) == "number" then pcall(function() ltv.setTextColor(tc2) end) end
             ltv.setGravity(Gravity.CENTER)
             local lNative = { "toolbar.key", "tool", "key" }
             if type(stName) == "string" and stName ~= "" then table.insert(lNative, 1, stName) end
-            -- 回到 r9 直设：nativeFontOf 解析出的主题字体直接用（含图标的合并字体能正确显示）。
+            -- 字体：默认字体主题回退本地 nativeFontOf（r27.31 撤销无效的真机字体链）。
             local ntf = nativeFontOf(lNative)
             if ntf then pcall(function() ltv.setTypeface(ntf) end) end
             -- 角标偏移：真机 long_click 角标用 getLongClickKeyStyle()（即 style.long_click）。
@@ -2310,10 +2523,36 @@ function buildToolbarPreview(W)
             end
             return nil
         end
+        -- 【r27.32】桥接文字覆盖 helper：桥接 e.label（真机显示文字）优先，
+        -- 空则回退脚本推导值（图片键桥接 txt 常为空，回退到 bunny.png 文件名，
+        -- 再由 addLabelView 的图片分支渲染成图片）。
+        local tbSeq = 0
+        local function bridgedLabel(fallback, i)
+            local le = liveTbEntry(i)
+            if le and le.label and le.label ~= "" then return le.label end
+            -- 【r27.35】桥接已到位但该键 txt 为空 = 真机这一键没有文字（图标/空白键）。
+            -- 此时不再回退脚本内部名（Mode_switch / schema_name / 占位符），那不是桥接数据。
+            -- 唯一例外：fallback 是图片文件名（bunny.png 等）——保留它仅用于找图，
+            -- addLabelView 的图片分支会显示图片而非文件名文字。
+            if le then
+                if isImageFileName(fallback) then
+                    return fallback
+                end
+                return ""
+            end
+            -- 桥接键越界（脚本键比桥接多）：桥接没覆盖到，才用脚本兜底
+            return fallback
+        end
+        local function bridgedLong(fallback, i)
+            local lt = liveTbLongText(liveTbEntry(i))
+            if lt and lt ~= "" then return lt end
+            return fallback
+        end
         for _, ti in ipairs(tbIdx) do
+            tbSeq = tbSeq + 1
             local o = tbkeys[ti] or tbkeys[tostring(ti)]
             if type(o) == "string" then
-                tbKeyView(evLabel(o) or o)
+                tbKeyView(bridgedLabel(evLabel(o) or o, tbSeq), nil, nil, bridgedLong(nil, tbSeq))
             elseif type(o) == "table" then
                 local label, stName = nil, nil
                 if type(o.options) == "table" then
@@ -2347,7 +2586,23 @@ function buildToolbarPreview(W)
                         end
                     end
                 end
-                tbKeyView(label or "", stName, nil, longLabel)
+                tbKeyView(bridgedLabel(label or "", tbSeq), stName, nil, bridgedLong(longLabel, tbSeq))
+            end
+        end
+        -- 【r27.32】桥接键数多于脚本键数时（真机 6 键 vs 脚本 4 键），把脚本没覆盖到的
+        -- 尾部桥接键（如「悬浮关」「🐰 图片键」）按真机顺序补渲染，样式用默认 toolbar.key。
+        if liveTbN > tbSeq then
+            for i = tbSeq + 1, liveTbN do
+                local le = liveTbEntry(i)
+                local lb = (le and le.label) or ""
+                local ll = liveTbLongText(le)
+                -- 桥接 label 为空时，尝试从该键的角落里找任一非空文字，避免整键空白。
+                if (not lb or lb == "") and le and type(le.corners) == "table" then
+                    for _, c in ipairs(le.corners) do
+                        if c.txt and c.txt ~= "" then lb = c.txt; break end
+                    end
+                end
+                tbKeyView(lb, nil, nil, ll)
             end
         end
     end
@@ -2612,7 +2867,7 @@ function buildCandidatePreview(W)
     -- 字体：真机 Style.getFont 优先级 candidate.font → candidate.text_font → keyboard.font
     local cdFont = resolveUIFont({"candidate.font", "candidate.text_font", "candidate.key.font",
         "font.candidate", "font.candidate_font", "candidate_font"})
-    -- 候选栏字体：回到 r9 直设 —— nativeFontOf 解析出的主题字体直接用。
+    -- 候选栏字体：本地 nativeFontOf（r27.31 撤销无效的真机字体链）。
     local cdTf = nativeFontOf({ "candidate", "candidate.key", "key" })
     local function setCandFont(tv)
         if cdTf then pcall(function() tv.setTypeface(cdTf) end)
@@ -2674,8 +2929,11 @@ function buildCandidatePreview(W)
     local more = TextView(activity)
     local moreText = getValue("candidate.key.text")
     if type(moreText) ~= "string" or moreText == "" then moreText = "▽" end
-    more.setText(moreText)
     local kTs = tonumber(getValue("candidate.key.text_size")) or cts
+    -- 【r27.42】候选栏右侧 hide/更多按钮纳入统一后缀判图：文字是图片文件名后缀
+    -- （如 hide.png）就显示图，否则显示文字。候选【词】本身仍不查图（见上方遍历）。
+    local morePath = lookupContentImage(moreText)
+    drawContentOnView(more, moreText, morePath, math.max(8, kTs))
     local kTc = getValue("candidate.key.text_color")
     if type(kTc) ~= "number" then kTc = type(ctc) == "number" and ctc or 0xFF888888 end
     more.setTextSize(math.max(8, kTs))
@@ -2772,6 +3030,32 @@ function channelField(stName, ch, key)
         end
     end
     return nil
+end
+
+-- 编辑面板的"当前值"回显：与真机渲染完全一致的取值口径。
+-- 旧实现用 getValue(精确路径)，默认主题只在 key 主表定义少数字段，子表(pressed/hint/
+-- long_click/margins…)大多没直接写 → 精确取值几乎全是 nil → 面板一大片"未设置"，
+-- 但真机渲染走 channelField 的 __index 继承链(stName.hint→stName→key)其实是有值的。
+-- 这里先走继承链，取不到再套渲染兜底默认值，让面板显示"该键实际生效值"。
+local function isCornerStylePath(ch)
+    return (ch and ch ~= "") and (ch:find("hint", 1, true) ~= nil or ch:find("long_click", 1, true) ~= nil) or false
+end
+local function defaultStyleValue(ch, f)
+    local corner = isCornerStylePath(ch)
+    if f == "text_color" then return corner and 0x99FFFFFF or 0xFF000000 end
+    if f == "text_size" then return corner and 8 or 18 end
+    if f == "show" then return true end
+    if f == "offset_x" or f == "offset_y" or f == "corner_radius" or f == "stroke_width"
+        or f == "elevation" or f == "left" or f == "top" or f == "right" or f == "bottom"
+        or f == "translation_x" or f == "translation_y" or f == "translation_z" then return 0 end
+    if f == "scale_x" or f == "scale_y" then return 1 end
+    return nil
+end
+-- 面板回显值：先按继承链解析生效值，整条链都没有再取渲染缺省值。
+function effectiveStyleValue(stName, ch, f)
+    local v = channelField(stName, ch or "", f)
+    if v == nil then v = defaultStyleValue(ch, f) end
+    return v
 end
 
 -- 严格复刻真机 KeyStyle.hasKey(k) = !mTable.rawget(k).isnil()：只认样式表【直接定义】的子键。
@@ -3007,15 +3291,57 @@ function swipeDirFromMove(x, y, w, h)
     return (y < 0) and "swipe_up" or "swipe_down"
 end
 
+-- 【r27.8】真机 KeyView 序号 ↔ 工具渲染序号 的自适应校准。
+-- 现象：坐标本身是对的（dump 命中、cXY>0），但角标整体移到相邻键（"错位一个 key"）。
+-- 根因：两侧键序列存在偏移——渲染时空白键也 `gRenderSeq+1` 占号，而结构化 dump 只采
+-- 真机 KeyView；一旦某处真机没有对应 KeyView（被隐藏/合并/不创建），从这里开始每个键
+-- 都取到"下一个键"的角标。固定规则（"空白键必占号"）不可能对所有主题成立。
+-- 解法：逐键用"主标签"做锚定——原位命中就用原位；否则在 ±3 内找同 label 的真机键
+-- （大小写无关）。这样整体偏移、局部偏移（某行有 spacer）都能自动纠正，且不依赖
+-- 任何写死假设。命中结果记忆为 __off，供 label 本身不同（Enter↔回车）的键沿用。
+local function resolveLiveSeq(seq, label)
+    if not seq or not liveKeyTexts or type(liveKeyTexts.keys) ~= "table" then return seq end
+    local keys = liveKeyTexts.keys
+    if label and label ~= "" then
+        local want = tostring(label):lower()
+        local c0 = keys[seq]
+        if c0 and c0.label and tostring(c0.label):lower() == want then
+            liveKeyTexts.__off = 0
+            return seq
+        end
+        -- 由近及远向两侧找：+d 优先（错位通常是"取到下一个键"）。
+        for d = 1, 3 do
+            local a = keys[seq + d]
+            if a and a.label and tostring(a.label):lower() == want then
+                liveKeyTexts.__off = d
+                return seq + d
+            end
+            local b = keys[seq - d]
+            if b and b.label and tostring(b.label):lower() == want then
+                liveKeyTexts.__off = -d
+                return seq - d
+            end
+        end
+    end
+    -- 无法用文字锚定（如 Enter↔回车）：沿用最近一次锚定出的偏移；没有就原位。
+    local off = liveKeyTexts.__off
+    if off and off ~= 0 and seq + off >= 1 and seq + off <= (liveKeyTextsN or 0) then
+        return seq + off
+    end
+    return seq
+end
+
 function makeKeyView(label, st, stName, w, h, r, k, margins, seq)
     local _tr = "K[" .. tostring(r) .. "," .. tostring(k) .. "]#" .. tostring(seq) .. "(" .. tostring(label) .. "/" .. tostring(stName) .. ")"
+    -- 【r27.8】按真机结构校准消费序号（见 resolveLiveSeq 注释）。
+    local useSeq = resolveLiveSeq(seq, label)
     -- 【真机文字源】取本键在真机 dump 里的实际显示文字（布局/样式仍走 kbdEnv）。
     -- 仅当 dump 可用、序号有效、且主标签匹配（或预览 label 为空）时才采用，避免键盘
     -- 不一致时按序映射错位。lt=nil 表示本键不采用真机文字，完全回退现有推导。
     local lt = nil
     local keyLiveOff = liveTextsDisabledKeys[keySlot(r, k)] == true
-    if not liveTextsDisabled and not keyLiveOff and liveKeyTexts and seq and seq >= 1 and seq <= liveKeyTextsN then
-        local cand = liveKeyTexts.keys[seq]
+    if not liveTextsDisabled and not keyLiveOff and liveKeyTexts and useSeq and useSeq >= 1 and useSeq <= liveKeyTextsN then
+        local cand = liveKeyTexts.keys[useSeq]
         -- 【r23 根因】label 相等不能作为硬条件：工具的 label 是【键盘脚本原始占位符】
         -- （如 Enter / schema_name / {X}），真机 dump 的 cand.label 是【Rime 转换后的
         -- 显示文字】（如 回车 / 万象拼音）。二者天然不同，强求相等会让几乎所有键
@@ -3028,11 +3354,6 @@ function makeKeyView(label, st, stName, w, h, r, k, margins, seq)
             if type(_G.__kbdDiag) == "table" then
                 _G.__kbdDiag.rendered = (_G.__kbdDiag.rendered or 0) + 1
                 _G.__kbdDiag.ltHit = (_G.__kbdDiag.ltHit or 0) + 1
-                if (cand.label or "") ~= (label or "") and #(_G.__kbdDiag.relabel or {}) < 8 then
-                    _G.__kbdDiag.relabel = _G.__kbdDiag.relabel or {}
-                    _G.__kbdDiag.relabel[#_G.__kbdDiag.relabel + 1] =
-                        tostring(label) .. ">" .. tostring(cand.label)
-                end
             end
         elseif type(_G.__kbdDiag) == "table" then
             _G.__kbdDiag.rendered = (_G.__kbdDiag.rendered or 0) + 1
@@ -3088,7 +3409,11 @@ function makeKeyView(label, st, stName, w, h, r, k, margins, seq)
 
     -- 中心主文字：复刻 KeyView 的 mClick（样式取本键 style 的 text_color/size/font/gravity/offset）
     -- 真机 mClick 字号直接用 getTextSize()（sp），不做额外缩放
-    if label and label ~= "" and not hide then
+    -- 【r27.39】渲染门槛修正：旧判断 `if label and label ~= ""` 只看【脚本占位 label】。
+    -- 桥接 dump 里 txt=[中文] 的键（如 seq=52）在脚本里常是占位/空 label，导致整段被
+    -- 跳过——桥接文字明明拿到了却不显示。改为：脚本 label 或桥接 label 有一个非空就渲染。
+    local __bridgedText = (lt and lt.label and lt.label ~= "") and lt.label or nil
+    if ((label and label ~= "") or __bridgedText) and not hide then
         local tc = field("text_color") or 0xFF000000
         local ts = tonumber(field("text_size")) or 18
         -- 严格对齐 trime2 Style.getFont("font")：当前 style.font → keyboard.font，
@@ -3111,187 +3436,73 @@ function makeKeyView(label, st, stName, w, h, r, k, margins, seq)
         if nox ~= nil or noy ~= nil then
             ox, oy, pxOffsets = nox, noy, true
         end
-        -- 真机 KeyView 主标签用 FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT,
-        -- mKeyStyle.getGravity(CENTER)) + setTranslationX/Y(offset)（KeyView.java 799-802）。
-        -- 传 wrapLp=true 走同一布局方式：gravity 设在 LayoutParams 上，位置随主题 gravity
-        -- 正确变化；旧版 MATCH_PARENT+setGravity 只在居中时碰巧一致，换主题设 LEFT/RIGHT
-        -- 或带 offset 时就会偏 —— 用户反馈的「click 文本位置和真机不同」即源于此。
-        addLabelView(keyRoot, label, ts, type(tc) == "number" and tc or nil, 8, font, grav, ox, oy, nil, nativeStyles, pxOffsets, true)
+        -- 【r27.18】click 主标签改与角标同构：有桥接权威坐标(lt.clickX/Y)时像角标一样
+        -- 绝对定位（传给 addLabelView 的 absX/absY），不再用主题 gravity+offset 推导，
+        -- 消除各主题推导结果不同造成的位置差异。无桥接坐标时仍回退原主题推导。
+        local clickAbsX, clickAbsY = nil, nil
+        if lt and lt.clickX ~= nil and lt.clickY ~= nil then
+            clickAbsX, clickAbsY = lt.clickX, lt.clickY
+        end
+        -- 【纯桥接 / r27.35】主标签文字只取桥接 KSCLICK 的 txt（真机 Rime 显示文字）。
+        -- 桥接键已命中(lt 非 nil)但 txt 为空 → 真机这键无文字，显示空，不再回退脚本内部名
+        -- （Enter / Mode_switch / schema_name 这类占位符不是桥接数据）。只有 lt=nil（桥接
+        -- 未覆盖到该键）时才回退脚本 label，保证桥接缺失时仍能显示。
+        local clickText
+        if lt then
+            clickText = (lt.label ~= nil and lt.label ~= "") and lt.label or ""
+            -- 桥接到位但 txt 空、且脚本本来有 label → 记一次"脚本内部名被屏蔽"
+            if clickText == "" and label and label ~= "" and type(_G.__kbdDiag) == "table" then
+                _G.__kbdDiag.scriptMasked = (_G.__kbdDiag.scriptMasked or 0) + 1
+            end
+        else
+            clickText = label
+        end
+        addLabelView(keyRoot, clickText, ts, type(tc) == "number" and tc or nil, 8, font, grav, ox, oy,
+                     nil, nativeStyles, pxOffsets, true, nil, nil, clickAbsX, clickAbsY)
     end
 
-    -- 各通道角标：完全复刻 KeyView.initKey / addHint 的显示规则
-    --  · 只有该通道 event 或 hint 文字存在，且对应样式 hasKey + isShow 才画角标
-    --  · 角标样式走 channelField 的 __index 继承链；重力取各通道样式的 gravity（含默认）
-    --  · 互斥：某 swipe 角标与 long_click / click-hint 角标重力相同时，隐藏后者（真机 addHint 行为）
+    -- 各通道角标：【纯桥接模式】完全由真机 dump 的 KSCORNER 建立，删去一切主题推导与
+    -- 方向池抢占。dump 有一条角标就画一条，文字/通道/坐标全取桥接；样式（字体/色/大小/
+    -- gravity/offset）仍走主题，因为桥接不采集样式——这部分保持原样在下方渲染循环里。
     local kdef = kbdEnv and kbdEnv.rows and kbdEnv.rows[r] and kbdEnv.rows[r].keys[k]
     if type(kdef) == "table" and not hide then
-        -- 各通道：默认重力与真机 addHint/setLongClickText/setHintText 一致
-        -- 默认重力逐位对齐真机 KeyView：
-        --   setLongClickText: mLongClickStyle.getGravity(Gravity.TOP | Gravity.CENTER)
-        --   setHintText:      mHintStyle.getGravity(Gravity.BOTTOM | Gravity.CENTER)
-        --   addHint(g, ...):  LayoutParams(..., g | Gravity.CENTER)  (g=UP→TOP/DOWN→BOTTOM/LEFT/RIGHT)
-        -- Gravity.CENTER = CENTER_HORIZONTAL|CENTER_VERTICAL；旧 defG 少了 CENTER_VERTICAL 位，
-        -- 主题没写 gravity 时和真机差一位（居中方向），换主题后就偏。这里补齐。
+        -- 通道 → spec（stPath 决定样式继承链，defG 仅在无 dump 坐标时作渲染回退）
         local specs = {
-            { id="long_click",  stPath="long_click",  defG=bitOr(Gravity.TOP, Gravity.CENTER), wf=0.42, hf=0.34 },
-            { id="click",       stPath="hint",        defG=bitOr(Gravity.BOTTOM, Gravity.CENTER), wf=0.42, hf=0.34, ev="click", hint="hint" },
-            { id="swipe_up",    stPath="hint.up",     defG=bitOr(Gravity.TOP, Gravity.CENTER), wf=0.42, hf=0.32 },
-            { id="swipe_down",  stPath="hint.down",   defG=bitOr(Gravity.BOTTOM, Gravity.CENTER), wf=0.42, hf=0.32 },
-            { id="swipe_left",  stPath="hint.left",   defG=bitOr(Gravity.LEFT, Gravity.CENTER), wf=0.26, hf=0.5 },
-            { id="swipe_right", stPath="hint.right",  defG=bitOr(Gravity.RIGHT, Gravity.CENTER), wf=0.26, hf=0.5 },
+            { id="long_click",  stPath="long_click",  defG=bitOr(Gravity.TOP, Gravity.CENTER) },
+            { id="click",       stPath="hint",        defG=bitOr(Gravity.BOTTOM, Gravity.CENTER) },
+            { id="swipe_up",    stPath="hint.up",     defG=bitOr(Gravity.TOP, Gravity.CENTER) },
+            { id="swipe_down",  stPath="hint.down",   defG=bitOr(Gravity.BOTTOM, Gravity.CENTER) },
+            { id="swipe_left",  stPath="hint.left",   defG=bitOr(Gravity.LEFT, Gravity.CENTER) },
+            { id="swipe_right", stPath="hint.right",  defG=bitOr(Gravity.RIGHT, Gravity.CENTER) },
         }
-        local shown = {}   -- id -> {grav, ...}
-        for _, S in ipairs(specs) do
-            local ch = channelById(S.id) or {}
-            local evField = S.ev or ch.ev
-            local hintField = S.hint or ch.hint
-            -- 真机建角标 View 的第一道门：mKeyStyle.hasKey("hint"/"long_click") 或
-            -- mHintKeyStyle.hasKey("up"/"down"/"left"/"right")（Style.java rawget，只认直接定义）。
-            -- 缺失它就会给"样式根本没定义该通道"的键凭空造角标——万象 g 键的假下滑 ▼ 即此。
-            if channelHasKeyStyle(stName, S.stPath) and channelField(stName, S.stPath, "show") ~= false then
-                local raw, rawOriginal = nil, nil
-                if S.id == "long_click" then
-                    -- long_click 上标 = long_click 事件本身（真机 getLongClickLabel 的事件 label），
-                    -- 不是 hint 系列的 hint_long。事件值可为 string(";") 或 preset table
-                    -- ({label,send}，如万象 z 键的 rev)，必须用 resolveEventLabelFull 解析。
-                    -- 旧逻辑优先读 hint_long、且 resolveEventLabel 遇 table 返回 nil → L/Z 上标丢失。
-                    local ev = evField and kdef[evField]
-                    if ev ~= nil then
-                        rawOriginal = ev
-                        raw = resolveEventLabelFull(ev)
-                    end
-                elseif hintField and type(kdef[hintField]) == "string" and kdef[hintField] ~= "" then
-                    -- 独立的 hint 字段（kdef.hint / hint_up / hint_down ...）：取原始值。
-                    raw = kdef[hintField]
-                    rawOriginal = kdef[hintField]
-                elseif S.id ~= "click" and evField and kdef[evField] ~= nil then
-                    -- 事件标签兜底仅限 swipe 通道。
-                    -- click 通道 = 真机 mHint（底部角标，KeyView.setHintText），只取 mKey.getHint()
-                    -- 即 kdef.hint；click 事件只画主标签 mClick（initKey 中 setClickText），
-                    -- 绝不能再当底部角标。万象 H/J/K/L/Q 没有 hint 字段，旧工具 fallback 到
-                    -- click 事件 → 凭空多出小字母 h/j/k/l/q，真机 dump 证实这些键底部无角标。
-                    rawOriginal = kdef[evField]
-                    raw = resolveEventLabelFull(rawOriginal)
-                end
-                if type(raw) == "string" and raw ~= "" then
-                    -- 【r25 回退】r24 曾把 swipe 通道 gravity 写死为 defG(=方向|CENTER)，
-                    -- 依据是"真机 addHint 不读主题 gravity"。但用户实测：原来那个主题
-                    -- 给 hint.<dir> 配了 gravity/offset 产生的偏移，r24 后【全部被 CENTER
-                    -- 抹平成居中】。既然 r25 已修好桥接、角标改按真机 dump 最终坐标直接
-                    -- 摆放，gravity 推导仅作键盘收起时的回退，这里恢复读主题 gravity，
-                    -- 让老主题在有/无 dump 两种情况下都保持它自己的偏移语义。
-                    local g = parseGravity(channelField(stName, S.stPath, "gravity"), S.defG)
-                    -- 真机 addHint 的 g|CENTER 交叉轴居中位：保留 CENTER 补位（主题没写
-                    -- gravity 时至少和真机默认一致）。主题写了就用主题值，不再强制覆盖。
-                    if S.id:find("swipe_", 1, true) == 1 then g = bitOr(g, Gravity.CENTER) end
-                    -- 真机 KeyStyle.getSpan 用的 text 是【原始事件串】（含 {} 等），不是 resolveEventLabel
-                    -- 削出来的纯字符。万象 g 键下滑：原始串带 {} → 查 ▼.png 找不到 → 真机显示 ▼ 字符；
-                    -- 工具旧代码用削过的纯 "▼" 查图 → 误命中 ▼.png → 显示了不该有的图片。
-                    -- 修复：查图用 rawOriginal（完整原始值），显示文字才用削过的 raw。
-                    local lookup = type(rawOriginal) == "string" and rawOriginal or raw
-                    shown[S.id] = { S = S, grav = g, text = utf8Cut(raw, 4), rawText = lookup,
-                                    orig = rawOriginal }
-                end
-            end
-        end
-        -- 真机互斥：swipe 角标与 long_click / click 角标重力相同则隐藏后者
-        local function sameDir(a, b)
-            local function basic(g)
-                local v = 0
-                if hasBits(g, Gravity.TOP) then v = v + 1 end
-                if hasBits(g, Gravity.BOTTOM) then v = v + 2 end
-                if hasBits(g, Gravity.LEFT) then v = v + 4 end
-                if hasBits(g, Gravity.RIGHT) then v = v + 8 end
-                return v
-            end
-            local ba, bb = basic(a), basic(b)
-            return a == b or (ba ~= 0 and ba == bb)
-        end
-        for _, id in ipairs({"swipe_up", "swipe_down", "swipe_left", "swipe_right"}) do
-            local sw = shown[id]
-            if sw then
-                if shown.long_click and sameDir(sw.grav, shown.long_click.grav) then shown.long_click = nil end
-                if shown.click and sameDir(sw.grav, shown.click.grav) then shown.click = nil end
-            end
-        end
-        -- ===== 【真机文字源·权威覆盖】用 dump 读到的真机实际角标文字覆盖推导结果 =====
-        -- 真机画什么就显示什么：lt.top（y<40，long_click/上滑位）→ long_click 通道；
-        -- lt.bottom（y>90，hint/下滑位）→ click(hint) 通道。dump 有值就画、无值就不画，
-        -- 不再依赖 kbdEnv 的 long_click 事件是 string 还是 table preset（L/Z 上标丢失根因）。
+        local specById = {}
+        for _, S in ipairs(specs) do specById[S.id] = S end
+        local shown = {}
         if lt then
-            local function specOf(id)
-                for _, S0 in ipairs(specs) do if S0.id == id then return S0 end end
-                return nil
-            end
-            -- 真机角标权威映射：按重力方向把 dump 的 corners 分配到 6 个通道。
-            -- 关键：一个方向可能有 2 个角标（数字键 TOP 同时有 long_click=数字 与
-            -- swipe_up=↑/浮关），必须都映射到各自通道，不能只取第一个。
-            -- 同时：dump 里没有的方向，若推导建了角标必须删除（句号键 dump 无任何
-            -- 角标 → 长按等推导角标都不该显示）。
-            -- 映射依据：用推导 shown[id].grav 的重力方向匹配 dump 角标的方向；
-            -- 同方向多个时按 dump 出现顺序（long_click 先于 swipe，与真机 addView 一致）
-            -- 依次填充。若某通道推导没建但 dump 有对应方向的角标，则补建。
-            local dirOf = function(g)
-                local v = 0
-                if hasBits(g, Gravity.TOP) then v = v + 1 end
-                if hasBits(g, Gravity.BOTTOM) then v = v + 2 end
-                if hasBits(g, Gravity.LEFT) then v = v + 4 end
-                if hasBits(g, Gravity.RIGHT) then v = v + 8 end
-                return v
-            end
-            local chanDirs = { long_click="TOP", click="BOTTOM", swipe_up="TOP",
-                               swipe_down="BOTTOM", swipe_left="LEFT", swipe_right="RIGHT" }
-            -- dump 角标池，按方向分组，保留出现顺序
-            local pool = { TOP={}, BOTTOM={}, LEFT={}, RIGHT={} }
+            -- 一条 KSCORNER = 一个角标。c.chan 是 Java 反射 mHints[] 得来的权威通道；
+            -- 无 chan 的旧 dump 才用方向 grav 兜底映射到该方向默认通道，且每方向只取首条，
+            -- 绝不再让 long_click 去 TOP 池抢 swipe_up 的角标（这是错位根因）。
+            local dirDefault = { TOP="long_click", BOTTOM="click", LEFT="swipe_left", RIGHT="swipe_right" }
+            local usedDir = {}
             for _, c in ipairs(lt.corners or {}) do
-                if pool[c.grav] then pool[c.grav][#pool[c.grav] + 1] = c end
-            end
-            local used = { TOP=0, BOTTOM=0, LEFT=0, RIGHT=0 }
-            -- 先处理推导已建的角标：用同方向的 dump 角标覆盖，取不到就删除该假角标
-            for _, id in ipairs({"long_click", "click", "swipe_up", "swipe_down", "swipe_left", "swipe_right"}) do
-                local e = shown[id]
-                if e then
-                    local dir = chanDirs[id]
-                    local c = pool[dir][used[dir] + 1]
-                    if c and c.txt ~= "" then
-                        used[dir] = used[dir] + 1
-                        e.text = utf8Cut(c.txt, 4)
-                        e.rawText = c.txt
-                        e.orig = c.txt
-                        -- 【r21】保留真机 dump 的权威坐标：工具 gravity 推导常读不到主题角标
-                        -- 配置（回退 defG 垂直=TOP → 贴顶 y=0），而 dump 给了相对 keyRoot 的
-                        -- 精确 x/y。渲染时直接用它绝对定位，逐像素复现真机。
-                        e.dumpX, e.dumpY, e.dumpW, e.dumpH = c.x, c.y, c.w, c.h
+                if c.txt and c.txt ~= "" then
+                    local id = specById[c.chan] and c.chan or nil
+                    if not id then
+                        local dflt = dirDefault[c.grav]
+                        if dflt and not usedDir[c.grav] then
+                            id = dflt
+                            usedDir[c.grav] = true
+                        end
+                    end
+                    local S = id and specById[id] or nil
+                    if S then
+                        shown[id] = {
+                            S = S, grav = S.defG,
+                            text = utf8Cut(c.txt, 4), rawText = c.txt, orig = c.txt,
+                            dumpX = c.x, dumpY = c.y, dumpW = c.w, dumpH = c.h,
+                        }
                         if type(_G.__kbdDiag) == "table" then
                             _G.__kbdDiag.cornerWithXY = (_G.__kbdDiag.cornerWithXY or 0) + 1
-                        end
-                    else
-                        -- dump 该方向角标已用完/不存在 → 真机没画，删掉推导的假角标
-                        shown[id] = nil
-                    end
-                end
-            end
-            -- 再补建：dump 还有剩余角标但推导没对应通道（按方向找第一个空闲通道）
-            for _, id in ipairs({"long_click", "click", "swipe_up", "swipe_down", "swipe_left", "swipe_right"}) do
-                if not shown[id] then
-                    local dir = chanDirs[id]
-                    local c = pool[dir][used[dir] + 1]
-                    if c and c.txt ~= "" then
-                        used[dir] = used[dir] + 1
-                        local S0 = specOf(id)
-                        if S0 then
-                            -- 【r25 回退】同首轮推导：恢复读主题 gravity（r24 写死导致
-                            -- 老主题偏移被 CENTER 抹平）。swipe 仍补 CENTER 交叉轴位。
-                            local gg = parseGravity(channelField(stName, S0.stPath, "gravity"), S0.defG)
-                            if id:find("swipe_", 1, true) == 1 then gg = bitOr(gg, Gravity.CENTER) end
-                            shown[id] = {
-                                S = S0, grav = gg,
-                                text = utf8Cut(c.txt, 4), rawText = c.txt, orig = c.txt,
-                                dumpX = c.x, dumpY = c.y, dumpW = c.w, dumpH = c.h,
-                            }
-                            if type(_G.__kbdDiag) == "table" then
-                                _G.__kbdDiag.cornerWithXY = (_G.__kbdDiag.cornerWithXY or 0) + 1
-                            end
                         end
                     end
                 end
@@ -3299,18 +3510,19 @@ function makeKeyView(label, st, stName, w, h, r, k, margins, seq)
         end
         for _, id in ipairs({"long_click", "click", "swipe_up", "swipe_down", "swipe_left", "swipe_right"}) do
             local e = shown[id]
+            -- 【r27.18】角标改回桥接权威坐标定位（与 r27.8 同）：有 dump 坐标就绝对定位，
+            -- 不再让主题 gravity+offset 推导结果主导位置，消除各主题差异。
+            -- 无 dump 坐标（桥接未到/退化）才回退主题推导，保证角标仍能显示。
             if e then
                 local S = e.S
                 local ic = channelField(stName, S.stPath, "text_color") or 0x99FFFFFF
                 local its = tonumber(channelField(stName, S.stPath, "text_size")) or 8
                 local ifont = channelField(stName, S.stPath, "font")
-                -- 真机每类角标用【各自 style】的 offset_x/offset_y：
-                -- long_click→long_click.offset_x, click→hint.offset_x, swipe_up→hint.up.offset_x ...
-                -- 用 channelField(stName, S.stPath, ...) 正好命中对应通道 style（含继承链）。
+                -- 【r27.17】与 click 主标签同构：角标位置由本通道 style 的
+                -- gravity + offset_x/offset_y 推导（gravity 在 e.grav 里，见上方 specs 解析）。
+                -- 走 nativeOffset → realOffset → dp 的同一条链路，不再用 dump 坐标定位。
                 local hox = tonumber(channelField(stName, S.stPath, "offset_x"))
                 local hoy = tonumber(channelField(stName, S.stPath, "offset_y"))
-                -- 真机角标 style = 当前 key style 的子 style（getHintKeyStyle/getLongClickKeyStyle）。
-                -- 构造带通道路径的候选：先专属 style，再通用 key.<通道>，逐级下钻到 KeyStyle.getSize()。
                 local hintNativeOff = {}
                 if stName and stName ~= "" and stName ~= "key" then
                     hintNativeOff[#hintNativeOff + 1] = stName .. "." .. S.stPath
@@ -3358,20 +3570,17 @@ function makeKeyView(label, st, stName, w, h, r, k, margins, seq)
                 -- 它在 setLabelLp 里一次性建好 LP(TOP|LEFT + margins=坐标)，addView 时
                 -- 立即按此 layout。r21 的事后 setLayoutParams 是异步 requestLayout，
                 -- dump 同一帧取 getLeft 仍是旧值（实测坐标纹丝不动），故改为源头传入。
+                -- 【r27.18】与 click 主标签同构：两者都用桥接权威坐标绝对定位。
+                -- 有 e.dumpX/Y → setLabelLp 按坐标定位；无 → absX/Y=nil 自动回退主题推导。
+                -- 【r27.33】只给 long_click 的 label 与按键 hint（S.id=="click"）右移；
+                -- 上下左右滑动 hint（swipe_*）本就正常，不偏移。仍仅限桥接绝对定位的角标
+                -- （回退 gravity/offset 推导的角标 dumpX=nil 不动）。
+                local nudgeDp = (S.id == "long_click" or S.id == "click")
+                                and (CORNER_X_NUDGE_DP or 0) or 0
+                local cornerAbsX = e.dumpX and (e.dumpX + dp(nudgeDp)) or nil
                 local hintView = addLabelView(keyRoot, e.text, its, type(ic) == "number" and ic or 0x99FFFFFF,
                              0, ifont, e.grav, hox, hoy, e.rawText or e.text, hintNativeStyles, hpx, true, derive, true,
-                             e.dumpX, e.dumpY)
-                -- 【r24 诊断】记录本角标【样式推导】出的权威参数（不依赖真机 dump）。
-                -- 键盘收起时 e.dumpX/Y=nil，位置完全由 grav+offset 决定；把这些值打出来，
-                -- 一次就能对照真机坐标判断 gravity/offset 推导是否与真机一致。
-                if type(_G.__cornerDiag) == "table" and #_G.__cornerDiag < 40 then
-                    _G.__cornerDiag[#_G.__cornerDiag + 1] = string.format(
-                        "%s g=0x%X off=(%s,%s)%s txt=[%s]",
-                        tostring(S.id), tonumber(e.grav) or 0,
-                        tostring(hox), tostring(hoy),
-                        (e.dumpX ~= nil) and (string.format(" dump=(%s,%s)", tostring(e.dumpX), tostring(e.dumpY))) or "",
-                        tostring(e.text))
-                end
+                             cornerAbsX, e.dumpY, e.dumpW, e.dumpH)
                 -- 角标保留点击热区：直接打开该通道的事件编辑器（样式在独立入口改）。
                 -- addLabelView 现已返回实际 tv，点击直接挂在 tv 上（不再需要 box 包装层）。
                 if hintView then
@@ -3469,10 +3678,8 @@ end
 
 function renderPreviewImpl()
     resetGlyphBudget()          -- 每次渲染重置字形探测预算，防止累积耗尽
-    -- 【r23】每轮渲染前重置真机文字源命中诊断计数，保证 dump 里反映的是本轮真实状态。
-    _G.__kbdDiag = { rendered = 0, ltHit = 0, cornerWithXY = 0, relabel = {} }
-    -- 【r24】每轮渲染前重置角标样式推导诊断（不依赖真机 dump，键盘收起也能验证）。
-    _G.__cornerDiag = {}
+    -- 内容源命中计数（供启动 [SRC] 状态行展示；轻量、无 JNI 开销）
+    _G.__kbdDiag = { rendered = 0, ltHit = 0, cornerWithXY = 0, scriptMasked = 0 }
     local W = previewBox.getWidth() - previewBox.getPaddingLeft() - previewBox.getPaddingRight()
     if W <= 0 then
         if renderRetry < 10 then
@@ -3484,22 +3691,9 @@ function renderPreviewImpl()
     renderRetry = 0
     previewBox.removeAllViews()
 
-    local gb = getValue("background")
-    if type(gb) == "string" then
-        local p = findImage(gb)
-        if p then
-            local iv = ImageView(activity)
-            iv.setLayoutParams(FrameLayout.LayoutParams(-1, -1))
-            iv.setScaleType(ImageView.ScaleType.FIT_XY)
-            pcall(function()
-                local bmp = decodeImage(p, W, previewBox.getHeight())
-                if bmp then iv.setImageBitmap(bmp) end
-            end)
-            previewBox.addView(iv)
-        end
-    elseif type(gb) == "number" then
-        pcall(function() previewBox.setBackgroundDrawable(areaDrawable("", gb)) end)
-    end
+    -- 【r27.45】背景渲染移到下方 col 组装之后：主题 background 是「键盘背景」，
+    -- 应贴合键盘内容块（候选栏+工具栏+按键区），不是整个预览画布。旧版铺在 previewBox
+    -- 上（weight=1 占满剩余空间），数字颜色还会覆盖画布深色底 → 浅灰铺满溢出键盘。
 
     local cdRow = showCandidateFlag and buildCandidatePreview(W) or nil
     local tbRow = buildToolbarPreview(W)
@@ -3600,6 +3794,28 @@ function renderPreviewImpl()
         pcall(function() kb.setBackgroundDrawable(areaDrawable("keyboard", kbg)) end)
     end
     col.addView(kb)
+
+    -- 【r27.45 背景贴合】主题 background 是键盘背景，只覆盖键盘内容块 col，绝不铺满画布。
+    -- col 本身是 WRAP_CONTENT + CENTER，高度恰好=候选栏+工具栏+按键区，把背景直接设到 col 上
+    -- 必然贴合，无需另建背景层（另建层用 WRAP_CONTENT 套 MATCH_PARENT 子 view 测量不可靠）。
+    --  · 数字颜色：areaDrawable("",gb) 铺满 col；
+    --  · 图片：BitmapDrawable + Gravity.FILL 拉伸铺满 col（等价 ImageView 的 FIT_XY）。
+    -- 画布 previewBox 保留自己的深色底（上下留白露深色），两个主题都不再溢出。
+    local gb = getValue("background")
+    if type(gb) == "string" then
+        local p = findImage(gb)
+        if p then pcall(function()
+            local bmp = decodeImage(p, W, kbH)
+            if bmp then
+                local bd = BitmapDrawable(activity.getResources(), bmp)
+                bd.setGravity(Gravity.FILL)
+                col.setBackgroundDrawable(bd)
+            end
+        end) end
+    elseif type(gb) == "number" then
+        pcall(function() col.setBackgroundDrawable(areaDrawable("", gb)) end)
+    end
+
     previewBox.addView(col)
 
     -- 【真机文字源】键渲染顺序序号：与 parseRootDumpToKeys 的锚点顺序（行优先）一一对应。
@@ -3703,34 +3919,15 @@ function renderPreviewImpl()
                             if label == "" then label = nil end
                         end
                         if not click and not label then
-                            -- 空白/占位键：也画出来，可点开通道编辑器给它加 event（两层结构同 makeKeyView）
+                            -- 【r27.43】空白/占位键：脚本骨架里没有任何内容（无 label/click），
+                            -- 真机 dump 里也只是一个 0×0 锚点、没有任何样式。旧代码在这里
+                            -- fallback 到 key.background + 4dp 圆角 + 选中高亮，等于工具凭空
+                            -- 给空壳加了一块可见背景（红圈里多出来的方块）。改为：只保留一个
+                            -- 透明占位 view 维持 kw×kh 布局与 seq 对齐，不画任何背景/圆角/
+                            -- margins/padding/高亮——用户没给的样式，工具绝不自作主张添加。
+                            -- onClick 保留，仍可点开通道编辑器给它加 event。
                             local sp = FrameLayout(activity)
                             sp.setLayoutParams(LinearLayout.LayoutParams(kw, kh))
-                            local spStName = getKbdValue("rows." .. ri .. ".keys." .. ki .. ".style")
-                            if not spStName or spStName == "" then
-                                local spClick = getKbdValue("rows." .. ri .. ".keys." .. ki .. ".click")
-                                if spClick == nil then spClick = keyDef.click end
-                                if type(spClick) == "number" then spClick = tostring(spClick) end
-                                if type(spClick) == "string" and spClick ~= "" then spStName = spClick end
-                            end
-                            local spInner = FrameLayout(activity)
-                            local spLp = FrameLayout.LayoutParams(-1, -1)
-                            local spMg = styleInset4(spStName, "margins")
-                            spLp.setMargins(dp(spMg.left or 0), dp(spMg.top or 0), dp(spMg.right or 0), dp(spMg.bottom or 0))
-                            spInner.setLayoutParams(spLp)
-                            local spPd = styleInset4(spStName, "padding")
-                            spInner.setPadding(dp(spPd.left or 0), dp(spPd.top or 0), dp(spPd.right or 0), dp(spPd.bottom or 0))
-                            sp.addView(spInner)
-                            local spBgVal = getValue((spStName and (spStName .. ".background")) or "key.background")
-                            local spBg = makeKeyBackground(spStName, spBgVal, tonumber(getValue((spStName and (spStName .. ".corner_radius")) or "key.corner_radius")) or 4, nil, nil)
-                            spInner.setBackgroundDrawable(spBg)
-                            if selKeyR == ri and selKeyK == ki then
-                                -- 与按键一致：淡填充指示选中，不用实心描边覆盖真实边框
-                                local hl = GradientDrawable()
-                                hl.setColor(0x3330C190)
-                                hl.setCornerRadius(dp(3))
-                                spInner.setBackgroundDrawable(hl)
-                            end
                             sp.onClick = function()
                                 selKeyR, selKeyK = ri, ki
                                 renderPreview()
@@ -4379,10 +4576,12 @@ end
 -- 实际存在的额外项；每一项都回显当前值（getValue 已含内存改动的覆盖）。
 function channelStyleItems(stName, chId)
     local items, seen = {}, {}
-    local function addItem(path, name)
+    -- cur 改为走继承链的生效值（见 effectiveStyleValue），与真机渲染口径一致；
+    -- 写入路径 path 不变（仍落到本键专属表 own.<rel>）。
+    local function addItem(path, name, rel, f)
         if seen[path] then return end
         seen[path] = true
-        table.insert(items, { path = path, name = name, cur = getValue(path) })
+        table.insert(items, { path = path, name = name, cur = effectiveStyleValue(stName, rel, f) })
     end
     local function join(a, b)
         if a == nil or a == "" then return b end
@@ -4392,7 +4591,7 @@ function channelStyleItems(stName, chId)
     local function addFields(relBase, fields, prefix)
         local base = join(stName, relBase) or ""
         for _, f in ipairs(fields) do
-            addItem(join(base, f), prefix .. fieldCN(f))
+            addItem(join(base, f), prefix .. fieldCN(f), relBase, f)
         end
         -- 额外字段：样式表里真实存在但不在策展清单里的字符串/数值项
         local t = getFrom(styleEnv, base)
@@ -4407,7 +4606,7 @@ function channelStyleItems(stName, chId)
             end
             table.sort(extra)
             for _, kk in ipairs(extra) do
-                addItem(join(base, kk), prefix .. fieldCN(kk))
+                addItem(join(base, kk), prefix .. fieldCN(kk), relBase, kk)
             end
         end
     end
@@ -4547,90 +4746,318 @@ local function styleNamesInScope(scope)
     return names, keyCount
 end
 
-styleEditorDialog = function()
-    local dlg = LuaDialog(activity)
-    local rootL = LinearLayout(activity); rootL.setOrientation(LinearLayout.VERTICAL)
-    rootL.setPadding(dp(12), dp(6), dp(12), dp(6))
-
-    local curScope = "all"
-    local holders = {}   -- 当前面板里的 {field, widget, reader}
-    local title = TextView(activity)
-    title.setTextSize(12); title.setTextColor(0xFF8B949E)
-    rootL.addView(title)
-
-    local scopeRow = LinearLayout(activity); scopeRow.setOrientation(LinearLayout.HORIZONTAL)
-    rootL.addView(scopeRow)
-    local fieldsBox = LinearLayout(activity); fieldsBox.setOrientation(LinearLayout.VERTICAL)
-    rootL.addView(fieldsBox)
-
-    local function buildFields()
-        fieldsBox.removeAllViews(); holders = {}
-        local names, cnt = styleNamesInScope(curScope)
-        local scopeName = "全部按键"
-        for _, s in ipairs(STYLE_SCOPES) do if s.id == curScope then scopeName = s.name end end
-        title.setText("作用范围：" .. scopeName .. "　影响 " .. cnt .. " 个键 / " .. #names
-            .. " 个样式表\n" .. (#names > 0 and ("样式：" .. table.concat(names, ", ")) or "（该范围未找到按键）"))
-        -- 用该范围第一个 style 的当前值回显（作为代表值）
-        local rep = names[1] or "key"
-        for _, fd in ipairs(STYLE_FIELDS) do
-            local fpath, fname = fd[1], fd[2]
-            local fullPath = rep .. "." .. fpath
-            local cur = getValue(fullPath)
-            local state = { value = cur }
-            local function onChange(v) state.value = v end
-            local widget, reader = makeStyleWidget(fullPath, fname, cur, onChange)
-            -- 颜色类控件不返回 reader，用 state 收集其取色盘回写值
-            if not reader then reader = function() return state.value end end
-            addFieldRow(fieldsBox, fname, widget)
-            -- init 记录打开面板时的原值：应用时只写「和原值不同」的项，
-            -- 没动过的字段不写进任何样式表（避免把代表值批量铺到所有键上）。
-            holders[#holders + 1] = { field = fpath, reader = reader, init = cur }
-        end
+-- ============ 通用「分类按钮 + 项目按钮」编辑面板（与按键编辑面板同款界面）============
+-- 供样式编辑 / 键盘调整复用：分类按钮(每行3个，动态编号①…) + 两列项目按钮(名称灰/当前值蓝)
+-- 项目 item = { name, kind, cur, v, commit, onEdit, isAction, onClick }
+--   kind: bool/color/number/text/event；onEdit 可选，自定义编辑器(item, done)
+--   isAction: 动作项，渲染成整行按钮，点击直接执行 onClick
+local function utf16units(s)
+    local n, i = 0, 1
+    while i <= #s do
+        local c = s:byte(i)
+        local cp
+        if c < 0x80 then cp = c; i = i + 1
+        elseif c < 0xE0 then cp = (c - 0xC0) * 0x40 + (s:byte(i+1) - 0x80); i = i + 2
+        elseif c < 0xF0 then cp = (c - 0xE0) * 0x1000 + (s:byte(i+1) - 0x80) * 0x40 + (s:byte(i+2) - 0x80); i = i + 3
+        else cp = (c - 0xF0) * 0x40000 + (s:byte(i+1) - 0x80) * 0x1000 + (s:byte(i+2) - 0x80) * 0x40 + (s:byte(i+3) - 0x80); i = i + 4 end
+        n = n + (cp >= 0x10000 and 2 or 1)
     end
+    return n
+end
 
-    for _, s in ipairs(STYLE_SCOPES) do
-        local b = Button(activity); b.setAllCaps(false); b.setTextSize(10); b.setText(s.name)
-        b.setLayoutParams(LinearLayout.LayoutParams(0, dp(36), 1))
-        b.onClick = function()
-            curScope = s.id
-            buildFields()
-        end
-        scopeRow.addView(b)
-    end
+local function catSame(a, b)
+    if a == nil and b == nil then return true end
+    if a == nil or b == nil then return false end
+    return tostring(a) == tostring(b)
+end
 
-    dlg.setTitle("样式编辑（批量，按作用范围）")
-    dlg.setButton("应用到此范围", function()
-        local names = styleNamesInScope(curScope)
-        if #names == 0 then toast("该范围没有按键") return end
-        local function same(a, b)
-            if a == nil and b == nil then return true end
-            if a == nil or b == nil then return false end
-            return tostring(a) == tostring(b)
-        end
-        local applied, fields = 0, 0
-        for _, h in ipairs(holders) do
-            local v = h.reader and h.reader() or nil
-            if not same(v, h.init) then          -- 只处理用户真正改过的项
-                fields = fields + 1
-                for _, sn in ipairs(names) do
-                    local path = sn .. "." .. h.field
-                    if v == nil then unsetStyleValue(path) else setValue(path, v) end
-                    applied = applied + 1
+local function catValText(v, kind)
+    if v == nil then return "（未设置）" end
+    if kind == "bool" then return v and "开" or "关" end
+    if kind == "color" and type(v) == "number" then return string.format("#%06X", v % 0x1000000) end
+    return tostring(v)
+end
+
+-- 名称=中性灰，当前值=强调蓝；颜色项在值前加一个小色块■（染实际色，不撑满按钮）
+local function paintCatBtn(btn, it, accent)
+    accent = accent or 0xFF58A6FF
+    local name = it.name or ""
+    local val = catValText(it.v, it.kind) or ""
+    local isColor = (it.kind == "color" and type(it.v) == "number")
+    local swatch = isColor and "■ " or ""
+    local text = name .. "\n  " .. swatch .. val
+    local spanned = false
+    if _SpannableString and _Spannable and _FgSpan then
+        pcall(function()
+            local ss = _SpannableString(text)
+            local total = ss.length()
+            local valStart = math.max(0, total - utf16units(val))
+            local swStart = math.max(0, valStart - utf16units(swatch))
+            if total > 0 then
+                ss.setSpan(_FgSpan(0xFF8B949E), 0, swStart, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                if isColor and valStart > swStart then
+                    ss.setSpan(_FgSpan(it.v), swStart, valStart, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                end
+                if total > valStart then
+                    ss.setSpan(_FgSpan(accent), valStart, total, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
                 end
             end
+            btn.setText(ss)
+            spanned = true
+        end)
+    end
+    if not spanned then btn.setText(text) end
+end
+
+local function editCatItem(it, done)
+    if it.onEdit then it.onEdit(it, done); return end
+    if it.kind == "bool" then
+        done(not it.v)
+    elseif it.kind == "color" then
+        colorDialog("修改 " .. it.name, type(it.v) == "number" and it.v or nil,
+            function(n) if n then done(n) end end)
+    elseif it.kind == "event" then
+        local opts = { "✎ 手动输入…" }
+        local keyList = {}
+        for key, _ in pairs(presetKeysCache or {}) do keyList[#keyList + 1] = key end
+        table.sort(keyList)
+        for _, key in ipairs(keyList) do
+            local l = resolveEventLabel(key)
+            opts[#opts + 1] = (l and l ~= "" and l ~= key) and (key .. "  " .. l) or key
         end
-        dlg.dismiss()
-        if fields == 0 then
-            toast("没有修改任何项")
-            return
+        listDialog("选择 " .. it.name, opts, function(sel)
+            if sel == "✎ 手动输入…" then
+                inputDialog(it.name, "如 a / space / Return", it.v, function(s) done(s ~= "" and s or nil) end)
+            else
+                done(sel:match("^([^%s]+)") or sel)
+            end
+        end, { filter = true, filterHint = "输入关键字筛选预置事件" })
+    else
+        local isNum = (it.kind == "number")
+        inputDialog("修改 " .. it.name, isNum and "输入数字" or "留空=删除该项", it.v, function(s)
+            if isNum then
+                local n = tonumber(s)
+                if n == nil then toast("请输入数字") return end
+                done(n)
+            else
+                done(s ~= "" and s or nil)
+            end
+        end)
+    end
+end
+
+-- cfg = { title, accent, tip, applyText, cancelText, groups, scopeButtons, headText, onApply }
+--   onApply: function() return changedCount end；返回 0/nil 视为无改动
+--   scopeButtons: {{name, active, onClick}} 顶部作用范围切换行(可选)
+function categoryPanelDialog(cfg)
+    local accent = cfg.accent or 0xFF58A6FF
+    local dlg = LuaDialog(activity)
+    local lay = LinearLayout(activity)
+    lay.setOrientation(LinearLayout.VERTICAL)
+    lay.setPadding(dp(10), dp(6), dp(10), dp(6))
+
+    if cfg.scopeButtons and #cfg.scopeButtons > 0 then
+        local scRow = LinearLayout(activity); scRow.setOrientation(LinearLayout.HORIZONTAL)
+        for _, sb in ipairs(cfg.scopeButtons) do
+            local b = Button(activity); b.setAllCaps(false); b.setTextSize(9); b.setText(sb.name)
+            b.setLayoutParams(LinearLayout.LayoutParams(0, dp(34), 1))
+            if sb.active then b.setTextColor(accent) end
+            b.onClick = sb.onClick
+            scRow.addView(b)
         end
-        renderPreview()
-        toast("已改 " .. fields .. " 项 / " .. #names .. " 个样式表（未修改的项未动）")
+        lay.addView(scRow)
+    end
+    if cfg.headText then
+        local htv = TextView(activity); htv.setTextSize(11); htv.setTextColor(0xFF8B949E)
+        htv.setText(cfg.headText); lay.addView(htv)
+    end
+
+    local NUM_CN = { "①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩","⑪","⑫","⑬","⑭","⑮" }
+    local groups = cfg.groups or {}
+    for i, g in ipairs(groups) do g.name = (NUM_CN[i] or (i .. ".")) .. " " .. (g.name or "") end
+
+    local catBtns, contentBox = {}, LinearLayout(activity)
+    contentBox.setOrientation(LinearLayout.VERTICAL)
+
+    local function showGroup(idx)
+        local g = groups[idx]
+        contentBox.removeAllViews()
+        for ci, b in ipairs(catBtns) do b.setTextColor(ci == idx and accent or 0xFF8B949E) end
+        if not g then return end
+        local items = g.items or {}
+        if #items == 0 then
+            local tv = TextView(activity); tv.setText("（本分类暂无可修改项）")
+            tv.setTextColor(0xFF8B949E); tv.setTextSize(12); contentBox.addView(tv)
+        end
+        local row, col = nil, 0
+        for _, it in ipairs(items) do
+            if it.isAction then
+                local b = Button(activity); b.setAllCaps(false); b.setTextSize(11); b.setText(it.name)
+                b.setLayoutParams(LinearLayout.LayoutParams(-1, dp(42)))
+                b.onClick = it.onClick
+                contentBox.addView(b); col = 0
+            else
+                if col % 2 == 0 then
+                    row = LinearLayout(activity); row.setOrientation(LinearLayout.HORIZONTAL)
+                    contentBox.addView(row, LinearLayout.LayoutParams(-1, dp(48)))
+                end
+                local b = Button(activity); b.setAllCaps(false); b.setTextSize(11)
+                b.setLayoutParams(LinearLayout.LayoutParams(0, dp(48), 1))
+                paintCatBtn(b, it, accent)
+                local captured = b
+                b.onClick = function()
+                    editCatItem(it, function(v) it.v = v; paintCatBtn(captured, it, accent) end)
+                end
+                row.addView(b); col = col + 1
+            end
+        end
+    end
+
+    local catRow
+    for i, g in ipairs(groups) do
+        if (i - 1) % 3 == 0 then
+            catRow = LinearLayout(activity); catRow.setOrientation(LinearLayout.HORIZONTAL); lay.addView(catRow)
+        end
+        local b = Button(activity); b.setAllCaps(false); b.setTextSize(10); b.setText(g.name)
+        b.setLayoutParams(LinearLayout.LayoutParams(0, dp(36), 1))
+        b.onClick = function() showGroup(i) end
+        catRow.addView(b); catBtns[#catBtns + 1] = b
+    end
+
+    local tip = TextView(activity); tip.setTextSize(10); tip.setTextColor(0xFF8B949E)
+    tip.setText(cfg.tip or "点分类 → 点项目按钮改值 → 应用修改")
+    lay.addView(tip)
+    lay.addView(contentBox)
+
+    dlg.setTitle(cfg.title or "编辑")
+    local sv = ScrollView(activity); sv.addView(lay); dlg.setView(sv)
+    dlg.setButton(cfg.applyText or "应用修改", function()
+        local n = cfg.onApply and cfg.onApply() or 0
+        if n == 0 then toast("没有修改任何项"); return end
+        dlg.dismiss(); renderPreview()
+        toast("已应用 " .. n .. " 项改动")
     end)
-    dlg.setButton2("关闭", function() dlg.dismiss() end)
-    local sv = ScrollView(activity); sv.addView(rootL); dlg.setView(sv)
-    buildFields()
+    dlg.setButton2(cfg.cancelText or "取消", function() dlg.dismiss() end)
+    if #groups > 0 then showGroup(1) end
     dlg.show()
+    return dlg
+end
+
+-- 背景二选一编辑器：图片文件名 或 纯色（与真机 Style.getDrawable 一致）
+function backgroundEditDialog(title, cur, done)
+    local dlg = LuaDialog(activity)
+    local lay = LinearLayout(activity); lay.setOrientation(LinearLayout.VERTICAL)
+    lay.setPadding(dp(12), dp(6), dp(12), dp(6))
+    local colorInit = type(cur) == "number" and cur or nil
+    local imgInit = type(cur) == "string" and cur or ""
+    local state = { value = colorInit }
+    local tv = TextView(activity); tv.setTextSize(11); tv.setTextColor(0xFF8B949E)
+    tv.setText("填图片文件名，或选一个纯色（二者互斥，后定的为准）"); lay.addView(tv)
+    local cb = Button(activity); cb.setAllCaps(false); cb.setTextSize(11)
+    local function paintColor(n)
+        if type(n) == "number" then
+            cb.setText("颜色：" .. string.format("#%08X", n))
+            pcall(function() cb.setBackgroundColor(n) end)
+            local lum = ((math.floor(n/0x10000)%0x100)*299 + (math.floor(n/0x100)%0x100)*587 + (n%0x100)*114)/1000
+            pcall(function() cb.setTextColor(lum > 128 and 0xFF000000 or 0xFFFFFFFF) end)
+        else
+            cb.setText("颜色：未设置")
+            pcall(function() cb.setBackgroundColor(0xFF30363D); cb.setTextColor(0xFFD0D0D0) end)
+        end
+    end
+    paintColor(colorInit)
+    cb.onClick = function()
+        colorDialog("选择背景色", state.value, function(n) if n then state.value = n; paintColor(n) end end)
+    end
+    lay.addView(cb, LinearLayout.LayoutParams(-1, dp(40)))
+    local et = EditText(activity); et.setSingleLine(true); et.setText(imgInit); et.setHint("留空=用背景颜色")
+    lay.addView(et, LinearLayout.LayoutParams(-1, dp(40)))
+    dlg.setTitle(title)
+    dlg.setButton("确定", function()
+        local t = tostring(et.getText()):gsub("^%s+", ""):gsub("%s+$", "")
+        if t ~= imgInit then done(t == "" and nil or t)
+        elseif not catSame(state.value, colorInit) then done(state.value)
+        else done(cur) end
+        dlg.dismiss()
+    end)
+    dlg.setButton2("取消", function() dlg.dismiss() end)
+    local sv = ScrollView(activity); sv.addView(lay); dlg.setView(sv); dlg.show()
+end
+
+-- 样式编辑（批量，按作用范围）：分类-项目按钮界面，与按键编辑面板同款
+styleEditorDialog = function(curScope)
+    curScope = curScope or "all"
+    if not styleEnv then toast("样式还没加载好") return end
+    local names, cnt = styleNamesInScope(curScope)
+    local scopeName = "全部按键"
+    for _, sc in ipairs(STYLE_SCOPES) do if sc.id == curScope then scopeName = sc.name end end
+    local rep = names[1] or "key"
+
+    local myDlg
+    local scopeButtons = {}
+    for _, sc in ipairs(STYLE_SCOPES) do
+        scopeButtons[#scopeButtons + 1] = {
+            name = sc.name, active = (sc.id == curScope),
+            onClick = function()
+                pcall(function() if myDlg then myDlg.dismiss() end end)
+                styleEditorDialog(sc.id)
+            end,
+        }
+    end
+
+    local function fieldGroup(f)
+        if f:find("^pressed%.") then return "按下样式" end
+        if f:find("^hint%.") then return "提示样式" end
+        if f:find("^long_click%.") then return "长按样式" end
+        if f:find("^margins%.") then return "留白边距" end
+        if f:find("^padding%.") then return "内距" end
+        return "常规样式"
+    end
+
+    local groups, gmap, allItems = {}, {}, {}
+    local function grp(nm)
+        if not gmap[nm] then gmap[nm] = { name = nm, items = {} }; groups[#groups + 1] = gmap[nm] end
+        return gmap[nm]
+    end
+    for _, fd in ipairs(STYLE_FIELDS) do
+        local fpath, fname = fd[1], fd[2]
+        local fullPath = rep .. "." .. fpath
+        local cur = getValue(fullPath)
+        local kind = "text"
+        if looksLikeColor(fname, cur) then kind = "color"
+        elseif type(cur) == "boolean" then kind = "bool"
+        elseif type(cur) == "number" then kind = "number" end
+        local it = { name = fname, kind = kind, cur = cur, v = cur }
+        it.commit = function(v)
+            for _, sn in ipairs(names) do
+                local path = sn .. "." .. fpath
+                if v == nil then unsetStyleValue(path) else setValue(path, v) end
+            end
+        end
+        grp(fieldGroup(fpath)).items[#grp(fieldGroup(fpath)).items + 1] = it
+        allItems[#allItems + 1] = it
+    end
+
+    local head = "作用范围：" .. scopeName .. "　影响 " .. cnt .. " 个键 / " .. #names .. " 个样式表\n"
+        .. (#names > 0 and ("样式：" .. table.concat(names, ", ")) or "（该范围未找到按键）")
+        .. "\n当前值取自代表样式 " .. rep .. "，应用时写入该范围全部样式表"
+
+    myDlg = categoryPanelDialog({
+        title = "样式编辑 · " .. scopeName,
+        accent = 0xFFE3B341,
+        headText = head,
+        scopeButtons = scopeButtons,
+        groups = groups,
+        applyText = "应用到此范围",
+        onApply = function()
+            if #names == 0 then toast("该范围没有按键") return 0 end
+            local n = 0
+            for _, it in ipairs(allItems) do
+                if not catSame(it.v, it.cur) then it.commit(it.v); n = n + 1 end
+            end
+            return n
+        end,
+    })
 end
 
 function channelEventSummary(r, k, ch)
@@ -4642,16 +5069,38 @@ function channelEventSummary(r, k, ch)
     return "（未设置）"
 end
 
+-- 源码显示文字逻辑（Key.getLabel / Event.getLabel，见渲染 3913-3921）：
+-- 该状态 view 上显示的文字 = 显式显示字段(label / hint_*) 优先；为空时从本状态的
+-- 事件串(ev) 用 resolveEventLabelFull 推导（preset / 去{} / table 的 label·send·text）。
+-- 面板回显不能"没写 label 就是未设置"——那会漏掉真机实际从事件推导出来的显示文字。
+function resolveDisplayText(r, k, ch)
+    local base = "rows." .. r .. ".keys." .. k
+    local textField = ch.label or ch.hint
+    local explicit = textField and getKbdValue(base .. "." .. textField) or nil
+    if type(explicit) == "string" and explicit ~= "" then return explicit end
+    if type(explicit) == "number" then return tostring(explicit) end
+    -- 显式字段为空：按源码从本状态事件串推导（string/number/table 都覆盖）
+    local ev = getKbdValue(base .. "." .. ch.ev)
+    if ev ~= nil then
+        local full = resolveEventLabelFull(ev)
+        if type(full) == "string" and full ~= "" then return full end
+    end
+    return nil
+end
+
 channelEditDialog = function(r, k, chId)
     local ch = channelById(chId) or CHANNELS[1]
     local base = "rows." .. r .. ".keys." .. k
     local kdef = kbdEnv and kbdEnv.rows and kbdEnv.rows[r] and kbdEnv.rows[r].keys[k]
     if type(kdef) ~= "table" then return end
 
+    local own = ownStyleName(r, k)
+    local stNameNow = keyEffectiveStyleName(r, k)
+    local dlg = LuaDialog(activity)
+
     local lay = LinearLayout(activity)
     lay.setOrientation(LinearLayout.VERTICAL)
-    lay.setPadding(dp(12), dp(4), dp(12), dp(4))
-    local dlg = LuaDialog(activity)  -- 前向声明：通道切换按钮的闭包会引用
+    lay.setPadding(dp(10), dp(6), dp(10), dp(6))
 
     -- 通道切换按钮行（一处不重开窗口，直接切换编辑通道）
     local swRow = LinearLayout(activity)
@@ -4669,229 +5118,361 @@ channelEditDialog = function(r, k, chId)
     end
     lay.addView(swRow)
 
-    -- 标题 + 当前 event 回显
     local title = TextView(activity)
-    title.setTextSize(13); title.setTextColor(ch.color)
-    local curEv = getKbdValue(base .. "." .. ch.ev)
-    title.setText("第 " .. r .. " 行 · 第 " .. k .. " 键　【" .. ch.name .. " " .. ch.ev .. "】\n当前：" ..
-        (type(curEv) == "string" and curEv ~= "" and curEv or "（未设置）"))
+    title.setTextSize(12); title.setTextColor(ch.color)
+    local curEv0 = getKbdValue(base .. "." .. ch.ev)
+    title.setText("第" .. r .. "行第" .. k .. "键 · " .. ch.name .. "　当前事件：" ..
+        (type(curEv0) == "string" and curEv0 ~= "" and curEv0 or "（未设置）"))
     lay.addView(title)
 
-    -- ① 事件串（写入键盘文件）
-    local hEv = TextView(activity)
-    hEv.setText("── 事件（写入键盘文件，" .. ch.ev .. "）──")
-    hEv.setTextSize(12); hEv.setTextColor(0xFF3FB950); hEv.setPadding(0, dp(8), 0, dp(2))
-    lay.addView(hEv)
-
-    local evEt = EditText(activity)
-    evEt.setSingleLine(true); evEt.setText(curEv == nil and "" or tostring(curEv))
-    evEt.setHint("如 a / space / Return；留空=删除此事件")
-    evEt.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-    addFieldRow(lay, "事件字符串（字段 " .. ch.ev .. "）", evEt)
-
-    -- 预置事件选择（加速录入；带筛选框，可按事件名或中文标签搜）
-    local pick = Button(activity)
-    pick.setAllCaps(false); pick.setTextSize(11); pick.setText("从预置事件中选择…")
-    pick.setLayoutParams(LinearLayout.LayoutParams(-1, dp(34)))
-    pick.onClick = function()
-        local keys = {}
-        for key, _ in pairs(presetKeysCache or {}) do table.insert(keys, key) end
-        table.sort(keys)
-        if #keys == 0 then toast("无预置事件") return end
-        listDialog("选择 " .. ch.name .. " 事件", keys, function(sel)
-            evEt.setText(sel)
-        end, {
-            filter = true,
-            filterHint = "输入关键字筛选（事件名或中文标签，共 " .. #keys .. " 项）",
-            label = function(k)
-                local l = resolveEventLabel(k)
-                if l == nil or l == "" or l == k then return k end
-                return k .. "　" .. l
-            end,
-        })
+    -- ============ 构建所有编辑项（持久表：切换分类不丢未应用的改动）============
+    -- item = { name, kind, v(当前待写值), cur(初始值), commit(v), isStyle }
+    local groups = {}
+    local allItems = {}
+    -- 分组名不带编号：click 通道比其它通道多一个"下标提示"组，硬编码编号会出现
+    -- 子编号或缺号。改为构建完成后按实际顺序统一动态编号（见分类按钮前的编号循环）。
+    -- isActions 标记"位置增删"动作组，showGroup 据此识别，不再靠组名字符串匹配。
+    local function newGroup(name, isActions)
+        local g = { name = name, items = {}, isActions = isActions and true or false }
+        groups[#groups + 1] = g
+        return g
     end
-    lay.addView(pick)
-
-    -- ② 提示显示文字（角标上显示的文字）
-    local hintEtRef = nil
-    if ch.hint then
-        local curHint = getKbdValue(base .. "." .. ch.hint)
-        local hintEt = EditText(activity)
-        hintEt.setSingleLine(true); hintEt.setText(curHint == nil and "" or tostring(curHint))
-        hintEt.setHint("留空=自动取事件的显示文字")
-        hintEt.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-        addFieldRow(lay, "角标文字（字段 " .. ch.hint .. "）", hintEt)
-        hintEtRef = hintEt
+    local function addItem(g, name, kind, cur, commit, isStyle)
+        local it = { name = name, kind = kind, v = cur, cur = cur, commit = commit, isStyle = isStyle and true or false }
+        g.items[#g.items + 1] = it
+        allItems[#allItems + 1] = it
+        return it
+    end
+    local function valText(v, kind)
+        if v == nil then return "（未设置）" end
+        if kind == "bool" then return v and "开" or "关" end
+        if kind == "color" and type(v) == "number" then return string.format("#%06X", v % 0x1000000) end
+        return tostring(v)
     end
 
-    -- ③ 本键专属样式：改一个键的样式只影响它自己。
-    --    回显从当前生效样式读（纯读），写回目标却是本键专属表 own=studio_r{r}k{k}；
-    --    专属表在用户点"应用修改"时才由 ensureOwnStyle 创建并改 style 指针，取消则零副作用。
-    local own = ownStyleName(r, k)
-    local stNameNow = keyEffectiveStyleName(r, k)
-    local styleHolders = {}   -- own 专属样式的字段写回器（applyAll 用）
-    do
-        local hStyle = TextView(activity)
-        hStyle.setText("── 本键样式（专属，只影响本键）──")
-        hStyle.setTextSize(12); hStyle.setTextColor(0xFFE3B341); hStyle.setPadding(0, dp(10), 0, dp(2))
-        lay.addView(hStyle)
-        local note = TextView(activity)
-        note.setTextSize(10); note.setTextColor(0xFF8B949E)
-        note.setText("样式名：" .. own .. "（本键独立副本，改这里不影响其他键）")
-        lay.addView(note)
-        for _, it in ipairs(channelStyleItems(stNameNow, ch.id)) do
-            local state = { value = it.cur }
-            local function onChange(v) state.value = v end
-            local w, rd = channelWidget(it.path, it.name, it.cur, onChange)
-            if not rd then rd = function() return state.value end end
-            addFieldRow(lay, it.name, w)
-            -- 写回路径换成专属表前缀：it.path 形如 "<stNameNow>.background" → "<own>.background"
-            local rel = it.path:sub(#stNameNow + 1)  -- 以 "." 开头
-            local ownPath = own .. rel
-            styleHolders[#styleHolders + 1] = { path = ownPath, reader = rd, cur = it.cur }
-        end
-        -- 颜色快捷：作用到本键专属样式表（只影响本键）。
-        -- 取色后只更新对应字段的 state + 重绘按钮，不重开窗口，避免丢失其它未应用字段；
-        -- 真正的写入统一在 applyAll 里做。
-        local function colorBtn(btnName, fieldPath)
-            local holder
-            for _, h in ipairs(styleHolders) do if h.path == fieldPath then holder = h; break end end
-            local cur = holder and holder.cur or nil  -- 专属表尚未创建，值取字段清单的回显
-            local b = Button(activity)
-            b.setAllCaps(false); b.setTextSize(11)
-            local function paint(n)
-                b.setText(btnName .. (type(n) == "number" and ("  #" .. string.format("%06X", n % 0x1000000)) or "（默认）"))
-                if type(n) == "number" then
-                    pcall(function() b.setBackgroundColor(n) end)
-                    local lum = ((math.floor(n/0x10000)%0x100)*299 + (math.floor(n/0x100)%0x100)*587 + (n%0x100)*114)/1000
-                    pcall(function() b.setTextColor(lum > 128 and 0xFF000000 or 0xFFFFFFFF) end)
+    -- 事件串
+    local gEvent = newGroup("事件")
+    local curEv = getKbdValue(base .. "." .. ch.ev)
+    addItem(gEvent, "事件字符串", "event",
+        (type(curEv) == "string" and curEv ~= "" and curEv) or nil,
+        function(v)
+            local path = base .. "." .. ch.ev
+            if v == nil or v == "" then
+                if getKbdValue(path) ~= nil then unsetKbdValue(r, k, ch.ev) end
+            else
+                setKbdValue(path, tostring(v))
+            end
+            disableLiveTextOfKey(r, k)
+        end, false)
+
+    -- ② 显示文字：就是这个状态 view 上当前显示的文字，和"事件"是两个不同字段。
+    --    click 通道 → label 字段（键面文字）；长按/各方向 → 各自的角标文字字段(ch.hint)。
+    --    事件(ev) 决定触发动作，显示文字(label/hint_*) 决定键上呈现的字符。
+    local textField = ch.label or ch.hint
+    if textField then
+        local gText = newGroup("显示文字")
+        -- 按源码显示逻辑回显：显式字段优先，为空则从事件串推导（不是"没 label 就未设置"）
+        local curText = resolveDisplayText(r, k, ch)
+        addItem(gText, "显示文字", "text",
+            (type(curText) == "string" and curText ~= "" and curText) or nil,
+            function(v)
+                local path = base .. "." .. textField
+                if v == nil or v == "" then
+                    if getKbdValue(path) ~= nil then unsetKbdValue(r, k, textField) end
+                else
+                    setKbdValue(path, tostring(v))
                 end
-            end
-            paint(cur)
-            b.setLayoutParams(LinearLayout.LayoutParams(0, dp(38), 1))
-            b.onClick = function()
-                colorDialog("修改 " .. btnName .. "（仅本键）", type(cur) == "number" and cur or nil, function(n)
-                    if n then
-                        if holder then holder.reader = function() return n end end  -- 让 applyAll 写新值
-                        cur = n; paint(n)
-                    end
-                end)
-            end
-            return b
-        end
-        local clrRow = LinearLayout(activity); clrRow.setOrientation(LinearLayout.HORIZONTAL)
-        clrRow.addView(colorBtn("背景色", own .. ".background"))
-        clrRow.addView(colorBtn("文字色", own .. ".text_color"))
-        clrRow.addView(colorBtn("按下背景", own .. ".pressed.background"))
-        lay.addView(clrRow)
+                disableLiveTextOfKey(r, k)
+            end, false)
     end
 
-    -- ④ 整键通用项（label / width / style / ascii）
-    local hCommon = TextView(activity)
-    hCommon.setText("── 整键通用 ──")
-    hCommon.setTextSize(12); hCommon.setTextColor(0xFF8B949E); hCommon.setPadding(0, dp(10), 0, dp(2))
-    lay.addView(hCommon)
-    local commonReaders = {}
-    -- style 字段由"本键专属样式"机制管理，这里不再暴露手填框，避免与专属副本冲突。
-    for _, fd in ipairs({{"label", "键面文字（label）"}, {"width", "键宽（width，%）"}, {"ascii", "ASCII 覆盖（ascii）"}}) do
+    -- 下标提示（仅 click 通道，单独一组）：真机 mHints[0]——独立 hint。
+    --     它的显示文字(ch.hint="hint" 字段) + 全部样式项(key.hint.*：偏移/字体/颜色/大小/对齐/显示)
+    --     都归到这一组里，作为一个完整的独立单元。
+    if ch.id == "click" then
+        local gSub = newGroup("下标提示")
+        -- 下标提示的显示文字
+        local curSubText = getKbdValue(base .. "." .. ch.hint)
+        addItem(gSub, "下标提示文字", "text",
+            (type(curSubText) == "string" and curSubText ~= "" and curSubText) or nil,
+            function(v)
+                local path = base .. "." .. ch.hint
+                if v == nil or v == "" then
+                    if getKbdValue(path) ~= nil then unsetKbdValue(r, k, ch.hint) end
+                else
+                    setKbdValue(path, tostring(v))
+                end
+                disableLiveTextOfKey(r, k)
+            end, false)
+        -- 下标提示的样式项
+        local subFields = { "text_color", "text_size", "font", "show", "gravity", "offset_x", "offset_y" }
+        for _, f in ipairs(subFields) do
+            local cur = effectiveStyleValue(stNameNow, "hint", f)
+            local path = own .. ".hint." .. f
+            local kind = "text"
+            if looksLikeColor(fieldCN(f), cur) then kind = "color"
+            elseif type(cur) == "boolean" then kind = "bool"
+            elseif type(cur) == "number" then kind = "number" end
+            addItem(gSub, "下标·" .. fieldCN(f), kind, cur,
+                function(v) if v == nil then unsetStyleValue(path) else setValue(path, v) end end, true)
+        end
+    end
+
+    -- ③~⑧ 样式项：合并三个通道的清单（覆盖所有样式字段 + 主题里真实存在的额外字段），
+    --     按名称前缀分类；写入目标一律是本键专属表 own.<字段>。
+    local styleGroups = {}
+    local function sg(name)
+        if not styleGroups[name] then styleGroups[name] = newGroup(name) end
+        return styleGroups[name]
+    end
+    local seenPath = {}
+    for _, cid in ipairs({ "click", "long_click", "swipe_up" }) do
+        for _, it in ipairs(channelStyleItems(stNameNow, cid)) do
+            if not seenPath[it.path] then
+                seenPath[it.path] = true
+                local nm = it.name or ""
+                local gn
+                if nm:find("按下(长按)", 1, true) or nm:find("长按", 1, true) then
+                    gn = "长按样式"
+                elseif nm:find("按下(提示)", 1, true) or nm:find("提示", 1, true) then
+                    gn = "提示样式"
+                elseif nm:find("按下", 1, true) then
+                    gn = "按下样式"
+                elseif nm:find("留白", 1, true) or nm:find("内边距", 1, true) then
+                    gn = "边距内距"
+                elseif nm:find("常规", 1, true) then
+                    gn = "常规样式"
+                else
+                    gn = "其他样式"
+                end
+                local rel = it.path:sub(#stNameNow + 1)  -- 以 "." 开头
+                local ownPath = own .. rel
+                local kind = "text"
+                if looksLikeColor(it.name, it.cur) then kind = "color"
+                elseif type(it.cur) == "boolean" then kind = "bool"
+                elseif type(it.cur) == "number" then kind = "number" end
+                local shortName = it.name:match("·([^·]+)$") or it.name
+                addItem(sg(gn), shortName, kind, it.cur,
+                    function(v)
+                        if v == nil then unsetStyleValue(ownPath) else setValue(ownPath, v) end
+                    end, true)
+            end
+        end
+    end
+
+    -- 整键通用属性（label 已归入 click 通道的"显示文字"，此处不再重复）
+    local gCommon = newGroup("整键属性")
+    for _, fd in ipairs({ { "width", "键宽(%)" }, { "ascii", "ASCII覆盖" } }) do
         local field, name = fd[1], fd[2]
         local cur = getKbdValue(base .. "." .. field)
-        local et = EditText(activity)
-        et.setSingleLine(true); et.setText(cur == nil and "" or tostring(cur))
-        et.setHint("留空=未设置"); et.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-        addFieldRow(lay, name, et)
-        commonReaders[field] = function()
-            local s = tostring(et.getText())
-            if s == "" then return nil end
-            return s
+        local init = (type(cur) == "string" and cur ~= "" and cur) or (cur ~= nil and tostring(cur) or nil)
+        addItem(gCommon, name, "text", init,
+            function(v)
+                local path = base .. "." .. field
+                if v == nil or v == "" then
+                    if getKbdValue(path) ~= nil then unsetKbdValue(r, k, field) end
+                else
+                    setKbdValue(path, tostring(v))
+                end
+            end, false)
+    end
+
+    -- 位置与增删（动作组，不走 commit）
+    newGroup("位置增删", true)
+
+    -- ============ 分类按钮 + 内容区 ============
+    local catBtns = {}
+    local contentBox = LinearLayout(activity)
+    contentBox.setOrientation(LinearLayout.VERTICAL)
+
+    -- 名称与当前值分两段染不同色：名称=中性灰，当前值=强调蓝，一眼区分。
+    -- 颜色项不再整块刷背景（那样会与其它按钮外观不一致），而是在值前面放一个小色块
+    -- "■" 染成实际颜色，按钮本身保持和其它按钮一样的默认外观。
+    local function paintItemBtn(btn, it)
+        local name = it.name or ""
+        local val = valText(it.v, it.kind) or ""
+        local isColor = (it.kind == "color" and type(it.v) == "number")
+        -- 色块前缀只占一个字符（■ 是 BMP，UTF-16 1 单元），放在值段最前面
+        local swatch = isColor and "■ " or ""
+        local text = name .. "\n  " .. swatch .. val
+        -- Java String.length()/Spannable 下标都是 UTF-16 code unit 数，而 Lua 的 # 是字节数、
+        -- 码点数又和 UTF-16 单元数不同：emoji(辅助平面) 1 个码点=2 个 UTF-16 单元(代理对)。
+        -- 各段起点用「总 UTF16 长 - 后缀 UTF16 长」从末尾反推；若用码点数会让 span 起点
+        -- 切进 emoji 的代理对中间 → 乱码。这里逐码点累加其 UTF-16 单元数。
+        local function utf16units(s)
+            local n, i = 0, 1
+            while i <= #s do
+                local c = s:byte(i)
+                local cp
+                if c < 0x80 then cp = c; i = i + 1
+                elseif c < 0xE0 then cp = (c - 0xC0) * 0x40 + (s:byte(i + 1) - 0x80); i = i + 2
+                elseif c < 0xF0 then cp = (c - 0xE0) * 0x1000 + (s:byte(i + 1) - 0x80) * 0x40 + (s:byte(i + 2) - 0x80); i = i + 3
+                else cp = (c - 0xF0) * 0x40000 + (s:byte(i + 1) - 0x80) * 0x1000 + (s:byte(i + 2) - 0x80) * 0x40 + (s:byte(i + 3) - 0x80); i = i + 4 end
+                n = n + (cp >= 0x10000 and 2 or 1)
+            end
+            return n
+        end
+        -- 名称/色块/值 三段起点（从末尾反推，emoji 安全）
+        local spanned = false
+        if _SpannableString and _Spannable and _FgSpan then
+            pcall(function()
+                local ss = _SpannableString(text)
+                local total = ss.length()
+                local valStart = math.max(0, total - utf16units(val))
+                local swStart = math.max(0, valStart - utf16units(swatch))
+                if total > 0 then
+                    -- 名称段（含换行缩进）：中性灰
+                    ss.setSpan(_FgSpan(0xFF8B949E), 0, swStart, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    -- 色块段：染成实际颜色值
+                    if isColor and valStart > swStart then
+                        ss.setSpan(_FgSpan(it.v), swStart, valStart, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    end
+                    -- 值段：强调蓝（颜色项也一样，颜色已由色块表达）
+                    if total > valStart then
+                        ss.setSpan(_FgSpan(0xFF58A6FF), valStart, total, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    end
+                end
+                btn.setText(ss)
+                spanned = true
+            end)
+        end
+        if not spanned then btn.setText(text) end
+    end
+
+    local function editItem(it, btn)
+        local function done(v) it.v = v; paintItemBtn(btn, it) end
+        if it.kind == "bool" then
+            done(not it.v)
+        elseif it.kind == "color" then
+            colorDialog("修改 " .. it.name, type(it.v) == "number" and it.v or nil,
+                function(n) if n then done(n) end end)
+        elseif it.kind == "event" then
+            local opts = { "✎ 手动输入…" }
+            local keyList = {}
+            for key, _ in pairs(presetKeysCache or {}) do keyList[#keyList + 1] = key end
+            table.sort(keyList)
+            for _, key in ipairs(keyList) do
+                local l = resolveEventLabel(key)
+                opts[#opts + 1] = (l and l ~= "" and l ~= key) and (key .. "  " .. l) or key
+            end
+            listDialog("选择 " .. it.name, opts, function(sel)
+                if sel == "✎ 手动输入…" then
+                    inputDialog("事件字符串", "如 a / space / Return", it.v, function(s) done(s ~= "" and s or nil) end)
+                else
+                    done(sel:match("^([^%s]+)") or sel)
+                end
+            end, { filter = true, filterHint = "输入关键字筛选预置事件" })
+        else
+            local isNum = (it.kind == "number")
+            inputDialog("修改 " .. it.name, isNum and "输入数字" or "留空=删除该项", it.v, function(s)
+                if isNum then
+                    local n = tonumber(s)
+                    if n == nil then toast("请输入数字") return end
+                    done(n)
+                else
+                    done(s ~= "" and s or nil)
+                end
+            end)
         end
     end
 
-    -- ⑤ 位置 / 增删
-    local hPos = TextView(activity)
-    hPos.setText("── 位置与增删 ──")
-    hPos.setTextSize(12); hPos.setTextColor(0xFF8B949E); hPos.setPadding(0, dp(10), 0, dp(2))
-    lay.addView(hPos)
-    local function rowBtns(defs)
-        local row = LinearLayout(activity); row.setOrientation(LinearLayout.HORIZONTAL)
-        for _, d in ipairs(defs) do
-            local b = Button(activity); b.setText(d[1]); b.setAllCaps(false); b.setTextSize(11)
-            b.setLayoutParams(LinearLayout.LayoutParams(0, dp(36), 1)); b.onClick = d[2]; row.addView(b)
+    local function showGroup(idx)
+        local g = groups[idx]
+        contentBox.removeAllViews()
+        for ci, btn in ipairs(catBtns) do
+            if ci == idx then btn.setTextColor(ch.color) else btn.setTextColor(0xFF8B949E) end
         end
-        lay.addView(row)
+        if g.isActions then
+            local function rowBtns(defs)
+                local row = LinearLayout(activity); row.setOrientation(LinearLayout.HORIZONTAL)
+                for _, d in ipairs(defs) do
+                    local b = Button(activity); b.setText(d[1]); b.setAllCaps(false); b.setTextSize(11)
+                    b.setLayoutParams(LinearLayout.LayoutParams(0, dp(38), 1)); b.onClick = d[2]; row.addView(b)
+                end
+                contentBox.addView(row)
+            end
+            rowBtns({
+                { "← 左移", function() if opSwap(r, k, k - 1) then dlg.dismiss(); renderPreview() end end },
+                { "右移 →", function() if opSwap(r, k, k + 1) then dlg.dismiss(); renderPreview() end end },
+                { "↑ 上移", function() if opMove(r, k, r - 1) then dlg.dismiss(); renderPreview() end end },
+                { "↓ 下移", function() if opMove(r, k, r + 1) then dlg.dismiss(); renderPreview() end end },
+            })
+            rowBtns({
+                { "左侧插键", function() dlg.dismiss(); insertKeyChoice(r, k) end },
+                { "右侧插键", function() dlg.dismiss(); insertKeyChoice(r, k + 1) end },
+                { "删除本键", function() dlg.dismiss(); if opDelete(r, k) then selKeyR, selKeyK = nil, nil; renderPreview() end end },
+            })
+        else
+            if #g.items == 0 then
+                local tv = TextView(activity); tv.setText("（本分类暂无可修改项）")
+                tv.setTextColor(0xFF8B949E); tv.setTextSize(12)
+                contentBox.addView(tv)
+            end
+            -- 二级项目按钮：每行 2 个，各占一半宽度（按钮文字两行：名称 + 当前值）
+            local itemRow
+            for ii, it in ipairs(g.items) do
+                if (ii - 1) % 2 == 0 then
+                    itemRow = LinearLayout(activity); itemRow.setOrientation(LinearLayout.HORIZONTAL)
+                    contentBox.addView(itemRow, LinearLayout.LayoutParams(-1, dp(48)))
+                end
+                local b = Button(activity); b.setAllCaps(false); b.setTextSize(11)
+                b.setLayoutParams(LinearLayout.LayoutParams(0, dp(48), 1))
+                paintItemBtn(b, it)
+                local captured = b
+                b.onClick = function() editItem(it, captured) end
+                itemRow.addView(b)
+            end
+        end
     end
-    rowBtns({
-        {"← 左移", function() if opSwap(r, k, k - 1) then dlg.dismiss(); renderPreview() end end},
-        {"右移 →", function() if opSwap(r, k, k + 1) then dlg.dismiss(); renderPreview() end end},
-        {"↑ 上移", function() if opMove(r, k, r - 1) then dlg.dismiss(); renderPreview() end end},
-        {"↓ 下移", function() if opMove(r, k, r + 1) then dlg.dismiss(); renderPreview() end end},
-    })
-    rowBtns({
-        {"左侧插键", function() dlg.dismiss(); insertKeyChoice(r, k) end},
-        {"右侧插键", function() dlg.dismiss(); insertKeyChoice(r, k + 1) end},
-        {"删除本键", function() dlg.dismiss(); if opDelete(r, k) then selKeyR, selKeyK = nil, nil; renderPreview() end end},
-    })
+
+    -- 统一动态编号：按 groups 实际顺序编号 ①②③…，click 多一个"下标提示"组也
+    -- 不会出现子编号或跳号；动作组(位置增删)也纳入同一序列。
+    local NUM_CN = { "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩", "⑪", "⑫" }
+    for i, g in ipairs(groups) do
+        g.name = (NUM_CN[i] or (i .. ".")) .. " " .. g.name
+    end
+
+    -- 分类按钮：每行 3 个
+    local catRow
+    for i, g in ipairs(groups) do
+        if (i - 1) % 3 == 0 then
+            catRow = LinearLayout(activity); catRow.setOrientation(LinearLayout.HORIZONTAL); lay.addView(catRow)
+        end
+        local b = Button(activity); b.setAllCaps(false); b.setTextSize(10); b.setText(g.name)
+        b.setLayoutParams(LinearLayout.LayoutParams(0, dp(36), 1))
+        b.onClick = function() showGroup(i) end
+        catRow.addView(b); catBtns[#catBtns + 1] = b
+    end
+    local tip = TextView(activity); tip.setTextSize(10); tip.setTextColor(0xFF8B949E)
+    tip.setText("点分类 → 点项目按钮改值 → 应用修改")
+    lay.addView(tip)
+    lay.addView(contentBox)
 
     dlg.setTitle(ch.name .. " · 第" .. r .. "行第" .. k .. "键")
     local sv = ScrollView(activity); sv.addView(lay); dlg.setView(sv)
+
     local function applyAll()
-        -- event 串
-        local v = tostring(evEt.getText())
-        local old = getKbdValue(base .. "." .. ch.ev)
-        if v ~= "" then
-            if v ~= tostring(old) then setKbdValue(base .. "." .. ch.ev, v); disableLiveTextOfKey(r, k) end
-        elseif old ~= nil then
-            unsetKbdValue(r, k, ch.ev); disableLiveTextOfKey(r, k)
+        local hasStyle = false
+        for _, it in ipairs(allItems) do
+            if it.isStyle and tostring(it.v) ~= tostring(it.cur) then hasStyle = true; break end
         end
-        -- 提示文字
-        if ch.hint and hintEtRef then
-            local hv = tostring(hintEtRef.getText())
-            local hold = getKbdValue(base .. "." .. ch.hint)
-            if hv ~= "" then
-                if hv ~= tostring(hold) then setKbdValue(base .. "." .. ch.hint, hv); disableLiveTextOfKey(r, k) end
-            elseif hold ~= nil then
-                unsetKbdValue(r, k, ch.hint); disableLiveTextOfKey(r, k)
-            end
+        if hasStyle and not ensureOwnStyle(r, k) then toast("专属样式创建失败") return end
+        local n = 0
+        for _, it in ipairs(allItems) do
+            if tostring(it.v) ~= tostring(it.cur) then it.commit(it.v); n = n + 1 end
         end
-        -- 整键通用项
-        for field, reader in pairs(commonReaders) do
-            local cv = reader(); local path = base .. "." .. field; local c_old = getKbdValue(path)
-            if cv ~= nil then
-                if tostring(cv) ~= tostring(c_old) then
-                    setKbdValue(path, tostring(cv))
-                    if field == "label" then disableLiveTextOfKey(r, k) end  -- label 是文字；width/ascii 不动角标
-                end
-            elseif c_old ~= nil then
-                unsetKbdValue(r, k, field)
-                if field == "label" then disableLiveTextOfKey(r, k) end
-            end
-        end
-        -- 本键专属样式字段（只影响本键）：先建专属表并改 style 指针，再写字段。
-        -- 仅当确实有样式字段改动时才创建，避免"打开看看就取消/应用"产生无谓副本。
-        local hasStyleChange = false
-        for _, h in ipairs(styleHolders) do
-            local v = h.reader()
-            if v ~= nil and tostring(v) ~= tostring(h.cur) then hasStyleChange = true; break end
-        end
-        if hasStyleChange then
-            local okOwn = ensureOwnStyle(r, k)
-            if okOwn then
-                for _, h in ipairs(styleHolders) do
-                    local v = h.reader()
-                    if v ~= nil and tostring(v) ~= tostring(h.cur) then setValue(h.path, v) end
-                end
-            end
-        end
+        return n
     end
     dlg.setButton("应用修改", function()
         applyAll()
-        selKeyR, selKeyK = nil, nil   -- 清除选中态：改完立刻看到真实边框，不被高亮干扰
+        selKeyR, selKeyK = nil, nil
         dlg.dismiss()
         renderPreview()
         toast("已应用 " .. ch.name .. " 的修改")
     end)
     dlg.setButton2("取消", function() dlg.dismiss() end)
     dlg.setButton3("整键总览", function() applyAll(); selKeyR, selKeyK = nil, nil; dlg.dismiss(); keyEditDialog(r, k) end)
+    showGroup(1)
     dlg.show()
 end
 
@@ -4937,199 +5518,85 @@ end
 --   圆角/描边    = 同一前缀的 corner_radius / stroke_width / stroke_color
 --   工具栏间距   = toolbar.elevation（真机 ToolbarView 就按它让出底部空间，缺省 2dp）
 -- 所有项只在「与打开面板时不同」才写入，没动的字段一个都不碰。
+-- 键盘调整：分类-项目按钮界面，与按键编辑面板同款
 function kbdSettingsDialog()
     if not kbdEnv then toast("未加载键盘") return end
     if not styleEnv then toast("样式还没加载好") return end
 
-    local fields = {}
-    local function trim(v) return (tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
-    local function same(a, b)
-        if a == nil and b == nil then return true end
-        if a == nil or b == nil then return false end
-        return tostring(a) == tostring(b)
-    end
     local function join(prefix, field)
         return prefix == "" and field or (prefix .. "." .. field)
     end
-
-    local lay = LinearLayout(activity)
-    lay.setOrientation(LinearLayout.VERTICAL)
-    lay.setPadding(dp(14), dp(6), dp(14), dp(6))
-
-    local function section(text)
-        local tv = TextView(activity)
-        tv.setText(text); tv.setTextSize(12); tv.setTextColor(0xFFE3B341)
-        tv.setPadding(0, dp(10), 0, dp(1))
-        lay.addView(tv)
-    end
-    local function note(text)
-        local tv = TextView(activity)
-        tv.setText(text); tv.setTextSize(10); tv.setTextColor(0xFF6E7681)
-        tv.setPadding(0, dp(1), 0, dp(3))
-        lay.addView(tv)
-    end
-    local function row(label, widget, width)
-        local r = LinearLayout(activity)
-        r.setOrientation(LinearLayout.HORIZONTAL)
-        r.setGravity(Gravity.CENTER_VERTICAL)
-        r.setPadding(0, dp(3), 0, dp(3))
-        local tv = TextView(activity)
-        tv.setText(label); tv.setTextSize(11); tv.setTextColor(0xFF8B949E)
-        tv.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-        r.addView(tv)
-        widget.setLayoutParams(LinearLayout.LayoutParams(dp(width or 148), -2))
-        r.addView(widget)
-        lay.addView(r)
-        return widget
+    local groups, allItems = {}, {}
+    local function grp(nm)
+        groups[#groups + 1] = { name = nm, items = {} }
+        return groups[#groups]
     end
 
-    local function colorButton(state)
-        local b = Button(activity)
-        b.setAllCaps(false); b.setTextSize(11)
-        local function paint(n)
-            if type(n) == "number" then
-                b.setText(string.format("#%08X", n))
-                pcall(function() b.setBackgroundColor(n) end)
-                local lum = ((math.floor(n / 0x10000) % 0x100) * 299
-                    + (math.floor(n / 0x100) % 0x100) * 587 + (n % 0x100) * 114) / 1000
-                pcall(function() b.setTextColor(lum > 128 and 0xFF000000 or 0xFFFFFFFF) end)
-            else
-                b.setText("未设置")
-                pcall(function() b.setBackgroundColor(0xFF30363D) end)
-                pcall(function() b.setTextColor(0xFF8B949E) end)
-            end
-        end
-        paint(state.value)
-        b.onClick = function()
-            colorDialog("选择颜色", type(state.value) == "number" and state.value or nil, function(n)
-                if n then state.value = n; paint(n) end
-            end)
-        end
-        return b
-    end
-
-    local function addNum(label, path)
-        local cur = getValue(path)
-        local et = EditText(activity)
-        et.setSingleLine(true); et.setInputType(2)
-        et.setText(cur ~= nil and tostring(cur) or "")
-        et.setHint("未设置")
-        row(label, et)
-        fields[#fields + 1] = {
-            path = path, init = cur,
-            get = function()
-                local t = trim(et.getText())
-                if t == "" then return nil end
-                return tonumber(t)
-            end,
-        }
-    end
-
-    local function addColor(label, path)
-        local cur = getValue(path)
-        local state = { value = cur }
-        row(label, colorButton(state))
-        fields[#fields + 1] = {
-            path = path, init = cur,
-            get = function() return state.value end,
-        }
-    end
-
-    -- 一块区域：背景（颜色/图片二选一）+ 圆角 + 描边
-    local function addArea(title, prefix, extraNote)
-        section(title)
-        if extraNote then note(extraNote) end
+    -- 一块区域：背景(颜色/图片二选一) + 圆角 + 描边
+    local function addArea(g, prefix)
         local bgPath = join(prefix, "background")
         local cur = getValue(bgPath)
-        local colorInit = type(cur) == "number" and cur or nil
-        local imgInit = type(cur) == "string" and cur or ""
-        local state = { value = colorInit }
-        row("背景颜色", colorButton(state))
-        local img = EditText(activity)
-        img.setSingleLine(true)
-        img.setText(imgInit)
-        img.setHint("留空用背景颜色")
-        row("背景图片（文件名）", img)
-        -- 图片被改就以图片为准（清空 = 删除该字段，回落到未设置/继承）；
-        -- 图片没动才看颜色有没有改；都没动返回原值，应用时不写入。
-        fields[#fields + 1] = {
-            path = bgPath, init = cur,
-            get = function()
-                local t = trim(img.getText())
-                if t ~= imgInit then
-                    if t == "" then return nil end
-                    return t
-                end
-                if not same(state.value, colorInit) then return state.value end
-                return cur
-            end,
-        }
-        addNum("圆角（dp）", join(prefix, "corner_radius"))
-        addNum("描边宽度（dp）", join(prefix, "stroke_width"))
-        addColor("描边颜色", join(prefix, "stroke_color"))
-    end
-
-    -- ===== 三块区域的背景/圆角/描边 =====
-    addArea("键盘整体背景（最底层）", "",
-        "候选区、工具栏、按键区都叠在它上面；改的是样式根表的 background / corner_radius。")
-    addArea("按键区域背景", "keyboard",
-        "按键区自己的底（keyboard.background），贴在键盘整体背景之上。")
-    addArea("工具栏区背景", "toolbar",
-        "工具栏条（toolbar.background）；没写 toolbar 表的主题会新建。")
-
-    -- ===== 工具栏与按键区域间距 =====
-    section("工具栏与按键区域间距")
-    addNum("与按键区间距（dp）", "toolbar.elevation")
-    note("写 toolbar.elevation：真机 ToolbarView 直接按这个值在底部让出空间（同时也是工具栏阴影高度），缺省 2dp。改 0 就是工具栏紧贴按键区。")
-
-    -- ===== 尺寸（键盘文件字段，不是样式表）=====
-    section("尺寸")
-    local initW = tonumber(getKbdValue("key_width") or kbdEnv.key_width) or 10
-    local initH = tonumber(getKbdValue("key_height") or kbdEnv.key_height) or 25
-    local wEt, hEt = EditText(activity), EditText(activity)
-    for _, et in ipairs({ wEt, hEt }) do
-        et.setSingleLine(true); et.setInputType(2)
-    end
-    wEt.setText(tostring(initW))
-    hEt.setText(tostring(initH))
-    row("默认键宽（%，key_width）", wEt)
-    row("键高（行高占比 %，key_height）", hEt)
-
-
-    local sv = ScrollView(activity)
-    sv.addView(lay)
-    local dlg = LuaDialog(activity)
-    dlg.setTitle("键盘设置")
-    dlg.setView(sv)
-    -- 候选栏入口：预览里点候选栏也能进；候选栏被隐藏时从这里进。
-    local candBtn = Button(activity)
-    candBtn.setAllCaps(false); candBtn.setTextSize(11)
-    candBtn.setText("候选栏设置（高亮色 / 按钮样式 / hide按钮 / 布局）")
-    candBtn.onClick = function()
-        pcall(function() dlg.dismiss() end)
-        candidateSettingsDialog()
-    end
-    lay.addView(candBtn, LinearLayout.LayoutParams(-1, -2))
-    dlg.setButton("应用", function()
-        local n = 0
-        local w = tonumber(trim(wEt.getText()))
-        if w and not same(w, initW) then setKbdTop("key_width", w); n = n + 1 end
-        local h = tonumber(trim(hEt.getText()))
-        if h and not same(h, initH) then setKbdTop("key_height", h); n = n + 1 end
-        for _, f in ipairs(fields) do
-            local v = f.get()
-            if not same(v, f.init) then
-                if v == nil then unsetStyleValue(f.path) else setValue(f.path, v) end
-                n = n + 1
-            end
+        local it = { name = "背景(颜色/图片)", kind = "color", cur = cur, v = cur }
+        it.onEdit = function(item, done) backgroundEditDialog("修改 " .. item.name, item.v, done) end
+        it.commit = function(v) if v == nil then unsetStyleValue(bgPath) else setValue(bgPath, v) end end
+        g.items[#g.items + 1] = it; allItems[#allItems + 1] = it
+        for _, fd in ipairs({
+            { "corner_radius", "圆角(dp)", "number" },
+            { "stroke_width", "描边宽度(dp)", "number" },
+            { "stroke_color", "描边颜色", "color" },
+        }) do
+            local path = join(prefix, fd[1])
+            local c = getValue(path)
+            local item = { name = fd[2], kind = fd[3], cur = c, v = c }
+            item.commit = function(v) if v == nil then unsetStyleValue(path) else setValue(path, v) end end
+            g.items[#g.items + 1] = item; allItems[#allItems + 1] = item
         end
-        dlg.dismiss()
-        if n == 0 then toast("没有修改任何项") return end
-        renderPreview()
-        toast("已应用 " .. n .. " 项改动（未修改的项未动）")
-    end)
-    dlg.setButton2("取消", function() dlg.dismiss() end)
-    dlg.show()
+    end
+
+    addArea(grp("键盘整体背景（最底层）"), "")
+    addArea(grp("按键区域背景"), "keyboard")
+    addArea(grp("工具栏区背景"), "toolbar")
+
+    -- 间距与尺寸
+    local gMisc = grp("间距与尺寸")
+    do
+        local path = "toolbar.elevation"
+        local c = getValue(path)
+        local it = { name = "与按键区间距(dp)", kind = "number", cur = c, v = c }
+        it.commit = function(v) if v == nil then unsetStyleValue(path) else setValue(path, v) end end
+        gMisc.items[#gMisc.items + 1] = it; allItems[#allItems + 1] = it
+    end
+    for _, fd in ipairs({ { "key_width", "默认键宽(%)" }, { "key_height", "键高(行高%)" } }) do
+        local c = tonumber(getKbdValue(fd[1]) or kbdEnv[fd[1]])
+        local it = { name = fd[2], kind = "number", cur = c, v = c }
+        it.commit = function(v) setKbdTop(fd[1], v) end
+        gMisc.items[#gMisc.items + 1] = it; allItems[#allItems + 1] = it
+    end
+
+    -- 候选栏入口（动作项）：打开子面板前先关掉本面板（避免叠窗）
+    local gMore = grp("候选栏")
+    local myDlg
+    gMore.items[#gMore.items + 1] = {
+        name = "打开候选栏设置 →", isAction = true,
+        onClick = function()
+            pcall(function() if myDlg then myDlg.dismiss() end end)
+            candidateSettingsDialog()
+        end,
+    }
+
+    myDlg = categoryPanelDialog({
+        title = "键盘调整 · 高度 / 背景 / 圆角 / 间距",
+        accent = 0xFF3FB950,
+        headText = "三块区域背景各自独立；改动的项才写入，未动的字段不碰。候选栏入口见最后一类。",
+        groups = groups,
+        onApply = function()
+            local n = 0
+            for _, it in ipairs(allItems) do
+                if not catSame(it.v, it.cur) then it.commit(it.v); n = n + 1 end
+            end
+            return n
+        end,
+    })
 end
 
 -- 工具栏整体样式设置：与真机 ToolbarView 对齐的字段
@@ -5579,11 +6046,19 @@ function exportCommit(ctx)
         local bpos = src:find(BLOCK_BEGIN, 1, true)
         local head = bpos and src:sub(1, bpos - 1) or src
         local tailPart = bpos and src:sub(bpos) or ""
+        -- 只在去注释后的真代码里定位 name=（注释里的示例 name 不能当真、更不能改）。
+        -- stripLuaComments 保持长度与行号，故 code 中的位置就是原文 head 的同一字节位。
         local replaced = false
-        head = head:gsub('(%f[%w]name%s*=%s*)["\'][^\n]-["\']', function(pre)
-            replaced = true
-            return pre .. luaQuote(ctx.name)
-        end, 1)
+        local code = stripLuaComments(head)
+        local ns = code:find('%f[%w]name%s*=%s*["\']')
+        if ns then
+            local qs = head:find('["\']', ns)
+            local _, qe = qs and head:find('["\'][^\n]-["\']', qs)
+            if qs and qe then
+                head = head:sub(1, qs - 1) .. luaQuote(ctx.name) .. head:sub(qe + 1)
+                replaced = true
+            end
+        end
         if not replaced then head = head .. "\nname = " .. luaQuote(ctx.name) .. "\n" end
         atomicWriteFile(mainPath, head .. tailPart)
     end
@@ -5827,30 +6302,55 @@ function mkBtn(parent, weight)
     return b
 end
 
--- 行1：主题 / 配色 / 键盘
-local row1 = LinearLayout(activity)
-row1.setOrientation(LinearLayout.HORIZONTAL)
-row1.setPadding(dp(4), dp(6), dp(4), 0)
-root.addView(row1)
-local btnTheme = mkBtn(row1)
-local btnVariant = mkBtn(row1)
-btnTheme.setText("选择主题")
-btnVariant.setText("选择配色")
-
+-- ===== 五个功能按钮（最上）=====
+-- 功能按钮行：样式编辑 / 键盘调整 / 视图诊断
 local row2 = LinearLayout(activity)
 row2.setOrientation(LinearLayout.HORIZONTAL)
-row2.setPadding(dp(4), dp(2), dp(4), 0)
+row2.setPadding(dp(4), dp(6), dp(4), 0)
 root.addView(row2)
-local btnKbd = mkBtn(row2)
 local btnStyle = mkBtn(row2)
+local btnSettings = mkBtn(row2)
 local btnView = mkBtn(row2)
-btnKbd.setText("选择键盘")
 btnStyle.setText("样式编辑")
+btnSettings.setText("键盘调整")
 btnView.setText("视图/诊断")
 btnStyle.setTextColor(0xFFE3B341)
+btnSettings.setTextColor(0xFF3FB950)
 btnStyle.onClick = function() styleEditorDialog() end
+btnSettings.onClick = function() kbdSettingsDialog() end
 
--- 改动计数提示
+-- 保存 / 放弃行：与上面三个共五个按钮，全部集中在最上方
+local bottom = LinearLayout(activity)
+bottom.setOrientation(LinearLayout.HORIZONTAL)
+bottom.setPadding(dp(4), dp(2), dp(4), dp(4))
+root.addView(bottom)
+local btnExport = mkBtn(bottom)
+local btnReset = mkBtn(bottom)
+btnExport.setText("保存主题")
+btnReset.setText("放弃修改")
+btnExport.setTextColor(0xFF3FB950)
+
+-- ===== 提示区 =====
+-- 状态文字（提示区最前面）：真机当前加载的主题 / 配色 / 键盘
+local stTheme, stVariant, stKbd = "主题：当前", "配色：当前", "键盘：当前"
+local statusTv = TextView(activity)
+statusTv.setTextSize(11)
+statusTv.setTextColor(0xFF8B949E)
+statusTv.setPadding(dp(8), dp(2), dp(8), dp(2))
+local function refreshStatus()
+    statusTv.setText(stTheme .. "   ·   " .. stVariant .. "   ·   " .. stKbd)
+end
+refreshStatus()
+root.addView(statusTv)
+
+local hint = TextView(activity)
+hint.setTextSize(11)
+hint.setTextColor(0xFF888888)
+hint.setText("复刻当前键盘 · 点按键中心=点击、四边=滑动、右上角=长按，分别编辑对应事件与样式")
+hint.setPadding(dp(8), 0, dp(8), dp(2))
+root.addView(hint)
+
+-- ===== 未保存改动区 =====
 local dirtyTv = TextView(activity)
 dirtyTv.setTextSize(11)
 dirtyTv.setTextColor(0xFF8B949E)
@@ -5870,7 +6370,7 @@ function refreshDirty()
     dirtyTv.setText("未保存改动：" .. dirtyCount .. " 项（点“保存主题”可覆盖原主题或另存新主题）")
 end
 
--- 预览区：左右不留 margin/padding，横向铺满整屏（贴合真机键盘占满屏宽的表现）
+-- ===== 键盘视图（最后，占满剩余高度）=====
 previewBox = FrameLayout(activity)
 local pvLp = LinearLayout.LayoutParams(-1, 0, 1)
 pvLp.setMargins(0, dp(4), 0, dp(2))
@@ -5878,26 +6378,6 @@ previewBox.setLayoutParams(pvLp)
 previewBox.setPadding(0, dp(4), 0, dp(4))
 previewBox.setBackgroundColor(0xFF161B22)
 root.addView(previewBox)
-
-local hint = TextView(activity)
-hint.setTextSize(11)
-hint.setTextColor(0xFF888888)
-hint.setText("复刻当前键盘 · 点按键中心=点击、四边=滑动、右上角=长按，分别编辑对应事件与样式")
-hint.setPadding(dp(8), 0, dp(8), dp(2))
-root.addView(hint)
-
--- 底部操作栏
-local bottom = LinearLayout(activity)
-bottom.setOrientation(LinearLayout.HORIZONTAL)
-bottom.setPadding(dp(4), dp(4), dp(4), dp(6))
-root.addView(bottom)
-local btnExport = mkBtn(bottom)
-local btnSettings = mkBtn(bottom)
-local btnReset = mkBtn(bottom)
-btnExport.setText("保存主题")
-btnSettings.setText("键盘设置")
-btnReset.setText("放弃修改")
-btnExport.setTextColor(0xFF3FB950)
 
 activity.setContentView(root)
 
@@ -6036,6 +6516,53 @@ function kbdFileHasData(fn)
     return #body > 40 and (body:find("rows") ~= nil or body:find("keys") ~= nil or body:find("require") ~= nil)
 end
 
+-- 静态读取键盘脚本的 name：本体没有裸 name= 时，顺着 require 链去读被 require 的文件拿 name。
+-- 全程只读文件、不执行任何脚本（零副作用，符合"零脚本执行"铁律）。
+-- 带 visited 防环 + 深度(4) + 读取预算(24) 防卡死；require 模块名按真机语义（.→/，补 .lua），
+-- 优先在脚本同目录、其次 <主题>/keyboards、主题根查找。
+-- 返回第一个找到的 name 字符串，找不到返回 nil。
+function kbdNameOfFile(path, depth, visited, budget)
+    depth = depth or 0
+    visited = visited or {}
+    budget = budget or { n = 24 }
+    if depth > 4 or budget.n <= 0 then return nil end
+    path = tostring(path):gsub("\\", "/")
+    if visited[path] then return nil end
+    visited[path] = true
+    budget.n = budget.n - 1
+    local body = readFileHead(path, 32768)
+    if not body then return nil end
+    local code = stripLuaComments(body)
+    local nm = code:match('name%s*=%s*"([^"]*)"') or code:match("name%s*=%s*'([^']*)'")
+    if nm then return nm end
+    -- 本体无 name：收集 require 模块名（多种写法），注释里的 require 已被 strip 掉
+    local mods = {}
+    for m in code:gmatch('require%s*"([%w_%.]+)"') do mods[#mods + 1] = m end
+    for m in code:gmatch("require%s*'([%w_%.]+)'") do mods[#mods + 1] = m end
+    for m in code:gmatch('require%s*%(%s*"([%w_%.]+)"%s*%)') do mods[#mods + 1] = m end
+    for m in code:gmatch("require%s*%(%s*'([%w_%.]+)'%s*%)") do mods[#mods + 1] = m end
+    if #mods == 0 then return nil end
+    local dir = path:match("^(.*)/[^/]+$") or ""
+    for _, mod in ipairs(mods) do
+        local rel = (mod:gsub("%.", "/")) .. ".lua"
+        local tries = {}
+        if dir ~= "" then tries[#tries + 1] = dir .. "/" .. rel end
+        if themeDir then
+            tries[#tries + 1] = themeDir .. "/keyboards/" .. rel
+            tries[#tries + 1] = themeDir .. "/" .. rel
+        end
+        for _, p in ipairs(tries) do
+            if fileExists(p) then
+                local got = kbdNameOfFile(p, depth + 1, visited, budget)
+                if got then return got end
+                break
+            end
+        end
+        if budget.n <= 0 then break end
+    end
+    return nil
+end
+
 function findKbdCandidates(displayName)
     local out = {}
     if not themeDir or type(displayName) ~= "string" or displayName == "" then return out end
@@ -6046,20 +6573,9 @@ function findKbdCandidates(displayName)
     if okList and type(files) == "table" then
         for _, fn in ipairs(files) do
             if type(fn) == "string" and fn:match("%.lua$") then
-                -- 只看头部 32KB：name= 一定写在脚本靠前的位置，整份读取没必要。
-                local body = readFileHead(kd .. "/" .. fn, 32768)
-                if body then
-                    local hit = false
-                    for nm in body:gmatch('name%s*=%s*"([^"]*)"') do
-                        if nm == displayName or nm == bare then hit = true end
-                    end
-                    if not hit then
-                        for nm in body:gmatch("name%s*=%s*'([^']*)'") do
-                            if nm == displayName or nm == bare then hit = true end
-                        end
-                    end
-                    if hit then out[#out + 1] = fn end
-                end
+                -- 静态读 name（含 require 链），不执行脚本、零副作用。
+                local nm = kbdNameOfFile(kd .. "/" .. fn)
+                if nm and (nm == displayName or nm == bare) then out[#out + 1] = fn end
             end
         end
     end
@@ -6481,40 +6997,22 @@ function dumpToolRenderedTexts()
         end
     end)
     if not ok0 then out[#out + 1] = "ERR: 工具自渲染遍历异常" end
-    -- 【r23 诊断】把真机文字源命中情况一起打出来，一次定位"角标贴顶"根因：
-    -- liveN=解析出的真机键数；rendered=本轮渲染键数；ltHit=拿到真机 dump 的键数；
-    -- cornerXY=拿到真机权威坐标(c.x/c.y)的角标数。若 ltHit=0/liveN=0 说明真机 dump
-    -- 没进来；若 cornerXY>0 但角标仍贴顶说明 addLabelView 定位另有bug；relabel 是
-    -- 工具脚本占位符→真机显示文字的映射样本（r23 前 label 相等硬条件会因此全部落空）。
+    -- 数据源摘要：真机文字源命中 + 结构化导出状态（手动诊断菜单可见）。
     local d = _G.__kbdDiag or {}
     out[#out + 1] = string.format("[DIAG] liveN=%s rendered=%s ltHit=%s cornerXY=%s",
         tostring(liveKeyTextsN or 0), tostring(d.rendered or 0),
         tostring(d.ltHit or 0), tostring(d.cornerWithXY or 0))
-    -- 【r27】结构化数据源状态：n>0 corners>0 即 Java 权威结构已生效；
-    -- 空则为旧 APK（回退扁平解析），下次 dump 一眼可辨。
     if _G.__ksDiag then out[#out + 1] = "[DIAG] KS " .. tostring(_G.__ksDiag) end
-    -- 【r25.1】桥接返回摘要（本轮真实值），判断桥接是否拿到真机 view：
-    -- ERR=[...] 非空=桥接调用失败；ROOT=[...] 非空=桥接通；kb/tv=读到的键盘文本行数。
     if _G.__bridgeDiag then out[#out + 1] = "[DIAG] BRIDGE " .. _G.__bridgeDiag end
-    local rl = d.relabel or {}
-    if #rl > 0 then out[#out + 1] = "[DIAG] relabel=" .. table.concat(rl, ", ") end
-    -- 【r24】角标样式推导参数（纯 Lua，键盘收起也可用）：gravity/offset 是否与真机一致，
-    -- 看这些值即可。g=0x31=TOP|CENTER, 0x51=BOTTOM|CENTER, 0x13=LEFT|CENTER, 0x15=RIGHT|CENTER。
-    local cd = _G.__cornerDiag or {}
-    if #cd > 0 then
-        out[#out + 1] = string.format("[CORNER] n=%d（通道 grav offset dump 文字）", #cd)
-        for _, line in ipairs(cd) do out[#out + 1] = "[CORNER] " .. line end
-    end
-    -- 【r25.2】桥接状态塞进最后 emit 的这一行，确保诊断视图截断后仍可见。
-    -- 这一行直接定死桥接有没有拿到真机 view：
-    --   ERR=[非空] → 桥接调用失败（APK 桥接类不对 / 服务未就绪）
-    --   ROOT=[非空] kb>0 → 桥接通、读到键盘 view
-    --   ROOT=[非空] kb=0 → 桥接通但键盘区无文本（视图未 load / 类名匹配不上）
-    out[#out + 1] = "---- TOOL DONE ---- BRIDGE[" .. tostring(_G.__bridgeDiag or "nil") .. "]"
+    out[#out + 1] = string.format("---- TOOL DONE ---- VER=r27.49 ksLen=%d liveN=%s BRIDGE[%s]",
+        #tostring(_G.__ksRaw or ""), tostring(liveKeyTextsN or 0),
+        tostring(_G.__bridgeDiag or "nil"))
     return table.concat(out, "\n")
 end
 
-function dumpKbViewTexts()
+function dumpKbViewTexts(noRender)
+    -- 【r27.41】noRender=true：只采集真机 dump 供诊断日志，不 apply 快照、不重绘。
+    -- 首帧已同步采集并渲染过，诊断 dump 若再渲染就是无谓的第二次全量渲染。
     -- 真机 View 树遍历放在 Java 桥接类内部（编译期绑定）。工具进程拿不到正在渲染的
     -- Service 实例，但 TrimeService.onCreate 保存的 RootInputView 静态引用跨 Lua 虚拟机
     -- 共享——它涵盖键盘 + 工具栏 + 候选栏整棵树。
@@ -6542,18 +7040,6 @@ function dumpKbViewTexts()
         for _ in rs:gmatch("[Tt]extView@") do tv = tv + 1 end
         _G.__bridgeDiag = string.format("ERR=[%s] ROOT=[%s] kb=%d tv=%d len=%d",
             tostring(errLine or ""), tostring(rootLine or ""), kb, tv, #rs)
-        -- 【r26.1】存真机 KEYBOARD 区前若干行原文（保留缩进），供工具诊断视图显示，
-        -- 一次定死真实缩进/层级/坐标结构，据此修正解析规则。
-        _G.__realKbSample = {}
-        local n = 0
-        for line in rs:gmatch("[^\r\n]+") do
-            if line:find("[KEYBOARD]", 1, true) then
-                n = n + 1
-                if n <= 24 then
-                    _G.__realKbSample[#_G.__realKbSample + 1] = line
-                end
-            end
-        end
     end
     -- 【r27】结构化导出：Java 按缓存的 KeyView 树直接导出每个键的主标签 +
     -- 各方向角标的权威 gravity/坐标/文本。工具据此 1:1 复刻，零猜测。
@@ -6565,10 +7051,32 @@ function dumpKbViewTexts()
     local ksCorners = 0
     for _ in ksRaw:gmatch("KSCORNER%s") do ksCorners = ksCorners + 1 end
     _G.__ksDiag = string.format("n=%d corners=%d", ksN, ksCorners)
-    local toolDump = dumpToolRenderedTexts()
-    return "===== 真机 root =====" .. tostring(r)
+    -- 【r27.7 诊断根因】旧顺序是"先 dump 工具视图、后 applyLiveFromRaw"，导致
+    -- [CORNER]/[DIAG] 永远反映【应用快照之前】的上一次渲染状态：即便本次 dump 成功、
+    -- 屏幕已用真机坐标正确重绘，诊断里也永远看不到 dump=(...)，根本无法判断角标有没有
+    -- 用上权威坐标。改为：先 apply 快照 → 同步重绘 → 再 dump 工具视图，诊断即真实结果。
+    local realStruct = "===== 真机 root =====" .. tostring(r)
         .. "\n\n===== 结构化 =====\n" .. tostring(ksRaw)
-        .. "\n\n===== 工具自渲染 =====" .. toolDump
+    -- 【r27.41】noRender 时只留原始 dump 文本供诊断，不再 apply 快照、不再重绘。
+    if not noRender then
+        pcall(applyLiveFromRaw, realStruct .. "\n\n===== 工具自渲染 =====")
+        -- renderPreview 有 50ms 节流会走异步；这里直接调实现，确保本轮工具视图是最新的
+        pcall(renderPreviewImpl)
+    end
+    -- 【r27.22】强制整棵树 measure+layout：r27.21 的 ACT 全 0 是因为 dump 时 view 还没
+    -- layout（getLeft/getWidth 在 layout 前恒为 0，r21 踩过同一坑）。这里用当前 previewBox
+    -- 宽高做 EXACTLY measure 再 layout，令所有角标 view 的 getLeft/getTop 立即变成真实渲染值。
+    pcall(function()
+        local pw = previewBox.getWidth()
+        local ph = previewBox.getHeight()
+        if pw > 0 and ph > 0 then
+            local EXACTLY = 1073741824  -- 0x40000000
+            previewBox.measure(EXACTLY + pw, EXACTLY + ph)
+            previewBox.layout(0, 0, pw, ph)
+        end
+    end)
+    local toolDump = dumpToolRenderedTexts()
+    return realStruct .. "\n\n===== 工具自渲染 =====" .. toolDump
 end
 
 -- ===== 【r27 权威数据源】解析结构化键盘导出（Java dumpKeyboardStructure）=====
@@ -6583,7 +7091,7 @@ function parseKeyStructure(raw)
     local function ensure(seq)
         local e = keys[seq]
         if not e then
-            e = { label = nil, top = nil, bottom = nil, corners = {} }
+            e = { label = nil, top = nil, bottom = nil, corners = {}, region = "KEYBOARD" }
             keys[seq] = e
             if seq > maxSeq then maxSeq = seq end
         end
@@ -6592,23 +7100,37 @@ function parseKeyStructure(raw)
     for line in raw:gmatch("[^\r\n]+") do
         local ks = tonumber(line:match("^KSKEY%s+(%d+)"))
         if ks then
-            ensure(ks)
+            local e = ensure(ks)
+            local reg = line:match("r=(%a+)")
+            if reg then e.region = reg end
+            -- 【r27.7】记录键的布局宽高，用于识别"未布局的退化 dump"：
+            -- 工具全屏时输入法键盘被遮挡，真机 View 未 measure，box 宽高全 0。
+            local bw, bh = line:match("box=%-?%d+,%-?%d+,(%d+),(%d+)")
+            if bw then e.bw, e.bh = tonumber(bw), tonumber(bh) end
         else
             local cs = tonumber(line:match("^KSCLICK%s+(%d+)"))
             local cr = tonumber(line:match("^KSCORNER%s+(%d+)"))
             if cs or cr then
                 local seq = cs or cr
                 local e = ensure(seq)
+                local reg = line:match("r=(%a+)")
+                if reg then e.region = reg end
                 local x, y, w, h = line:match("xy=(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+)")
                 local txt = line:match("txt=%[(.*)%]")
                 if txt then txt = txt:gsub("%%5B", "["):gsub("%%5D", "]") end
                 if cs then
                     if txt and txt ~= "" then e.label = txt end
+                    -- 【r27.18】click 主标签的桥接权威坐标（含 translation 的最终视觉位置）
+                    -- 与 gravity，供主标签像角标一样绝对定位，消除各主题推导差异。
+                    if x then e.clickX, e.clickY = tonumber(x), tonumber(y) end
+                    local cg = line:match("g=(%-?%d+)")
+                    if cg then e.clickG = tonumber(cg) end
                 elseif cr then
                     local d = line:match("d=(%a+)")
+                    local ch = line:match("ch=([%a_]+)")
                     if d and x then
                         e.corners[#e.corners + 1] = {
-                            grav = d, txt = txt or "",
+                            grav = d, chan = ch or "", txt = txt or "",
                             x = tonumber(x), y = tonumber(y),
                             w = tonumber(w) or 0, h = tonumber(h) or 0,
                         }
@@ -6620,11 +7142,35 @@ function parseKeyStructure(raw)
         end
     end
     if maxSeq <= 0 then return nil end
-    local out = {}
+    -- 【r27.5】按区域拆两组，各自按原始遍历顺序连续重编号：
+    -- makeKeyView 按 seq=1..N 对齐键盘 rows；若工具栏键混进来会让 seq 错位、角标串到键盘。
+    -- keys/n 仍是键盘组（消费端无需改），另附 toolbar/KEYBOARD 组供工具栏预览用。
+    local kbKeys, tbKeys, all = {}, {}, {}
     for i = 1, maxSeq do
-        out[i] = keys[i] or { label = nil, top = nil, bottom = nil, corners = {} }
+        local e = keys[i] or { label = nil, top = nil, bottom = nil, corners = {}, region = "KEYBOARD" }
+        all[i] = e
+        if e.region == "TOOLBAR" then
+            tbKeys[#tbKeys + 1] = e
+        else
+            kbKeys[#kbKeys + 1] = e
+        end
     end
-    return { keys = out, n = #out }
+    if #kbKeys == 0 then return nil end   -- 纯工具栏 dump 无键盘数据 → 让回退路径生效
+    -- 【r27.7】退化检测：真机 View 未 measure 时 box 宽高全 0，此时 KSCORNER 的
+    -- xy = getLeft(0) + translation，只有 offset、缺 gravity 布局位置；拿它当绝对
+    -- margins 会把所有角标整体错位。判定"全部键都未布局"= 退化 dump，交由调用方
+    -- 拒绝用其坏坐标覆盖上一份健康快照。
+    local laidOut = 0
+    for _, k in ipairs(kbKeys) do
+        if (k.bw or 0) > 0 and (k.bh or 0) > 0 then laidOut = laidOut + 1 end
+    end
+    return {
+        keys = kbKeys, n = #kbKeys,
+        keyboard = kbKeys, keyboardN = #kbKeys,
+        toolbar = tbKeys, toolbarN = #tbKeys,
+        all = all, allN = maxSeq,
+        degenerate = (laidOut == 0),
+    }
 end
 
 -- ===== 【权威文字源】把真机 root dump 解析成每个键实际显示的文字 =====
@@ -6752,12 +7298,18 @@ function parseRootDumpToKeys(raw)
         end
         keys[#keys + 1] = k
     end
-    return { keys = keys, n = #keys }
+    -- 【r27.7】退化检测（同结构化路径）：所有 rec 宽高都为 0 = 真机 View 未布局，
+    -- 此时锚点/@0,0 坐标全无意义，交由 applyLiveFromRaw 拒绝用其覆盖健康快照。
+    local laidOut = 0
+    for _, rr in ipairs(recs) do
+        if (rr.w or 0) > 0 and (rr.h or 0) > 0 then laidOut = laidOut + 1 end
+    end
+    return { keys = keys, n = #keys, degenerate = (laidOut == 0) }
 end
 
 -- 【真机文字源】统一入口：解析任意一段真机 root dump → 写全局缓存 → 重渲染预览。
 -- 真正刷新预览（此前只有延迟回调做解析，而它常常不执行，导致有 dump 无 LiveText）。
-function applyLiveFromRaw(raw)
+function applyLiveFromRaw(raw, noRender)
     local s = tostring(raw)
     -- 【r27】首选结构化段（Java 按 KeyView 树导出，方向/坐标/文本全是权威值）。
     local parsed = nil
@@ -6776,13 +7328,48 @@ function applyLiveFromRaw(raw)
         parsed = parseRootDumpToKeys(dumpPart)
     end
     if not parsed or parsed.n <= 0 then
-        liveKeyTexts, liveKeyTextsN = nil, 0
-        return nil
+        -- 【r27.6 根因修复】空 dump 绝不能再清空已经拿到的权威快照。
+        -- 真机键盘在收起动画 / 候选栏切换 / 服务重建瞬间，dumpKeyboardStructure
+        -- 会返回 ERR 或 n=0（root 暂时读不到完整的 KeyView 树）。旧代码在这里把
+        -- liveKeyTexts 清成 nil → 所有角标瞬间回退到 offset 推导 → 用户看到
+        -- "刚打开一瞬间正常，随后全部移动到错误位置，且再也不恢复"
+        -- （因为 _autoViewDiagDone 之后没有第二次成功 dump 能把数据填回来）。
+        -- 现在：一旦拿到过权威数据就一直保留，直到换键盘/主题由 loadKeyboard 主动失效。
+        -- 仅当从未成功过（liveKeyTexts 仍为 nil）才保持 nil，让启动重试逻辑继续。
+        return liveKeyTexts
+    end
+    -- 【r27.7 根因修复】退化 dump（真机 View 未 measure，box 宽高全 0）不覆盖健康快照。
+    -- 工具全屏时输入法键盘被遮挡，getLeft/getTop/宽高全 0，KSCORNER 只剩 translation、
+    -- 丢了 gravity 布局位置；用它当绝对坐标会让所有角标整体错位 —— 这正是
+    -- "刚打开正常（有布局）→ 随后全部移动（被遮挡后 dump 到 0x0）"的直接成因。
+    if parsed.degenerate and liveKeyTexts and not liveKeyTexts.degenerate then
+        return liveKeyTexts
+    end
+    -- 退化 dump 且无健康快照可用时：保留它的【文字】（比事件推导准），但清空角标坐标，
+    -- 让 makeKeyView 走 gravity+offset 推导（dump 的 x=getLeft(0)+translation 缺
+    -- gravity 布局位置，绝对定位必错；推导至少保留主题自己的 gravity/offset 语义）。
+    if parsed.degenerate then
+        for _, k in ipairs(parsed.keys or {}) do
+            for _, c in ipairs(k.corners or {}) do c.x, c.y = nil, nil end
+            k.clickX, k.clickY = nil, nil
+        end
     end
     -- 主标签匹配在 makeKeyView 内逐键兜底，这里不再要求键数严格相等
     -- （dump 含 0x0 占位锚点，旧版 w>0 过滤出 31 键 vs 预览 44 键而整体放弃）。
     liveKeyTexts, liveKeyTextsN = parsed, parsed.n
-    pcall(renderPreview)
+    -- 【r27.5】把区域拆分结果写进可见诊断：kb=键盘组 tb=工具栏组。
+    -- 下次 dump 看 [DIAG] KS kb=N tb=M，tb>0 即证明工具栏键已被单独分出、不再串进键盘。
+    _G.__ksDiag = string.format("n=%d kb=%d tb=%d corners=%d",
+        (parsed.allN or parsed.n), (parsed.keyboardN or parsed.n),
+        (parsed.toolbarN or 0), (function()
+            local c = 0
+            for _, k in ipairs(parsed.all or parsed.keys or {}) do c = c + #(k.corners or {}) end
+            return c
+        end)())
+    -- 【r27.41】noRender=true 时只填 liveKeyTexts、不触发重渲染。
+    -- 用于"首帧前同步采集"：数据先就位，随后由 loadKeyboard 统一渲染一次，
+    -- 消除旧逻辑"先静态渲染→dump 后再渲染"的二次渲染闪烁。
+    if not noRender then pcall(renderPreview) end
     return parsed
 end
 
@@ -6791,6 +7378,25 @@ end
 -- 若用 local 声明在此，渲染函数按 Lua 词法作用域只会看到全局 nil，永远读不到解析结果。
 liveKeyTexts = nil
 liveKeyTextsN = 0
+
+-- 【r27.41 单次渲染】首帧前同步采集权威快照（只填 liveKeyTexts，不输出诊断、不渲染）。
+-- 工具打开前真机键盘 View 已经渲染就绪，直接读 Java 桥接的结构化导出即可，
+-- 不必像旧逻辑那样"先静态渲染一帧 → postDelayed 200ms dump → 再渲染一帧"。
+-- 返回快照是否成功填入；失败保留 nil，让原逻辑的延迟兜底继续工作。
+function grabLiveSnapshotSync()
+    -- 只走结构化桥接：dumpKeyboardStructure 直接给每键权威文字/角标/坐标。
+    local okBind, Bridge = pcall(function()
+        return luajava.bindClass("com.osfans.trime.theme.ThemeDataBridge")
+    end)
+    if not okBind or not Bridge then return false end
+    local ksRaw = ""
+    if not pcall(function() ksRaw = Bridge.dumpKeyboardStructure() or "" end) then return false end
+    if ksRaw == "" then return false end
+    _G.__ksRaw = ksRaw
+    local parsed = applyLiveFromRaw(
+        "===== 结构化 =====\n" .. ksRaw .. "\n\n===== 工具自渲染 =====", true)
+    return parsed ~= nil
+end
 
 
 -- 【已删除·错误数据源】曾用 Java 反射从 TrimeService.getInstance() 取 mRootInputView → globals。
@@ -6853,8 +7459,9 @@ function parseKeyboardStatic(path)
             rowsLines[#rowsLines + 1] = n .. ": " .. (line:gsub("^%s+", ""))
         end
     end
-    -- 标量元数据（键盘名/键宽/键高/锁定），仅在字面量存在时取
-    out.name = src:match("name%s*=%s*[\"']([^\"']*)[\"']")
+    -- 标量元数据（键盘名/键宽/键高/锁定），仅在字面量存在时取；先去注释，避免注释里的示例 name= 被当真值
+    local metaSrc = stripLuaComments(src)
+    out.name = metaSrc:match("name%s*=%s*[\"']([^\"']*)[\"']")
     out.key_width = tonumber((src:match("key_width%s*=%s*(%d+%.?%d*)")))
     out.key_height = tonumber((src:match("key_height%s*=%s*(%d+%.?%d*)")))
     local short = path:match("([^/]+)$") or path
@@ -7001,9 +7608,10 @@ function parseThemeRootStatic(path, fallbackName)
     local out = {}
     out.name = fallbackName
     if not src then return out end
-    out.name = src:match("name%s*=%s*[\"']([^\"']*)[\"']") or fallbackName
-    out.style = src:match("style%s*=%s*[\"']([^\"']*)[\"']")
-    out.keyboard = src:match("keyboard%s*=%s*[\"']([^\"']*)[\"']")
+    local metaSrc = stripLuaComments(src)
+    out.name = metaSrc:match("name%s*=%s*[\"']([^\"']*)[\"']") or fallbackName
+    out.style = metaSrc:match("style%s*=%s*[\"']([^\"']*)[\"']")
+    out.keyboard = metaSrc:match("keyboard%s*=%s*[\"']([^\"']*)[\"']")
     -- get_keyboard(id, alphabet)：当前键盘的真正决策函数。不同主题实现不同，
     -- 唯一通用做法就是把它原样取出来、用真机同样的入参求值，而不是复刻分支。
     out.get_keyboard = extractThemeGetKeyboard(src, out)
@@ -7060,8 +7668,21 @@ function loadKeyboard(kbdFile, bridgeKbd, opts)
     local allowScript = opts.allowScript == true and opts.noScript ~= true
     local oldFile, oldEnv = currentKbdFile, kbdEnv   -- 解析失败时沿用同一键盘的旧布局
     clearOwnStyles()         -- 换键盘：单键专属样式绑在旧键盘行列上，一并作废
+    -- 【r27.6】换键盘时主动失效上一把键盘的权威快照。
+    -- 空 dump 不再清空快照（见 applyLiveFromRaw），所以换键盘必须由这里负责失效，
+    -- 否则新键盘的 seq 会串用旧键盘的 dumpX/dumpY/文字，角标照样错位。
+    -- loadTheme 也调用本函数，换主题一并失效。
+    liveKeyTexts, liveKeyTextsN = nil, 0
+    -- 【r27.41 单次渲染】首帧渲染前同步采集真机权威快照：工具打开前真机键盘 View
+    -- 已渲染就绪，直接读 Java 桥接结构化导出（只填数据、不渲染）。这样下面两条
+    -- 路径的首帧 renderPreview 都能一次成型用上桥接文字，不再"先静态→dump→再渲染"。
+    -- 采集失败保留 nil，仍由文件尾部的延迟 dump 兜底，不影响老降级路径。
+    pcall(grabLiveSnapshotSync)
     liveTextsDisabled = false -- 重新加载键盘 = 全新未编辑状态，恢复真机文字快照显示
     liveTextsDisabledKeys = {} -- 清空逐键停用集合：换键盘后所有键恢复真机文字快照
+    -- 换键盘后必须重新 dump 才能把权威快照填回；否则门控会让 dump 永远只跑一次，
+    -- 快照被清空后再无机会恢复 → 角标永久回退 offset 推导（错位）。
+    _autoViewDiagDone = false
     _fontCache = {}          -- 换主题/键盘后字体可能不同，清空缓存让首次渲染重读一次
     tfCache = {}             -- Typeface 也按路径缓存，换主题后旧路径可能已被删/替换
     _iconFont, _iconFontTried = nil, false  -- 图标字体兜底同样要重新找
@@ -7077,7 +7698,7 @@ function loadKeyboard(kbdFile, bridgeKbd, opts)
         kbdEdits, kbdOps = {}, {}
         selKeyR, selKeyK = nil, nil
         sandboxLastError = nil
-        btnKbd.setText("键盘：" .. ((kbdEnv and kbdEnv.name) or kbdFile:gsub("%.lua$", "")))
+        stKbd = "键盘：" .. ((kbdEnv and kbdEnv.name) or kbdFile:gsub("%.lua$", "")); refreshStatus()
         renderPreview()
         return
     end
@@ -7162,21 +7783,31 @@ function loadKeyboard(kbdFile, bridgeKbd, opts)
     sandboxLastError = nil
     kbdEdits, kbdOps = {}, {}
     selKeyR, selKeyK = nil, nil
-    btnKbd.setText("键盘：" .. ((kbdEnv and kbdEnv.name) or kbdFile:gsub("%.lua$", "")))
+    stKbd = "键盘：" .. ((kbdEnv and kbdEnv.name) or kbdFile:gsub("%.lua$", "")); refreshStatus()
     renderPreview()
-    -- 延迟 1.5s 等真机键盘 View 渲染就绪；只跑一次，避免反复切换键盘重复输出。
-    if not _autoViewDiagDone then
-        _autoViewDiagDone = true
-        uiHandler.postDelayed(function()
-            local okr, r = pcall(dumpKbViewTexts)
-            if not okr then r = "dumpKbViewTexts 异常：" .. tostring(r) end
-            -- 【真机文字源】从 dump 解析每个键的实际显示文字并缓存；解析成功则重渲染，
-            -- 让预览主/角标文字直接采用真机结果（L/Z 上标、g 键 ▼ 等不再靠事件推导）。
-            -- 统一走 applyLiveFromRaw：键数严格相等门控已移除，改由 makeKeyView 逐键
-            -- 用主标签匹配兜底，避免 0x0 占位键导致整体放弃。
-            pcall(applyLiveFromRaw, r)
-        end, 1500)
+    -- 【r27.6】每次加载键盘都重新 dump（换键盘后快照被清空，必须重新填回）。
+    -- 延迟 1.5s 等真机键盘 View 渲染就绪；空 dump（键盘动画/收起瞬间）时有限重试，
+    -- 确保权威快照最终一定能填上，否则角标会永久回退 offset 推导（错位）。
+    _autoViewDiagDone = true
+    -- 【r27.41 单次渲染】首帧前已同步采集到权威快照 → 这段 1.5s 的 dump 完全跳过：
+    -- 它内部的 dumpKbViewTexts + applyLiveFromRaw 会再触发一次全量渲染，是二次渲染的
+    -- 元凶之一。只有同步采集失败（真机 View 当时还没就绪、快照仍为 nil）才保留原重试。
+    if liveKeyTexts ~= nil then return end
+    local dumpTry = { 0 }
+    local function grabLiveSnapshot()
+        dumpTry[1] = dumpTry[1] + 1
+        local okr, r = pcall(dumpKbViewTexts)
+        if not okr then r = "dumpKbViewTexts 异常：" .. tostring(r) end
+        local okp, parsed = pcall(applyLiveFromRaw, r)
+        -- applyLiveFromRaw 成功时返回 parsed 表；空 dump 返回 nil（保留旧快照）。
+        -- 首次拿不到（liveKeyTexts 仍为 nil）就再试两次，间隔递减。
+        if not okp or parsed == nil or liveKeyTexts == nil then
+            if dumpTry[1] < 4 then
+                uiHandler.postDelayed(grabLiveSnapshot, 700)
+            end
+        end
     end
+    uiHandler.postDelayed(grabLiveSnapshot, 1500)
 end
 
 function loadVariant(variant, bridgeStyle)
@@ -7231,7 +7862,7 @@ function loadVariant(variant, bridgeStyle)
     end
     styleEdits = {}
     if not styleEnv then toast("配色加载失败：" .. variant) return end
-    btnVariant.setText("配色：" .. variant)
+    stVariant = "配色：" .. variant; refreshStatus()
     if sandboxLastError then
         logErr("样式加载", sandboxLastError)
         sandboxLastError = nil
@@ -7301,7 +7932,7 @@ function loadTheme(name)
     dirtyCount = 0
     refreshDirty()
     if not themeEnv then toast("主题加载失败：" .. name) return end
-    btnTheme.setText("主题：" .. (themeEnv.name or name))
+    stTheme = "主题：" .. (themeEnv.name or name); refreshStatus()
 
     local variants = listVariants(name)
     -- 真机当前配色（用户实际选中的，含日夜模式）优先；找不到才退回主题默认值 / 第一个
@@ -7332,10 +7963,7 @@ function loadTheme(name)
     -- 桥接键盘 = 输入法当前真实键盘（36 键等），无条件优先，不再被 activeFile 判断架空。
     -- 旧逻辑里 activeFile 一旦判成 qwerty27，就把桥接的 36 键丢掉 → 数字键行列错位。
     local bKbd = nil
-    if ignoreBridgeKbd then
-        kbdSelectReason = (kbdSelectReason and (kbdSelectReason .. "；") or "")
-            .. "已手动忽略桥接键盘"
-    elseif bridgeUsable and type(bridgeData.keyboard) == "table" and keyboardRowsOK(bridgeData.keyboard) then
+    if bridgeUsable and type(bridgeData.keyboard) == "table" and keyboardRowsOK(bridgeData.keyboard) then
         bKbd = bridgeData.keyboard
     elseif bridgeUsable then
         -- 桥接可用却没拿到键位：以前是静默退回解析脚本文件，然后键盘悄悄换了样子。
@@ -7389,30 +8017,10 @@ function loadTheme(name)
         end
     end
     if #kbds > 0 then loadKeyboard(kbdFileToLoad, bKbd, { noScript = kbdNoScript })
-    else kbdEnv = nil; btnKbd.setText("选择键盘"); renderPreview() end
+    else kbdEnv = nil; stKbd = "键盘：当前"; refreshStatus(); renderPreview() end
 end
 
 -- ========== 按钮绑定 ==========
-btnTheme.onClick = function()
-    local themes = listThemes()
-    if #themes == 0 then toast("未找到主题") return end
-    listDialog("选择主题", themes, function(n) loadTheme(n) end)
-end
-btnVariant.onClick = function()
-    if not currentTheme then toast("请先选择主题") return end
-    local variants = listVariants(currentTheme)
-    if #variants == 0 then variants = {"（主题 main.lua 内嵌样式）"} end
-    listDialog("选择配色", variants, function(v) loadVariant(v) end)
-end
-btnKbd.onClick = function()
-    if not currentTheme then toast("请先选择主题") return end
-    local kbds = listKeyboards(currentTheme)
-    if #kbds == 0 then toast("该主题没有 keyboards 目录") return end
-    -- 手动选键盘：允许脚本求值（动态 rows 只有跑脚本才拿得到）。
-    -- 启动/切主题绝不允许，那会在主线程上执行任意键盘脚本。
-    listDialog("选择键盘", kbds, function(f) loadKeyboard(f, nil, { allowScript = true }) end)
-end
-btnSettings.onClick = function() kbdSettingsDialog() end
 btnReset.onClick = function()
     if currentTheme then loadTheme(currentTheme) toast("已放弃修改，重新载入") end
 end
@@ -7421,274 +8029,88 @@ btnExport.onClick = function()
     if not ok then logErr("保存", e); toast("保存出错：" .. tostring(e)) end
 end
 
--- 【修复 36 键】Config.getKeyboard(x) 是"键不存在就按主题脚本求值并回写"的接口。
--- 工具进程里主题 VM 状态不全，求值会落到 default 主题的 qwerty36，
--- 一旦写进偏好，工具每次启动都读回 36 键（真机读的是另一个 schema 键，所以真机反而正常）。
--- 这里把值为 qwerty36 的键盘缓存键清掉，让真机按主题脚本重新求值。
--- 不按主题前缀过滤：工具进程的 Config.getTheme() 可能返回 default，按前缀过滤会漏掉真正的键。
-function clearKeyboardPrefCache()
-    local theme = nil
-    local okT, t = pcall(function() return Config.getTheme() end)
-    if okT and t and tostring(t) ~= "" then theme = tostring(t) end
-    local lines, n, seen = {}, 0, 0
+-- 读取当前输入法默认偏好的所有项，返回 { {key=..., val=...}, ... }（按 key 排序）
+function listInputPrefs()
+    local out = {}
     local ok, err = pcall(function()
         local PM = luajava.bindClass("android.preference.PreferenceManager")
         local sp = PM.getDefaultSharedPreferences(activity)
         local all = sp.getAll()
-        local ed = sp.edit()
-        local arr = all.keySet().toArray()
-        for i = 0, #arr - 1 do
-            local k = tostring(arr[i])
-            if k:match("_keyboard$") then
-                seen = seen + 1
-                local v = tostring(all.get(k))
-                if v == "qwerty36" or v == "" then
-                    -- 空值同样是脏数据：工具进程求值失败时 Config.getKeyboard 会写空串，
-                    -- 之后每次读都是空，谁也不知道真机用的是哪个键盘。
-                    ed.remove(k); n = n + 1
-                    lines[#lines + 1] = "删除  " .. k .. " = " .. (v == "" and "（空）" or v)
-                else
-                    lines[#lines + 1] = "保留  " .. k .. " = " .. v
-                end
+        local keys = all.keySet().toArray()
+        for i = 0, #keys - 1 do
+            local k = tostring(keys[i])
+            local v = all.get(k)
+            local sv
+            if v == nil then sv = "nil"
+            else
+                local okS, str = pcall(tostring, v)
+                sv = okS and str or ("<" .. tostring(type(v)) .. ">")
             end
+            out[#out + 1] = { key = k, val = sv }
         end
-        ed.apply()
     end)
-    if not ok then return "清除失败：" .. tostring(err) end
-    if #lines == 0 then lines[1] = "（偏好里没有任何 *_keyboard 键）" end
-    table.insert(lines, 1, "当前主题：" .. tostring(theme) .. "；扫描 " .. seen .. " 个 *_keyboard 键")
-    table.insert(lines, 1, n > 0
-        and ("已清除 " .. n .. " 个脏缓存键（qwerty36 或空值）。重启输入法（或切换一次主题）后生效。")
-        or "没有发现 qwerty36 或空值缓存键，当前记录的键盘不受此问题影响。")
-    return table.concat(lines, "\n")
+    if not ok then return nil, tostring(err) end
+    table.sort(out, function(a, b) return a.key < b.key end)
+    return out
 end
 
--- 诊断：当前键盘到底记在哪。把主题名、schema、内存显示名、命中的偏好键、
--- 同名候选、以及全部 keyboard 相关偏好项一次摊开，避免再靠猜。
-function dumpKeyboardPrefs()
-    local L = {}
-    local okT, t = pcall(function() return Config.getTheme() end)
-    L[#L + 1] = "Config.getTheme() = " .. tostring(okT and t or "读取失败")
-    L[#L + 1] = "select_schema_id = " .. tostring(readPref("select_schema_id", ""))
-    -- 输入法设置里的键盘选项：auto / 空 = 跟随主题；其它值 = 显式指定（源码 get_keyboard 的 id）
-    L[#L + 1] = "输入法设置 keyboard = " .. tostring(readPref("keyboard", ""))
-    L[#L + 1] = "判定依据 = " .. tostring(kbdSelectReason)
-    local mt = (bridgeData and type(bridgeData.meta) == "table") and bridgeData.meta or {}
-    -- 当前键盘的三个权威值：文件标识 / 求解来源 / 求值参数
-    L[#L + 1] = "桥接求得键盘文件 = " .. tostring(mt.keyboard_file)
-    L[#L + 1] = "求值来源 = " .. tostring(mt.keyboard_file_source)
-    L[#L + 1] = "方案 alphabet = " .. tostring(mt.alphabet)
-    -- 工具本地按同一入参再算一次，便于与桥接结果对照（两者应一致）
-    do
-        local gk = themeEnv and themeEnv.get_keyboard
-        if type(gk) == "function" then
-            local setK = tostring(readPref("keyboard", ""))
-            if setK == "auto" then setK = "" end
-            local alpha = detectAlphabet()
-            local okG, ret = pcall(gk, setK, alpha)
-            L[#L + 1] = "本地 get_keyboard(\"" .. setK .. "\", alphabet) = "
-                .. (okG and tostring(ret) or ("调用失败：" .. tostring(ret)))
-        else
-            L[#L + 1] = "本地 get_keyboard = 主题根里未找到该函数（将退回声明/偏好判定）"
-        end
-    end
-    L[#L + 1] = "内存键盘 name = " .. tostring(mt.keyboard)
-    L[#L + 1] = "桥接键盘来源 = " .. tostring(mt.keyboard_source)
-    -- 桥接内部自相矛盾时点明：内存里的键盘 ≠ 主题求得的那份。
-    -- 这是「切回默认键盘后工具里还是上个键盘」的直接证据。
-    do
-        local mname = tostring(mt.keyboard or "")
-        local mfile = tostring(mt.keyboard_file or "")
-        if mname ~= "" and mfile ~= "" and not kbdFileMatchesDisplay(mfile, mname) then
-            L[#L + 1] = "⚠ 不一致：输入法内存=" .. mname .. "，当前应为=" .. mfile
-                .. "（内存滞后；已优先改用该文件静态解析，解析失败才沿用内存键位，全程不执行脚本）"
-        end
-    end
-    L[#L + 1] = "桥接键位行数 = " .. tostring(mt.kbd_rows) .. "，键数 " .. tostring(mt.kbd_keys)
-    L[#L + 1] = "桥接键盘目录 = " .. tostring(mt.keyboard_dir)
-    L[#L + 1] = "InputView 相关 API = " .. tostring(mt.inputview_api)
-    L[#L + 1] = "Config 相关 API = " .. tostring(mt.config_api)
-    L[#L + 1] = "主题根 keyboard= 声明 = " .. tostring(mt.theme_kbd_decl)
-    L[#L + 1] = "偏好 keyboard_id = " .. tostring(mt.keyboard_id)
-    L[#L + 1] = "命中的偏好键 = " .. tostring(mt.keyboard_pref)
-    L[#L + 1] = "当前文件 = " .. tostring(currentKbdFile)
-    L[#L + 1] = "工具主题目录 = " .. tostring(themeDir)
-    local bk = bridgeData and bridgeData.keyboard
-    if type(bk) == "table" and keyboardRowsOK(bk) then
-        local per = {}
-        for i = 1, rowsCount(bk.rows) do
-            local r = bk.rows[i]
-            if type(r) == "table" and type(r.keys) == "table" then per[#per + 1] = #r.keys end
-        end
-        L[#L + 1] = "桥接键盘可用 = 是，每行键数 " .. table.concat(per, "/")
-    else
-        L[#L + 1] = "桥接键盘可用 = 否（rows 缺失或为空，预览只能退回解析脚本文件）"
-    end
-    local cands = findKbdCandidates(tostring(mt.keyboard or ""))
-    L[#L + 1] = "同名候选 = " .. (#cands > 0 and table.concat(cands, ", ") or "（无）")
-    -- 主题目录下的键盘文件清单：同名候选对不上时，一眼看出是缺文件还是 name 不同
-    if themeDir then
-        local okL, files = pcall(listDir, themeDir .. "/keyboards")
-        if okL and type(files) == "table" then
-            local items = {}
-            for _, fn in ipairs(files) do
-                if type(fn) == "string" and fn:match("%.lua$") then
-                    local body = readFile(themeDir .. "/keyboards/" .. fn)
-                    local nm = body and (body:match('name%s*=%s*"([^"]*)"') or body:match("name%s*=%s*'([^']*)'"))
-                    items[#items + 1] = fn .. "（name=" .. tostring(nm or "?") .. "）"
-                end
-            end
-            L[#L + 1] = "---- 主题目录 keyboards/（" .. #items .. " 个文件）----"
-            if #items == 0 then L[#L + 1] = "（空目录）" end
-            for _, it in ipairs(items) do L[#L + 1] = it end
-        else
-            L[#L + 1] = "---- 主题目录 keyboards/ 读取失败 ----"
-        end
-    end
-    L[#L + 1] = "---- 全部 keyboard 相关偏好 ----"
+-- 删除单项偏好（重启输入法后生效）
+function deleteInputPref(key)
     local ok, err = pcall(function()
         local PM = luajava.bindClass("android.preference.PreferenceManager")
-        local all = PM.getDefaultSharedPreferences(activity).getAll()
-        local arr = all.keySet().toArray()
-        local n = 0
-        for i = 0, #arr - 1 do
-            local k = tostring(arr[i])
-            if k:lower():find("keyboard", 1, true) then
-                n = n + 1
-                L[#L + 1] = k .. " = " .. tostring(all.get(k))
-            end
-        end
-        if n == 0 then L[#L + 1] = "（没有键名含 keyboard 的项）" end
+        local sp = PM.getDefaultSharedPreferences(activity)
+        sp.edit().remove(key).apply()
     end)
-    if not ok then L[#L + 1] = "枚举失败：" .. tostring(err) end
-    return table.concat(L, "\n")
+    if not ok then return false, tostring(err) end
+    return true
 end
 
--- 诊断：把本应用所有 SharedPreferences 文件（不只是默认那一个）的键值全部列出来。
--- 目的：不用再靠猜"键盘到底记在哪"——哪个文件、哪个键、什么值，一次看全。
--- 每项值截断到 200 字符，总条目上限 800，避免某个超大数据表把弹窗撑爆。
-function dumpAllPrefs()
-    local L, total, CAP = {}, 0, 800
-    local ok, err = pcall(function()
-        local ctx = activity
-        local dir = ctx.getFilesDir().getParentFile().getAbsolutePath() .. "/shared_prefs"
-        local File = luajava.bindClass("java.io.File")
-        local d = File(dir)
-        local names = {}
-        if d.exists() then
-            local fs = d.listFiles()
-            if fs then
-                for i = 0, #fs - 1 do
-                    local n = fs[i].getName()
-                    if n:match("%.xml$") then names[#names + 1] = (n:gsub("%.xml$", "")) end
-                end
-            end
-        end
-        table.sort(names)
-        L[#L + 1] = "目录：" .. dir
-        L[#L + 1] = "文件 " .. #names .. " 个：" .. table.concat(names, ", ")
-        for _, nm in ipairs(names) do
-            local sp = ctx.getSharedPreferences(nm, 0)
-            local all = sp.getAll()
-            local keys = all.keySet().toArray()
-            local list = {}
-            for i = 0, #keys - 1 do list[#list + 1] = tostring(keys[i]) end
-            table.sort(list)
-            L[#L + 1] = ""
-            L[#L + 1] = "==== " .. nm .. "（" .. #list .. " 项）===="
-            for _, k in ipairs(list) do
-                if total >= CAP then L[#L + 1] = "…（已达 " .. CAP .. " 条上限，其余省略）" break end
-                total = total + 1
-                local v = all.get(k)
-                local s
-                if v == nil then s = "nil"
-                else
-                    local okS, str = pcall(tostring, v)
-                    s = okS and str or ("<" .. tostring(type(v)) .. ">")
-                end
-                if #s > 200 then s = s:sub(1, 200) .. "…(" .. #s .. " 字符)" end
-                L[#L + 1] = k .. " = " .. s
-            end
-        end
-    end)
-    if not ok then L[#L + 1] = "枚举失败：" .. tostring(err) end
-    return table.concat(L, "\n")
+-- 弹出偏好列表，选择单项删除；删除或返回后重新弹出以刷新
+function deletePrefDialog()
+    local items, err = listInputPrefs()
+    if not items then toast("读取偏好失败：" .. tostring(err)); return end
+    if #items == 0 then toast("当前无偏好项"); return end
+    listDialog("删除单项偏好（共 " .. #items .. " 项）", items, function(sel)
+        local dlg = LuaDialog(activity)
+        dlg.setTitle("删除偏好项")
+        local tv = TextView(activity)
+        local sv = sel.val or ""
+        if #sv > 240 then sv = sv:sub(1, 240) .. "…" end
+        tv.setText("键：" .. sel.key .. "\n值：" .. sv .. "\n\n删除后重启输入法生效。确定删除这一项吗？")
+        tv.setTextSize(12); tv.setPadding(dp(14), dp(12), dp(14), dp(12))
+        dlg.setView(tv)
+        dlg.setButton("确认删除", function()
+            dlg.dismiss()
+            local ok, e = deleteInputPref(sel.key)
+            if not ok then toast("删除失败：" .. tostring(e)) else toast("已删除：" .. sel.key) end
+            deletePrefDialog()
+        end)
+        dlg.setButton2("返回列表", function() dlg.dismiss(); deletePrefDialog() end)
+        dlg.setButton3("退出", function() dlg.dismiss() end)
+        dlg.show()
+    end, {
+        label = function(it)
+            local sv = it.val or ""
+            if #sv > 56 then sv = sv:sub(1, 56) .. "…" end
+            return it.key .. " = " .. sv
+        end,
+    })
 end
 
 btnView.onClick = function()
     listDialog("视图/诊断", {
-        "读取真机键盘View显示文本（诊断）",
-        "诊断：键盘来源与偏好",
-        "列出全部共享数据（SharedPreferences）",
-        ignoreBridgeKbd and "恢复使用桥接键盘" or "忽略桥接键盘，按主题声明重载（验证）",
+        "删除单项偏好（当前偏好）",
         "显示/隐藏 候选栏",
-        "查看改动清单（" .. dirtyCount .. "）",
         "查看报错（" .. #errLog .. "）",
-        "清除键盘缓存（修复 36 键）",
         "复制报错",
     }, function(c)
-        if c:find("真机键盘View") then
-            local okd, result = pcall(dumpKbViewTexts)
-            if not okd then result = "诊断函数异常：" .. tostring(result) end
-            local dlg = LuaDialog(activity)
-            dlg.setTitle("真机键盘View显示文本")
-            local sv = ScrollView(activity); sv.setLayoutParams(LinearLayout.LayoutParams(-1, dp(360)))
-            local tv = TextView(activity)
-            tv.setText(result); tv.setTextSize(10); tv.setTextIsSelectable(true)
-            tv.setPadding(dp(10), dp(10), dp(10), dp(10))
-            sv.addView(tv); dlg.setView(sv)
-            dlg.setButton("关闭", function() dlg.dismiss() end)
-            dlg.show()
-        elseif c:find("诊断：键盘来源") then
-            local okd, result = pcall(dumpKeyboardPrefs)
-            if not okd then result = "诊断函数异常：" .. tostring(result) end
-            local dlg = LuaDialog(activity)
-            dlg.setTitle("键盘来源诊断")
-            local sv = ScrollView(activity); sv.setLayoutParams(LinearLayout.LayoutParams(-1, dp(380)))
-            local tv = TextView(activity)
-            tv.setText(result); tv.setTextSize(10); tv.setTextIsSelectable(true)
-            tv.setPadding(dp(10), dp(10), dp(10), dp(10))
-            sv.addView(tv); dlg.setView(sv)
-            dlg.setButton("关闭", function() dlg.dismiss() end)
-            dlg.show()
-        elseif c:find("全部共享数据") then
-            local okd, result = pcall(dumpAllPrefs)
-            if not okd then result = "诊断函数异常：" .. tostring(result) end
-            local dlg = LuaDialog(activity)
-            dlg.setTitle("全部共享数据")
-            local sv = ScrollView(activity); sv.setLayoutParams(LinearLayout.LayoutParams(-1, dp(440)))
-            local tv = TextView(activity)
-            tv.setText(result); tv.setTextSize(9); tv.setTextIsSelectable(true)
-            tv.setPadding(dp(8), dp(8), dp(8), dp(8))
-            sv.addView(tv); dlg.setView(sv)
-            dlg.setButton("复制并关闭", function()
-                copyText(result); dlg.dismiss(); toast("已复制全部共享数据")
-            end)
-            dlg.show()
-        elseif c:find("忽略桥接键盘") or c:find("恢复使用桥接键盘") then
-            ignoreBridgeKbd = not ignoreBridgeKbd
-            if currentTheme then loadTheme(currentTheme) end
-            toast(ignoreBridgeKbd and "已忽略桥接键盘：按主题声明/文件判定"
-                or "已恢复使用桥接键盘")
+        if c:find("删除单项偏好") then
+            local okd, e = pcall(deletePrefDialog)
+            if not okd then toast("打开列表失败：" .. tostring(e)) end
         elseif c:find("候选栏") then
             showCandidateFlag = not showCandidateFlag
             renderPreview()
             toast(showCandidateFlag and "已显示候选栏" or "已隐藏候选栏")
-        elseif c:find("改动清单") then
-            local lines = {}
-            for p, v in pairs(styleEdits) do table.insert(lines, "样式 " .. luaPath(p) .. " = " .. (v == "\255UNSET\255" and "nil" or tostring(v))) end
-            for p, v in pairs(kbdEdits) do table.insert(lines, "键盘 " .. luaPath(p) .. " = " .. (v == "\255UNSET\255" and "删除" or tostring(v))) end
-            for _, op in ipairs(kbdOps) do table.insert(lines, "结构 " .. tostring(opToLua(op))) end
-            table.sort(lines)
-            local dlg = LuaDialog(activity)
-            dlg.setTitle("改动清单")
-            local sv = ScrollView(activity); sv.setLayoutParams(LinearLayout.LayoutParams(-1, dp(320)))
-            local tv = TextView(activity)
-            tv.setText(#lines > 0 and table.concat(lines, "\n") or "（无改动）")
-            tv.setTextSize(11); tv.setTextIsSelectable(true); tv.setPadding(dp(10), dp(10), dp(10), dp(10))
-            sv.addView(tv); dlg.setView(sv)
-            dlg.setButton("关闭", function() dlg.dismiss() end)
-            dlg.show()
         elseif c:find("查看报错") then
             local dlg = LuaDialog(activity)
             dlg.setTitle("报错记录")
@@ -7754,17 +8176,6 @@ btnView.onClick = function()
             sv.addView(tv); dlg.setView(sv)
             dlg.setButton("关闭", function() dlg.dismiss() end)
             dlg.show()
-        elseif c:find("清除键盘缓存") then
-            local okc, r = pcall(clearKeyboardPrefCache)
-            if not okc then r = "执行异常：" .. tostring(r) end
-            local dlg = LuaDialog(activity)
-            dlg.setTitle("清除键盘缓存")
-            local tv = TextView(activity)
-            tv.setText(r); tv.setTextSize(11); tv.setTextIsSelectable(true)
-            tv.setPadding(dp(14), dp(12), dp(14), dp(12))
-            dlg.setView(tv)
-            dlg.setButton("关闭", function() dlg.dismiss() end)
-            dlg.show()
         elseif c:find("复制报错") then
             copyText(#errLog > 0 and table.concat(errLog, "\n") or "（暂无报错）")
         end
@@ -7802,75 +8213,29 @@ end
 local okBoot, bootErr = pcall(safeBoot)
 if not okBoot then logErr("启动", bootErr) end
 
--- 【启动减负】读真机键盘 View 的文字，改为首帧之后再读。
--- 顶层代码在 LuaActivity 还没完成首次布局时执行，此时同步遍历输入法整棵 View 树
--- （最多 600 个节点，每个节点多次 JNI 取 getText/getWidth…）会把主线程占住几百毫秒，
--- 首屏白屏、严重时 ANR —— 而 ANR 的后果是【同进程的输入法一起被系统杀掉】。
--- 放到 postDelayed 后，界面先出来，这次遍历只是补一次文字源；失败也不影响可用性。
-local function dumpLiveTexts()
-    local okr, r = pcall(dumpKbViewTexts)
-    if not okr then
-        logErr("View文本", "dumpKbViewTexts 异常：" .. tostring(r))
-        return false
-    end
-    -- 按行拆成多条，避免单条过长被面板截断。
-    -- 旧版全串只取前 40 行，而真机 root 一棵树轻松超 40 行 → 工具自渲染那半边
-    -- ([TOOL]) 永远打不出来，用户没法对照「真机 vs 工具」定位位置/角标差异。
-    -- 改为按「真机 / 工具」两段各自限额打印，两边都能看到。
-    local s = tostring(r)
-    local a = s:find("===== 真机 root =====", 1, true)
-    local b = s:find("===== 工具自渲染 =====", 1, true)
-    local realPart = (a and b and b > a) and s:sub(a, b - 1) or s
-    local toolPart = (a and b and b > a) and s:sub(b) or ""
-    -- 【r25.1 诊断】真机段会被工具段 151 行刷屏顶掉，用户看不到。把桥接返回的
-    -- 关键摘要提取到全局，塞进 [DIAG]（在工具段末尾、用户可见），一次定死桥接状态：
-    -- 有 ERR=桥接调用失败；ROOT=桥接通了；KB=n=读到几个键盘 TextView。
-    do
-        local _, _, errLine = realPart:find("(ERR:%s*[^\r\n]+)")
-        local _, _, rootLine = realPart:find("(ROOT:%s*[^\r\n]+)")
-        local kb, tv = 0, 0
-        for _ in realPart:gmatch("%[KEYBOARD%]") do kb = kb + 1 end
-        for _ in realPart:gmatch("[Tt]extView@") do tv = tv + 1 end
-        _G.__bridgeDiag = string.format("ERR=[%s] ROOT=[%s] kb=%d tv=%d len=%d",
-            tostring(errLine or ""), tostring(rootLine or ""), kb, tv, #realPart)
-    end
-    local function emit(part, tag, cap)
-        local n = 0
-        for line in part:gmatch("[^\n]+") do
-            n = n + 1
-            if n <= cap then logErr("View文本", tag .. line) end
-        end
-        if n > cap then
-            logErr("View文本", tag .. string.format("...（已省略 %d 行，仅显示前 %d 行）", n - cap, cap))
-        end
-    end
-    -- 【r25.1】桥接摘要单独 emit，放在真机段最前面。即使真机段/工具段被面板
-    -- 折叠，这一行在最前，一定能看到桥接到底有没有拿到真机 view。
-    logErr("View文本", "[真机] BRIDGE " .. tostring(_G.__bridgeDiag or "nil"))
-    emit(realPart, "[真机] ", 120)
-    -- 工具段提到 200 行：40 个 [CORNER] + 主标签 + [DIAG] 共约 151 行，
-    -- 旧 cap=120 会把末尾的 [DIAG]/BRIDGE 摘要截掉，用户正好看不到诊断。
-    if toolPart ~= "" then emit(toolPart, "[工具] ", 200) end
-    -- 【r26.1】真机 KEYBOARD 区前 24 行原文，最后 emit → 倒序视图里排最上面，必可见。
-    -- 这是解析规则的唯一依据：真实缩进/层级/坐标一眼定死。
-    local sample = _G.__realKbSample or {}
-    for i = 1, #sample do
-        logErr("View文本", "[REAL] " .. sample[i])
-    end
-    if #sample > 0 then
-        logErr("View文本", string.format("[REAL] ---- sample %d lines (kb=%s) ----",
-            #sample, tostring(_G.__bridgeDiag or "?")))
-    end
-    -- 【真机文字源】解析出每键真实文字后重渲染
-    pcall(applyLiveFromRaw, r)
-    return liveKeyTexts ~= nil
+-- ========== 启动自检：轻量状态日志（零 JNI，不阻塞主线程） ==========
+-- 【r27.44 提速】旧逻辑在首帧后 200ms 无条件跑一次 dumpKbViewTexts：它会经 JNI
+-- 遍历真机整棵 View 树（最多 600 节点 × 多次 getXxx）、强制 measure/layout、
+-- 再打印 200+ 行诊断日志。首帧已同步采集到权威快照，这次 dump 对功能零贡献，
+-- 却每次打开工具都占住主线程几百毫秒（卡顿/ANR 风险）。现改为：正常路径只从
+-- 内存打一行状态日志；完整 View 树 dump 保留在「视图/诊断」菜单里按需触发。
+local function emitBootStatus()
+    local sd = _G.__kbdDiag or {}
+    logErr("View文本", "[STRUCT] VER=r27.49 数据源=桥接同步快照(单次渲染) 显图=后缀判断 背景=贴合内容块 编辑面板=分类按钮")
+    logErr("View文本", string.format(
+        "[STRUCT] [SRC] 内容=全桥接(ltHit=%d/rendered=%d 角标XY=%d 工具栏tb=%d) 脚本内部名仅越界兜底=%d 皮肤=主题(桥接无样式字段)",
+        sd.ltHit or 0, sd.rendered or 0, sd.cornerWithXY or 0,
+        (liveKeyTexts and liveKeyTexts.toolbarN) or 0, sd.scriptMasked or 0))
 end
-pcall(function()
-    uiHandler.postDelayed(function()
-        -- 第一次没解析出来（键盘还没画完/服务未就绪）再补一次，不无限重试
-        if not dumpLiveTexts() then
-            uiHandler.postDelayed(dumpLiveTexts, 1200)
-        end
-    end, 200)
-end)
+pcall(emitBootStatus)
+-- 仅当同步采集失败（真机 View 首帧未就绪）才延迟兜底一次，确保角标不回退推导。
+if liveKeyTexts == nil then
+    pcall(function()
+        uiHandler.postDelayed(function()
+            if liveKeyTexts ~= nil then return end
+            local ok, r = pcall(dumpKbViewTexts)
+            if ok then pcall(applyLiveFromRaw, r) end
+        end, 600)
+    end)
+end
 
