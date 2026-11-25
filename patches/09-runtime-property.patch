@@ -1,0 +1,108 @@
+diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/core/RimeApi.java b/app/src/main/java/com/osfans/trime/core/RimeApi.java
+--- a/app/src/main/java/com/osfans/trime/core/RimeApi.java	2026-11-03 10:28:35.000000000 +0800
++++ b/app/src/main/java/com/osfans/trime/core/RimeApi.java	2026-11-17 02:22:48.596850818 +0800
+@@ -113,6 +113,19 @@
+ 
+     boolean getRuntimeOption(String option);
+ 
++    /**
++     * 写入一个字符串属性（property）。
++     * 与 librime-lua 的 context:set_property(prop, value) 读写的是同一份存储，
++     * 可用于 Java 层与 Lua 脚本之间传递任意字符串数据。
++     */
++    void setProperty(String prop, String value);
++
++    /**
++     * 读取一个字符串属性；不存在时返回空字符串。
++     * 对应 librime-lua 的 context:get_property(prop)。
++     */
++    String getProperty(String prop);
++
+     CandidateItem[] getCandidates(
+             int startIndex,
+             int limit
+diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/core/Rime.java b/app/src/main/java/com/osfans/trime/core/Rime.java
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java	2026-11-03 10:28:35.000000000 +0800
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java	2026-11-17 02:22:34.391907422 +0800
+@@ -429,6 +429,19 @@
+     }
+ 
+     @Override
++    public void setProperty(String prop, String value) {
++        withRimeContext((Callable<String>) () -> {
++            setRimeProperty(prop, value);
++            return null;
++        });
++    }
++
++    @Override
++    public String getProperty(String prop) {
++        return withRimeContext(() -> getRimeProperty(prop));
++    }
++
++    @Override
+     public CandidateItem[] getCandidates(int startIndex, int limit) {
+         return withRimeContext(() -> getRimeCandidates(startIndex, limit));
+     }
+@@ -736,6 +749,15 @@
+ 
+     public static native boolean getRimeOption(String option);
+ 
++    // runtime properties：字符串键值对，Java ↔ librime ↔ librime-lua 的数据通道。
++    // Lua 侧用 context:get_property(key) / context:set_property(key, value) 读写同一份数据。
++    public static native void setRimeProperty(
++            String prop,
++            String value
++    );
++
++    public static native String getRimeProperty(String prop);
++
+     public static native SchemaItem[] getRimeSchemaList();
+ 
+     public static native String getCurrentRimeSchema();
+diff -ruN --no-dereference a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime_jni/rime_jni.cc
+--- a/app/src/main/jni/librime_jni/rime_jni.cc	2026-11-03 10:28:35.000000000 +0800
++++ b/app/src/main/jni/librime_jni/rime_jni.cc	2026-11-17 02:22:21.860957356 +0800
+@@ -94,6 +94,20 @@
+     return rime->get_option(session(), key.data());
+   }
+ 
++  // 字符串键值对（property）：Java 层 ↔ librime ↔ librime-lua 的数据通道。
++  // Lua 侧用 context:get_property(key) / context:set_property(key, value) 读写，
++  // 与这里操作的是同一份存储（Context::properties_），可用来传任意字符串数据。
++  void setProperty(std::string_view key, std::string_view value) {
++    rime->set_property(session(), key.data(), value.data());
++  }
++
++  std::string getProperty(std::string_view key) {
++    char result[MAX_BUFFER_LENGTH];
++    return rime->get_property(session(), key.data(), result, MAX_BUFFER_LENGTH)
++               ? result
++               : "";
++  }
++
+   std::string currentSchemaId() {
+     char result[MAX_BUFFER_LENGTH];
+     return rime->get_current_schema(session(), result, MAX_BUFFER_LENGTH)
+@@ -321,6 +335,21 @@
+   return Rime::Instance().getOption(*CString(env, option));
+ }
+ 
++// runtime properties：Java ↔ librime ↔ librime-lua 传字符串数据
++extern "C" JNIEXPORT void JNICALL Java_com_osfans_trime_core_Rime_setRimeProperty(
++    JNIEnv *env, jclass /* thiz */, jstring prop, jstring value) {
++  const char *key = *CString(env, prop);
++  const char *val = *CString(env, value);
++  Rime::Instance().setProperty(key, val);
++}
++
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_osfans_trime_core_Rime_getRimeProperty(JNIEnv *env, jclass /* thiz */,
++                                                jstring prop) {
++  std::string value = Rime::Instance().getProperty(*CString(env, prop));
++  return env->NewStringUTF(value.c_str());
++}
++
+ extern "C" JNIEXPORT jobjectArray JNICALL
+ Java_com_osfans_trime_core_Rime_getRimeSchemaList(JNIEnv *env,
+                                                   jclass /* thiz */) {

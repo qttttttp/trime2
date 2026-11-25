@@ -1,0 +1,123 @@
+/*
+ * SPDX-FileCopyrightText: 2015 - 2026 Rime community
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.osfans.trime.dialog;
+
+import android.app.AlertDialog;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.os.IBinder;
+import android.view.Window;
+import android.view.WindowManager;
+import android.widget.Toast;
+
+import com.osfans.trime.TrimeService;
+import com.osfans.trime.core.DataManager;
+import com.osfans.trime.core.Rime;
+import com.osfans.trime.core.SchemaItem;
+import com.osfans.trime.theme.ThemeManager;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+
+public class SchemaDialog {
+    private AlertDialog mDialog; // 原 mDig
+    private IBinder mWindowToken; // 原 mToken
+
+    public SchemaDialog(Context context) {
+        DataManager.sync();
+        if (TrimeService.getInstance() == null) {
+            Toast.makeText(context, "请先启用输入法", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // 获取所有可用方案和已选方案
+        SchemaItem[] availableSchemas = Rime.getAvailableRimeSchemaList(); // 原 availableRimeSchemaList
+        SchemaItem[] selectedSchemas = Rime.getSelectedRimeSchemaList();  // 原 selectedRimeSchemaList
+        Arrays.sort(availableSchemas, new OptionsDialog.SortByName());
+
+        int schemaCount = availableSchemas.length;
+        String[] schemaNames = new String[schemaCount]; // 原 name
+        boolean[] checkedStates = new boolean[schemaCount]; // 原 checkedItems
+
+        // 存储当前选中的 Schema ID 列表
+        ArrayList<String> currentSelectedIds = new ArrayList<>(); // 原 rs
+
+        for (int i = 0; i < schemaCount; i++) {
+            SchemaItem item = availableSchemas[i];
+            schemaNames[i] = item.getName();
+
+            if (isSchemaSelected(selectedSchemas, item)) { // 原 checkSchema
+                checkedStates[i] = true;
+                currentSelectedIds.add(item.getId());
+            }
+        }
+
+        mDialog = new AlertDialog.Builder(context, ThemeManager.getDialogTheme())
+                .setTitle("管理方案")
+                .setMultiChoiceItems(schemaNames, checkedStates, new DialogInterface.OnMultiChoiceClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which, boolean isChecked) {
+                        String schemaId = availableSchemas[which].getId();
+                        if (isChecked) {
+                            currentSelectedIds.add(schemaId);
+                        } else {
+                            currentSelectedIds.remove(schemaId);
+                        }
+                    }
+                })
+                .setPositiveButton("确定", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        // 将 List 转换为 Array 提交给 Rime 核心
+                        String[] selectedIdsArray = currentSelectedIds.toArray(new String[0]); // 原 rr
+                        Rime.selectRimeSchemas(selectedIdsArray);
+
+                        // 部署新方案
+                        new DeployDialog(mDialog.getContext()).show(mWindowToken);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .create();
+    }
+
+    public void show() {
+        if (mDialog == null) return;
+        mDialog.show();
+    }
+
+    public void show(IBinder token) {
+        if (mDialog == null) return;
+        mWindowToken = token;
+
+        if (mWindowToken == null) {
+            show();
+            return;
+        }
+
+        Window window = mDialog.getWindow();
+        WindowManager.LayoutParams layoutParams = window.getAttributes(); // 原 attr
+
+        // 设置对话框类型，使其能依附于输入法窗口
+        layoutParams.type = WindowManager.LayoutParams.TYPE_APPLICATION_ATTACHED_DIALOG;
+        window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        layoutParams.token = token;
+
+        window.setAttributes(layoutParams);
+        mDialog.show();
+    }
+
+    /**
+     * 检查某个方案是否在已选列表中
+     */
+    private boolean isSchemaSelected(SchemaItem[] selectedList, SchemaItem targetItem) { // 原 checkSchema(bs, a)
+        for (SchemaItem selectedItem : selectedList) {
+            if (selectedItem.getId().equals(targetItem.getId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

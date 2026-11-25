@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300" viewBox="0 0 300 300">
+  <!-- 绘制主圆弧（260°弧度），右上角有约100°缺口 -->
+  <defs>
+    <style>
+      .main-arc { fill: none; stroke: #0080FF; stroke-width: 18; }
+      .big-char { font-size: 108px; fill: #222; font-family: "Microsoft YaHei", "SimHei", Arial, sans-serif; font-weight: bold;}
+      .gap-num { font-size: 48px; fill: #D50000; font-family: Arial, sans-serif; font-weight: bold;}
+      /* 108/180 ≈ 0.6, 字大概占圆宽的0.6 */
+    </style>
+  </defs>
+  <g>
+    <!-- 圆心 (150,150)，半径100，缺口跨度100°, 从320°到60° -->
+    <!-- SVG圆弧以x轴向右为0°逆时针，320°= -40°, 60°=60° -->
+    <path
+      class="main-arc"
+      d="
+        M 226.60 84.20
+        A 100 100 0 1 1 228.48 215.80
+      "
+    />
+    <!-- 大“中”字居中显示，高度大致为180*0.6=108px -->
+    <text
+      class="big-char"
+      x="150"
+      y="174"
+      text-anchor="middle"
+      dominant-baseline="middle"
+    >中</text>
+    <!-- 在右上缺口处放数字“2”，估算缺口圆弧外端 -->
+    <!-- 角度为(320+60)/2=190/2=95°, 右上：起点约320° -->
+    <text
+      class="gap-num"
+      x="248"
+      y="60"
+      text-anchor="middle"
+      dominant-baseline="middle"
+    >2</text>
+  </g>
+</svg>

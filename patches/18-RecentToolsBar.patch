@@ -1,0 +1,334 @@
+--- a/app/src/main/java/com/osfans/trime/PrefLauncher.java
++++ b/app/src/main/java/com/osfans/trime/PrefLauncher.java
+@@ -70,6 +70,7 @@
+     private TextView statusTitle, statusDetail, statusAction;
+     private ImageView statusIcon;
+     private HomeCardView theme, palette, keyboard, group, schema;
++    private RecentToolsBar recentTools; // r27.46/0.9.1：最近使用工具快捷栏
+     private boolean enabled;
+     private final ThreadPoolExecutor nameWorker=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>());
+     private final HomeConfigNames configNames=new HomeConfigNames(PrefLauncher::nameGlobals);
+@@ -229,6 +230,10 @@
+         scroll=new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
+         content=vertical(); content.setPadding(dp(16),dp(4),dp(16),dp(16));
+         scroll.addView(content,new ScrollView.LayoutParams(-1,-2)); root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
++        // r27.47/0.9.1：最近使用工具快捷栏，放在“切换输入法”状态卡片之前
++        section("最近使用工具");
++        recentTools=new RecentToolsBar(this,a.surface,a.outline,a.ink);
++        content.addView(recentTools,new LinearLayout.LayoutParams(-1,-2));
+         buildStatus();
+         boolean narrow=getResources().getConfiguration().screenWidthDp<360 || getResources().getConfiguration().fontScale>1.2f;
+         boolean compact=getResources().getConfiguration().fontScale>1.1f;
+@@ -353,7 +358,7 @@
+     }
+     @Override public void onConfigurationChanged(Configuration config) {super.onConfigurationChanged(config);buildHome();}
+     @Override public void onWindowFocusChanged(boolean focus) {super.onWindowFocusChanged(focus);if(focus)refreshStatus();}
+-    @Override protected void onResume(){super.onResume();LuaUtil.checkStorage(this);refreshStatus();}
++    @Override protected void onResume(){super.onResume();LuaUtil.checkStorage(this);refreshStatus();if(recentTools!=null)recentTools.refresh();}
+     @Override protected void onStart(){super.onStart();mToken=getWindow().getDecorView().getWindowToken();
+         getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.DEFAULT_INPUT_METHOD),false,imeObserver);
+         getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ENABLED_INPUT_METHODS),false,imeObserver);
+--- a/app/src/main/java/com/osfans/trime/ToolActivity.java
++++ b/app/src/main/java/com/osfans/trime/ToolActivity.java
+@@ -186,6 +186,7 @@
+             mHistory.remove(text);
+         mHistory.add(0, text);
+         //ClipboardUtil.saveToolHistory(mHistory);
++        ToolHistory.record(mDir, text); // r27.45：记录最近使用（供设置页快捷栏读取）
+         Intent intent = new Intent(this, LuaActivity.class);
+         intent.setData(Uri.parse(mDir + text + "/main.lua"));
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+--- /dev/null
++++ b/app/src/main/java/com/osfans/trime/ToolHistory.java
+@@ -0,0 +1,146 @@
++/*
++ * r27.45：最近使用工具的历史（独立文件，不触碰上游代码）。
++ * 历史存在 rime/tools/.recent_tools，每行一个工具目录名（UTF-8）。
++ * 只做纯文件读写 + 过滤，不执行任何工具脚本。
++ */
++package com.osfans.trime;
++
++import android.util.Log;
++
++import java.io.BufferedReader;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStreamWriter;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++
++public final class ToolHistory {
++
++    private static final String TAG = "ToolHistory";
++    /** 历史文件名，放在 tools 目录下（隐藏文件，不出现在工具列表里）。 */
++    public static final String HISTORY_FILE = ".recent_tools";
++    /** 最多保留的历史条数；显示只取前 N 个，多留一些以便过滤后仍有候选。 */
++    private static final int MAX_HISTORY = 12;
++
++    private ToolHistory() {
++    }
++
++    /**
++     * 记录一次工具使用：去重置顶，超过上限截断。
++     * name 必须是 tools 下的目录名；含路径分隔符或空串一律忽略（安全）。
++     */
++    public static void record(String toolsDir, String name) {
++        if (toolsDir == null || name == null) return;
++        name = name.trim();
++        if (name.isEmpty() || name.contains("/") || name.contains("\\")
++                || name.equals(".") || name.equals("..")) return;
++        File file = new File(toolsDir, HISTORY_FILE);
++        List<String> list = readRaw(file);
++        list.remove(name);
++        list.add(0, name);
++        if (list.size() > MAX_HISTORY) {
++            list = new ArrayList<>(list.subList(0, MAX_HISTORY));
++        }
++        try {
++            File parent = file.getParentFile();
++            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) return;
++            BufferedWriter w = new BufferedWriter(
++                    new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8));
++            try {
++                for (String s : list) {
++                    w.write(s);
++                    w.newLine();
++                }
++            } finally {
++                w.close();
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "记录工具历史失败: " + e.getMessage());
++        }
++    }
++
++    /** 读取历史，过滤掉已经不存在（没有 main.lua）的工具，保持顺序。 */
++    public static List<String> load(String toolsDir) {
++        List<String> out = new ArrayList<>();
++        if (toolsDir == null) return out;
++        for (String s : readRaw(new File(toolsDir, HISTORY_FILE))) {
++            if (isTool(toolsDir, s)) out.add(s);
++        }
++        return out;
++    }
++
++    /** 扫描 tools 目录，返回所有带 main.lua 的工具目录名（排序）。 */
++    public static List<String> listTools(String toolsDir) {
++        List<String> out = new ArrayList<>();
++        if (toolsDir == null) return out;
++        String[] names = new File(toolsDir).list();
++        if (names == null) return out;
++        Arrays.sort(names);
++        for (String n : names) {
++            if (isTool(toolsDir, n)) out.add(n);
++        }
++        return out;
++    }
++
++    /**
++     * 决定工具条最终显示的 N 个按钮：
++     * 历史（已过滤）优先 → 默认内置工具补足 → 其余工具补足。
++     */
++    public static List<String> resolve(String toolsDir, String[] defaults, int n) {
++        List<String> picked = new ArrayList<>();
++        Set<String> seen = new LinkedHashSet<>();
++        for (String s : load(toolsDir)) {
++            if (seen.add(s)) picked.add(s);
++            if (picked.size() >= n) return picked;
++        }
++        if (defaults != null) {
++            for (String d : defaults) {
++                if (!isTool(toolsDir, d)) continue;
++                if (seen.add(d)) picked.add(d);
++                if (picked.size() >= n) return picked;
++            }
++        }
++        for (String t : listTools(toolsDir)) {
++            if (seen.add(t)) picked.add(t);
++            if (picked.size() >= n) break;
++        }
++        return picked;
++    }
++
++    private static boolean isTool(String toolsDir, String name) {
++        if (name == null || name.isEmpty()) return false;
++        return new File(new File(toolsDir, name), "main.lua").isFile();
++    }
++
++    private static List<String> readRaw(File file) {
++        List<String> out = new ArrayList<>();
++        if (file == null || !file.isFile()) return out;
++        BufferedReader r = null;
++        try {
++            r = new BufferedReader(
++                    new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8));
++            String line;
++            while ((line = r.readLine()) != null) {
++                String s = line.trim();
++                if (!s.isEmpty() && !s.startsWith("#")) out.add(s);
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "读取工具历史失败: " + e.getMessage());
++        } finally {
++            if (r != null) {
++                try {
++                    r.close();
++                } catch (Exception ignored) {
++                }
++            }
++        }
++        return out;
++    }
++}
+--- /dev/null
++++ b/app/src/main/java/com/osfans/trime/RecentToolsBar.java
+@@ -0,0 +1,142 @@
++/*
++ * r27.45：设置页顶部的「最近使用工具」快捷栏（独立文件，不触碰上游代码）。
++ * 横排 3 个按钮，点击以 LuaActivity 启动对应工具的 main.lua。
++ * 历史不足时用内置工具补足；只启动脚本，不做其它事。
++ */
++package com.osfans.trime;
++
++import android.content.Context;
++import android.content.Intent;
++import android.graphics.Color;
++import android.graphics.drawable.GradientDrawable;
++import android.net.Uri;
++import android.os.Build;
++import android.view.Gravity;
++import android.view.View;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import com.androlua.LuaActivity;
++import com.androlua.LuaApplication;
++
++import java.io.File;
++
++public class RecentToolsBar extends LinearLayout {
++
++    /** 内置工具目录名（即 manifest.txt 的安装名）。 */
++    private static final String[] DEFAULT_TOOLS = {"主题工作室", "一键更新"};
++    private static final int BUTTON_COUNT = 3;
++
++    private final Context mContext;
++    private String mToolsDir;
++    // 主题色（r27.46/0.9.1）：默认沿用原深色；PrefLauncher 传入 HomeAppearance 颜色以融入卡片风格
++    private int mCardColor = Color.rgb(45, 52, 62);
++    private int mStrokeColor = Color.rgb(90, 100, 115);
++    private int mTextColor = Color.rgb(230, 230, 230);
++    private int mCornerDp = 6;
++    private int mTextSp = 13;
++
++    public RecentToolsBar(Context context) {
++        super(context);
++        mContext = context;
++        setOrientation(LinearLayout.HORIZONTAL);
++        setGravity(Gravity.CENTER_VERTICAL);
++        int pad = dp(8);
++        setPadding(pad, dp(4), pad, dp(4));
++        try {
++            mToolsDir = LuaApplication.getInstance().getLuaExtDir("tools");
++        } catch (Throwable e) {
++            mToolsDir = null;
++        }
++        buildButtons();
++    }
++
++    /**
++     * 0.9.1 卡片式设置页专用构造：把外观交给 HomeAppearance 的视觉令牌，
++     * 使三个工具按钮与设置页其它卡片风格一致。启动逻辑与默认构造完全相同。
++     */
++    public RecentToolsBar(Context context, int cardColor, int strokeColor, int textColor) {
++        this(context);
++        mCardColor = cardColor;
++        mStrokeColor = strokeColor;
++        mTextColor = textColor;
++        mCornerDp = 12;
++        mTextSp = 12;
++        buildButtons();
++    }
++
++    /** 重新读取历史并重建按钮；由 PrefLauncher.onResume 调用。 */
++    public void refresh() {
++        removeAllViews();
++        buildButtons();
++    }
++
++    private void buildButtons() {
++        if (mToolsDir == null) {
++            TextView hint = makeButton("（工具目录不可用）");
++            addView(hint, new LinearLayout.LayoutParams(0, dp(40), 1));
++            return;
++        }
++        java.util.List<String> tools = ToolHistory.resolve(mToolsDir, DEFAULT_TOOLS, BUTTON_COUNT);
++        if (tools.isEmpty()) {
++            TextView hint = makeButton("（暂无工具）");
++            addView(hint, new LinearLayout.LayoutParams(0, dp(40), 1));
++            return;
++        }
++        for (final String name : tools) {
++            TextView btn = makeButton(name);
++            btn.setOnClickListener(new OnClickListener() {
++                @Override
++                public void onClick(View v) {
++                    openTool(name);
++                }
++            });
++            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1);
++            lp.setMargins(dp(3), 0, dp(3), 0);
++            addView(btn, lp);
++        }
++    }
++
++    private void openTool(String name) {
++        File main = new File(new File(mToolsDir, name), "main.lua");
++        if (!main.isFile()) {
++            Toast.makeText(mContext, "工具不存在：" + name, Toast.LENGTH_SHORT).show();
++            return;
++        }
++        // 从快捷栏打开也算一次使用，置顶历史
++        ToolHistory.record(mToolsDir, name);
++        Intent intent = new Intent(mContext, LuaActivity.class);
++        intent.setData(Uri.parse(main.getAbsolutePath()));
++        // 设置页是普通 Activity：以 NEW_TASK 启动独立文档，行为与「工具」里一致
++        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
++            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT);
++            intent.addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
++        }
++        try {
++            mContext.startActivity(intent);
++        } catch (Exception e) {
++            Toast.makeText(mContext, "启动工具失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
++        }
++    }
++
++    private TextView makeButton(String text) {
++        TextView tv = new TextView(mContext);
++        tv.setText(text);
++        tv.setGravity(Gravity.CENTER);
++        tv.setTextSize(mTextSp);
++        tv.setTextColor(mTextColor);
++        tv.setSingleLine(true);
++        GradientDrawable bg = new GradientDrawable();
++        bg.setColor(mCardColor);
++        bg.setCornerRadius(dp(mCornerDp));
++        bg.setStroke(1, mStrokeColor);
++        tv.setBackgroundDrawable(bg);
++        return tv;
++    }
++
++    private int dp(float v) {
++        return Math.round(v * mContext.getResources().getDisplayMetrics().density);
++    }
++}
