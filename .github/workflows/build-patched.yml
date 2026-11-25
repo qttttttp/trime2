@@ -831,7 +831,7 @@ jobs:
             echo
             echo "### 发布历史"
             echo
-            echo "- ** Latest**：本仓库的 \`patched-latest\` 固定在发布页顶部，只保留最新一次构建的 APK（每次发布前自动清空旧资产），下载链接长期不变。"
+            echo "- ** Latest**：本仓库的 \`patched-latest\` 固定在发布页顶部，只保留最新一次构建的 APK（每次发布前自动清理旧资产；清理失败不影响发布），下载链接长期不变。"
             echo "- **历史版本**：每次构建另发一条以 \`patched-日期-上游短sha\` 命名的正式 Release，在 [发布列表](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases) 里按时间排列，可下载任意旧版 APK 与对应完整源码。"
             echo
             echo "上游 ${UP_LINK} ${UP_SUBJECT} ｜ 构建 [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) ｜ arm64-v8a ${SIZE_MB} MB"
@@ -851,25 +851,45 @@ jobs:
       # 上传的旧资产（GitHub 自动生成的 Source code 包不在 assets 列表里，不受
       # 影响），下一步再上传本次 APK。release 本体和 body 保留，因为 check job
       # 与"生成更新记录"都要从 body 里读 upstream-sha / fork-sha。
+      # 清理缓存属辅助操作，绝不能因 GitHub API 偶发 500 / 竞态 404 阻断发布：
+      # 每条资产单独重试，最终失败仅告警；continue-on-error 作最后兜底。
       - name: 清空 Latest 旧资产（只留最新构建）
         if: startsWith(github.ref, 'refs/tags/') == false
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           OLD=$(gh release view patched-latest --repo "$GITHUB_REPOSITORY" \
                   --json assets -q '.assets[].name' 2>/dev/null || true)
           if [ -z "$OLD" ]; then
             echo "patched-latest 无旧资产（或该 Release 尚不存在），无需清理"
             exit 0
           fi
+          fail=0
           while IFS= read -r name; do
             [ -n "$name" ] || continue
-            echo "删除 patched-latest 旧资产: $name"
-            gh release delete-asset patched-latest "$name" \
-              --repo "$GITHUB_REPOSITORY" --yes
+            ok=0
+            for attempt in 1 2 3; do
+              if gh release delete-asset patched-latest "$name" \
+                   --repo "$GITHUB_REPOSITORY" --yes 2>&1; then
+                echo "删除 patched-latest 旧资产: $name（第 $attempt 次成功）"
+                ok=1
+                break
+              fi
+              echo "删除 $name 第 $attempt 次失败，等待重试..."
+              sleep 3
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::warning::无法删除 patched-latest 旧资产 $name（GitHub API 可能 500/404），跳过；不影响本次发布"
+              fail=1
+            fi
           done <<< "$OLD"
-          echo "已清空 patched-latest 旧资产，下一步上传本次构建 APK"
+          if [ "$fail" -ne 0 ]; then
+            echo "部分旧资产未清理干净，Latest 可能残留旧包；本次 APK 仍会照常上传"
+          else
+            echo "已清空 patched-latest 旧资产，下一步上传本次构建 APK"
+          fi
 
       # 固定 tag 的 rolling Release:链接永久固定、公开仓库任何人无需登录即可下载、
       # 不受 artifact 90 天过期影响。设为正式发布并置顶为 Latest,
