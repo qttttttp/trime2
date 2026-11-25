@@ -8,17 +8,17 @@
      private boolean enabled;
      private final ThreadPoolExecutor nameWorker=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>());
      private final HomeConfigNames configNames=new HomeConfigNames(PrefLauncher::nameGlobals);
-@@ -250,6 +251,10 @@
-         int purple=a.dark?0xffc9abff:0xff7652c5, orange=a.dark?0xffffc18b:0xffb75a27;
-         pairs(narrow,card(R.drawable.home_image,purple,"主题编辑器",false,null,v -> edit(0)),card(R.drawable.home_palette,orange,"样式编辑器",false,null,v -> edit(1)));
-         pairs(narrow,card(R.drawable.home_keyboard,a.accent,"键盘编辑器",false,null,v -> edit(2)),card(R.drawable.home_code,purple,"方案编辑器",false,null,v -> edit(3)));
-+        // r27.46/0.9.1：最近使用工具快捷栏（独立新类，不触碰上游卡片逻辑）
+@@ -229,6 +230,10 @@
+         scroll=new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
+         content=vertical(); content.setPadding(dp(16),dp(4),dp(16),dp(16));
+         scroll.addView(content,new ScrollView.LayoutParams(-1,-2)); root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
++        // r27.47/0.9.1：最近使用工具快捷栏，放在“切换输入法”状态卡片之前
 +        section("最近使用工具");
 +        recentTools=new RecentToolsBar(this,a.surface,a.outline,a.ink);
 +        content.addView(recentTools,new LinearLayout.LayoutParams(-1,-2));
-         buildTest(draft,selection);
-         setContentView(root); EdgeToEdge.apply(this,root);
-         refreshStatus();
+         buildStatus();
+         boolean narrow=getResources().getConfiguration().screenWidthDp<360 || getResources().getConfiguration().fontScale>1.2f;
+         boolean compact=getResources().getConfiguration().fontScale>1.1f;
 @@ -353,7 +358,7 @@
      }
      @Override public void onConfigurationChanged(Configuration config) {super.onConfigurationChanged(config);buildHome();}
