@@ -1,0 +1,11 @@
+diff -ruN --no-dereference a/app/src/main/jni/cmake/Boost.cmake b/app/src/main/jni/cmake/Boost.cmake
+--- a/app/src/main/jni/cmake/Boost.cmake	2026-11-03 10:28:35.000000000 +0800
++++ b/app/src/main/jni/cmake/Boost.cmake	2026-11-03 13:05:27.712928879 +0800
+@@ -35,6 +35,7 @@
+     scope_exit
+     signals2
+     utility
++    vmd
+     uuid)
+ 
+ add_subdirectory(boost EXCLUDE_FROM_ALL)
