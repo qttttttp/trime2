@@ -1,4 +1,5 @@
 appname="一键更新"
+show = true
 -- 调试模式
 debugmode = true
 -- debug_mode = true

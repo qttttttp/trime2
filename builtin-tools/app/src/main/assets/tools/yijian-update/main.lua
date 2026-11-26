@@ -874,6 +874,7 @@ htmlContent = [[
     let currentProxyPrefix = '';
     let allDownloadUrls = [];
     let latestRelease = null;   // 最新 release（loadReleases 里赋值）
+    let allReleases = [];       // 全部 release（findNewestBuild 全局扫描用）
     // 当前仓库（由 Lua 端注入，支持在菜单里切换）
     const GH_OWNER = '__OWNER__';
     const GH_REPO  = '__REPO__';
@@ -881,12 +882,21 @@ htmlContent = [[
 
     //========== 一键更新：本地 tag 记录 / 检查 / 下载安装 ==========
     const TAG_KEY = 'ime_installed_tag_' + GH_OWNER + '_' + GH_REPO;  // 按仓库隔离，避免串味
+    // 滚动 release（如 patched-latest）的 tag 永远不变，只记 tag 无法判断新旧；
+    // 额外记住实际装的 APK 文件名（含版本号），作为 tag 回退判断的依据。
+    const APK_KEY = 'ime_installed_apk_' + GH_OWNER + '_' + GH_REPO;
 
     function getSavedTag() {
         return localStorage.getItem(TAG_KEY) || '';
     }
     function saveInstalledTag(tag) {
         localStorage.setItem(TAG_KEY, tag);
+    }
+    function getSavedApk() {
+        return localStorage.getItem(APK_KEY) || '';
+    }
+    function saveInstalledApk(apk) {
+        if (apk) localStorage.setItem(APK_KEY, apk);
     }
     // 本机输入法 APK 的安装时间（毫秒），由 Lua 从 PackageManager 读取，不依赖本地存储
     let installTimeMs = 0;
@@ -903,17 +913,56 @@ htmlContent = [[
         try { return new Date(ms).toLocaleString('zh-CN', {hour12:false}); }
         catch (e) { return String(ms); }
     }
-    // 最新构建时间（毫秒）：优先用 APK 资源的 updated_at，回退到 release.published_at
+    // 最新构建时间（毫秒）：扫描所有 release 的所有 APK，取 updated_at 最大的那个。
+    // 不能只看 data[0]——patched-latest 这类滚动 release 会把新旧 APK 堆在一起，
+    // 而真正的新构建快照可能在另一个 release 里；按 updated_at 全局取最大才准。
     function getBuildTimeMs() {
+        const newest = findNewestBuild();
+        if (newest && newest.ms > 0) return newest.ms;
         if (!latestRelease) return 0;
-        const apk = pickArmApk(latestRelease);
-        let iso = (apk && apk.updated_at) || latestRelease.published_at || latestRelease.created_at;
+        const iso = latestRelease.published_at || latestRelease.created_at;
         const t = iso ? Date.parse(iso) : 0;
         return isNaN(t) ? 0 : t;
     }
+    // ABI 优先级：arm64 > armeabi-v7a > x86_64 > x86。
+    // 真机几乎都是 arm64；x86 包只是 CI 顺带产出，绝不能被当成更新包下载。
+    function abiRank(name) {
+        const n = (name || '').toLowerCase();
+        if (n.indexOf('arm64') >= 0) return 4;
+        if (n.indexOf('armeabi-v7a') >= 0 || n.indexOf('armv7') >= 0) return 3;
+        if (n.indexOf('x86_64') >= 0) return 2;
+        if (n.indexOf('x86') >= 0) return 1;
+        return 0;
+    }
+    // 全局找"最新构建"：在所有 release 的所有 APK 里，按【ABI 优先级优先、更新时间次之】
+    // 挑选最合适的包。返回 {apk, release, ms, rank}。
+    //
+    // 早期版本只按 updated_at 取最大者，结果同一批构建里 x86 比 arm64 晚上传 1 秒
+    // （例：patched-20261125-a133d9d-r123 里 arm64=14:20:43、x86=14:20:44），
+    // 一键更新就错选了 x86 包。真机装不上 x86，属于明显错误。
+    // 修正：架构优先级是首要键，同架构内才比较时间；这样 arm64 机器永远拿到 arm64，
+    // 且仍是该架构下最新的一次构建。
+    function findNewestBuild() {
+        let best = null;
+        const list = (Array.isArray(allReleases) && allReleases.length)
+            ? allReleases : (latestRelease ? [latestRelease] : []);
+        for (const rel of list) {
+            if (!rel || !Array.isArray(rel.assets)) continue;
+            for (const a of rel.assets) {
+                if (!a.name || !a.name.toLowerCase().endsWith('.apk')) continue;
+                const ms = Date.parse(a.updated_at || '') || 0;
+                const rank = abiRank(a.name);
+                if (!best || rank > best.rank || (rank === best.rank && ms > best.ms)) {
+                    best = { apk: a, release: rel, ms: ms, rank: rank };
+                }
+            }
+        }
+        return best;
+    }
     // Lua 下载安装完成后回调这里记录 tag 并刷新状态
-    window.onUpdateInstalled = function(tag) {
+    window.onUpdateInstalled = function(tag, apkName) {
         if (tag) saveInstalledTag(tag);
+        if (apkName) saveInstalledApk(apkName);
         refreshUpdateStatus();
     };
 
@@ -940,11 +989,15 @@ htmlContent = [[
         if (!release || !release.assets) return null;
         const apks = release.assets.filter(a => a.name && a.name.toLowerCase().endsWith('.apk'));
         if (apks.length === 0) return null;
-        // arm64 优先
+        // ABI 优先级优先（arm64 > armv7 > x86_64 > x86），同架构内按 updated_at 倒序。
+        // 不能只按时间或字母序：同一构建里 x86 晚上传几秒会被误选，arm64 机器装不上；
+        // 字母序则让 "0.8.5.apk" 排在 "0.9.0.apk" 前，永远选中旧包。
         apks.sort((a, b) => {
-            const ax = a.name.toLowerCase().includes('arm64') ? 1 : 0;
-            const bx = b.name.toLowerCase().includes('arm64') ? 1 : 0;
-            if (ax !== bx) return bx - ax;
+            const ar = abiRank(a.name), br = abiRank(b.name);
+            if (ar !== br) return br - ar;
+            const at = Date.parse(a.updated_at || '') || 0;
+            const bt = Date.parse(b.updated_at || '') || 0;
+            if (at !== bt) return bt - at;
             return a.name.localeCompare(b.name);
         });
         return apks[0];
@@ -973,13 +1026,17 @@ htmlContent = [[
             el.innerHTML = '<i class="fas fa-check-circle" style="color:#3fb950;"></i> <b>已是最新：</b>' + latest
                 + '<br><span style="color:#8b949e;">' + buildLine + '</span>';
         } else {
-            // 时间不可用时回退到 tag 记录
+            // 时间不可用时回退到"已装 APK 文件名"判断（tag 在滚动 release 下恒定）
             const saved = getSavedTag();
-            if (saved && saved === latest) {
-                el.innerHTML = '<i class="fas fa-check-circle" style="color:#3fb950;"></i> 已是最新：<b>' + latest + '</b>';
+            const savedApk = getSavedApk();
+            const nb = findNewestBuild();
+            const newestApkName = nb && nb.apk && nb.apk.name;
+            if ((savedApk && newestApkName && savedApk === newestApkName) ||
+                (!savedApk && saved && saved === latest)) {
+                el.innerHTML = '<i class="fas fa-check-circle" style="color:#3fb950;"></i> 已是最新：<b>' + (newestApkName || latest) + '</b>';
             } else {
                 el.innerHTML = '<i class="fas fa-info-circle" style="color:#58a6ff;"></i> 最新版本：<b>' + latest + '</b>'
-                    + '<br><span style="color:#8b949e;">无法读取安装时间，按 tag 判断 · 本地：' + (saved || '未记录') + '</span>';
+                    + '<br><span style="color:#8b949e;">无法读取安装时间，按 APK 判断 · 本地：' + (savedApk || saved || '未记录') + '</span>';
             }
         }
     }
@@ -993,17 +1050,26 @@ htmlContent = [[
         const buildMs = getBuildTimeMs();
         const installMs = getInstallTimeMs();
         const saved = getSavedTag();
-        // 有时间用时间判断；取不到则回退 tag
+        const savedApk = getSavedApk();
+        // 有时间用时间判断；取不到则回退"已装 APK 文件名"判断（滚动 release 的 tag 固定不变，不能只比 tag）
         if (buildMs > 0 && installMs > 0) {
             if (buildMs <= installMs + 60000) {
                 alert('已是最新版本。\n本机安装：' + fmtTime(installMs) + '\n最新构建：' + fmtTime(buildMs) + '\n无需更新。');
                 return;
             }
-        } else if (saved && saved === latest) {
-            alert('已是最新版本：' + latest + '\n无需更新。');
-            return;
+        } else {
+            const newestForFallback = findNewestBuild();
+            const newestApkName = newestForFallback && newestForFallback.apk && newestForFallback.apk.name;
+            if ((savedApk && newestApkName && savedApk === newestApkName) ||
+                (!savedApk && saved && saved === latest)) {
+                alert('已是最新版本：' + newestApkName + '\n无需更新。');
+                return;
+            }
         }
-        const apk = pickArmApk(latestRelease);
+        // 下载全局最新的那个 APK（与 findNewestBuild 检测到的构建一致），
+        // 不能只从 latestRelease 里挑——快照 release 可能比滚动 release 更新。
+        const newest = findNewestBuild();
+        const apk = (newest && newest.apk) ? newest.apk : pickArmApk(latestRelease);
         if (!apk) {
             alert('该版本（' + latest + '）的发布资产里没有找到 APK 文件。');
             return;
@@ -1690,7 +1756,10 @@ htmlContent = [[
         try {
             const releaseRes = await fetch(REPO_API + '/releases');
             const data = await releaseRes.json();
-            if (Array.isArray(data) && data.length > 0) latestRelease = data[0];  // releases 首个即最新
+            if (Array.isArray(data) && data.length > 0) {
+                allReleases = data;                 // 保存全部，供 findNewestBuild 全局扫描
+                latestRelease = data[0];            // 首个仅用于展示/仓库信息
+            }
             // 已经有真实 APK 直链了，现在开始验证各代理能不能真的下到文件
             probeWithTarget();
             let html = '';
@@ -1851,71 +1920,96 @@ local function toast_dialog(msg)
     create.show()
 end
 
---参数：url是文件直链,path是目录,file是文件名
-function downloadWithProgress(url, filepath, filename)
-    local downloadId = downloadFile(url, filepath, filename)
+-- r27.67：通用下载进度视图。内部下载与「检查更新并安装」共用同一个视图，
+-- 都带可点的取消按钮（真正调用 DownloadManager.remove 停掉后台任务）。
+-- opts 字段：
+--   title        初始标题
+--   message      副标题（文件名，可选）
+--   period       轮询间隔毫秒（默认 120）
+--   onSuccess    下载成功回调 function(fileUri, totalSize)，在对话框关闭后调用
+--   onFail       下载失败回调 function(status)
+--   onCancel     取消回调（可选）
+-- 进度显示统一用字节数（%1d B/ %2d B），与内部下载保持一致。
+local function showDownloadDialog(downloadId, opts)
+    opts = opts or {}
     local dlg = ProgressDialog(activity)
-    dlg.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
-    --设置进度条的形式为水平进度条
-    dlg.setTitle("即将开始下载...")
-    dlg.setCancelable(false)--设置是否可以通过点击Back键取消
-    dlg.setCanceledOnTouchOutside(false)--设置在点击Dialog外是否取消Dialog进度条
-    dlg.setOnCancelListener{
-        onCancel=function(l)
-            print("将进入后台下载，请在通知栏检查下载进度")
-        end}
-    dlg.setButton(-1, "取消", function()
-        dlg.dismiss()
-        ti.stop()
-    end)
+    dlg.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL)
+    dlg.setTitle(opts.title or "即将开始下载...")
+    if opts.message then dlg.setMessage(opts.message) end
+    dlg.setCancelable(false)
+    dlg.setCanceledOnTouchOutside(false)
+
+    local cancelled = false
+    local ti  -- 前向声明：doCancel 闭包要捕获它
+    local function doCancel()
+        if cancelled then return end
+        cancelled = true
+        -- 真正移除 DownloadManager 任务，否则仍在后台继续下载
+        pcall(function()
+            local dm = activity.getSystemService(Context.DOWNLOAD_SERVICE)
+            dm.remove(downloadId)
+        end)
+        pcall(function() dlg.dismiss() end)
+        pcall(function() if ti then ti.stop() end end)
+        if opts.onCancel then pcall(opts.onCancel) end
+        print("已取消下载")
+    end
+
+    dlg.setOnCancelListener{ onCancel = function(l) doCancel() end }
+    dlg.setButton(-1, "取消", function() doCancel() end)
 
     dlg.setMax(1)
     dlg.setProgress(0)
     dlg.show()
-    local cancel = dlg.getButton(-1)
-    cancel.setEnabled(false)
-    -- public void android.app.ProgressDialog. setProgress(int)
-    -- public void android.app.ProgressDialog. setProgressPercentFormat(java.text.NumberFormat)
-    -- public void android.app.ProgressDialog. setProgressNumberFormat(java.lang.String)
+    -- 取消按钮从一开始就可用，任何状态（含“正在下载”）都能点
+    pcall(function() dlg.getButton(-1).setEnabled(true) end)
 
-    local ti=Ticker()
-    ti.Period=100
-    ti.onTick=function()
-        --事件
-        local fileUri,status,totalSize,downloadedSize = query(downloadId)
-        if totalSize and totalSize>0 then
-            if status==1 then
+    ti = Ticker()  -- 赋值给前向声明的 ti（不能用 local，否则遮蔽取消闭包捕获的 ti）
+    ti.Period = opts.period or 120
+    ti.onTick = function()
+        if cancelled then return end  -- 用户已取消：不再操作对话框/轮询
+        local ok, fileUri, status, totalSize, downloadedSize = pcall(query, downloadId)
+        if not ok or not status then return end
+        -- 进度显示只在拿到总大小时更新；成功/失败判断放块外，
+        -- 避免 totalSize 为 0（缓存命中/未知大小）时漏掉结束处理而卡住。
+        if totalSize and totalSize > 0 then
+            if status == 1 then
                 dlg.setTitle("等待下载...")
-                dlg.setCancelable(true)
-                cancel.setEnabled(true) --
-            elseif status==2 then
+            elseif status == 2 then
                 dlg.setTitle("正在下载...")
                 dlg.setMax(totalSize)
                 dlg.setProgress(downloadedSize)
                 dlg.setProgressNumberFormat("%1d B/ %2d B")
-                -- dlg.setProgressNumberFormat("%.2f MB / %.2f MB")  -- 显示两位小数
-            elseif status==4 then
+            elseif status == 4 then
                 dlg.setTitle("下载暂停...")
-                dlg.setCancelable(true)
-                cancel.setEnabled(true) --
-            elseif status==8 then
-                dlg.setTitle("下载成功")
+            end
+        end
+        if status == 8 then  -- STATUS_SUCCESSFUL
+            dlg.setTitle("下载成功")
+            if totalSize and totalSize > 0 then
                 dlg.setMax(totalSize)
                 dlg.setProgress(totalSize)
-                local msg = {
-                    text = "路径：" .. filepath,
-                    func = function(v) end
-                }
-                -- toast_dialog(msg)
-                dlg.dismiss()
-                ti.stop()
-            elseif status==16 then
-                dlg.dismiss()
-                ti.stop()
             end
+            cancelled = true  -- 结束轮询，防止后续 tick 再改动已关闭的对话框
+            pcall(function() dlg.dismiss() end)
+            ti.stop()
+            if opts.onSuccess then pcall(opts.onSuccess, fileUri, totalSize) end
+            return
+        elseif status == 16 then  -- STATUS_FAILED
+            cancelled = true
+            pcall(function() dlg.dismiss() end)
+            ti.stop()
+            if opts.onFail then pcall(opts.onFail, status) end
+            return
         end
     end
     ti.start()
+end
+
+--参数：url是文件直链,path是目录,file是文件名
+function downloadWithProgress(url, filepath, filename)
+    local downloadId = downloadFile(url, filepath, filename)
+    showDownloadDialog(downloadId, { title = "即将开始下载..." })
 end
 
 -- 读取本机输入法 APK 的安装/更新时间（毫秒时间戳）
@@ -2069,26 +2163,12 @@ local function downloadUpdateApk(url, tag, fileName)
     local savePath = "/storage/emulated/0/Download/"
 
     local downloadId = downloadFile(url, savePath, fileName)
-    local dlg = ProgressDialog(activity)
-    dlg.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL)
-    dlg.setTitle("正在下载输入法…")
-    dlg.setMessage(fileName)
-    dlg.setCancelable(false)
-    dlg.setCanceledOnTouchOutside(false)
-    dlg.setMax(100)
-    dlg.setProgress(0)
-    dlg.show()
-
-    local ti = Ticker()
-    ti.Period = 150
-    ti.onTick = function()
-        local ok, fileUri, status, totalSize, downloadedSize = pcall(query, downloadId)
-        if not ok or not status then return end
-        if totalSize and totalSize > 0 then
-            dlg.setProgress(math.floor(downloadedSize * 100 / totalSize))
-        end
-        if status == 8 then  -- STATUS_SUCCESSFUL
-            dlg.dismiss(); ti.stop()
+    -- r27.67：复用通用下载进度视图（与内部下载同一个），因此同样带取消按钮。
+    -- 差异只在完成后的处理，通过回调注入。
+    showDownloadDialog(downloadId, {
+        title = "正在下载输入法…",
+        message = fileName,
+        onSuccess = function()
             local full = savePath .. fileName
             lastDownloadId = downloadId
             if not fileLooksLikeZip(full) then
@@ -2102,19 +2182,22 @@ local function downloadUpdateApk(url, tag, fileName)
             end
             -- 通知 JS 记录本次 tag（用 pcall 防止 loadUrl 异常）
             pcall(function()
-                web.loadUrl("javascript:onUpdateInstalled('" .. tostring(tag) .. "')")
+                web.loadUrl("javascript:onUpdateInstalled('" .. tostring(tag) .. "','" .. tostring(fileName):gsub("'", "\\'") .. "')")
             end)
             installApkFile(full)
-        elseif status == 16 then  -- STATUS_FAILED
-            dlg.dismiss(); ti.stop()
+        end,
+        onFail = function()
             AlertDialog.Builder(activity)
                 .setTitle("下载失败")
                 .setMessage("下载未成功。请检查网络或换一个可用的加速代理后重试。")
                 .setPositiveButton("确定", nil)
                 .show()
-        end
-    end
-    ti.start()
+        end,
+        onCancel = function()
+            -- 取消后清掉可能存在的残缺文件，避免下次误判为已下载
+            pcall(function() File(savePath .. fileName).delete() end)
+        end,
+    })
 end
 
 local switchRepoDialog  -- WebView 里的「自定义代理地址」不再用网页内输入框：
