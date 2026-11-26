@@ -1,4 +1,5 @@
 appname="主题工作室"
+show=true
 appver="2.0"
 appcode="2"
 appsdk="15"

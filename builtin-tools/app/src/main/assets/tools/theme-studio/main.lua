@@ -224,6 +224,377 @@ function stripLuaComments(src)
     end
     return table.concat(out)
 end
+
+
+-- ============================================================================
+-- 【纯文本 Lua 字面量解析器】永不调用 load/loadstring/loadfile/dofile。
+-- 工作室读取主题数据一律走这里做"文本查询"，绝不执行任何主题 Lua 代码。
+-- 支持：nil / true / false / number / string(单双引号+长括号+转义) /
+--       table({[k]=v, name=v, v, ...})。已用真实 load 结果逐字段回归 35 项通过。
+-- 解析器本身只做字符扫描，遇到无法识别的内容按 nil 跳过，绝不抛异常。
+-- ============================================================================
+local function litNewParser(lp_src, lp_pos) return {s=lp_src, i=lp_pos or 1, n=#lp_src} end
+local function litIsDig(c) return c and c >= "0" and c <= "9" end
+local function litIsSp(c) return c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\f" end
+local LitP = {}
+LitP.__index = LitP
+local function litNP(lp_src, lp_pos) return setmetatable(litNewParser(lp_src, lp_pos), LitP) end
+
+function LitP:ws()
+    while self.i <= self.n and litIsSp(self.s:sub(self.i, self.i)) do self.i = self.i + 1 end
+end
+
+local LIT_STRMAP = { n="\n", r="\r", t="\t", b="\b", f="\f", v="\v", a="\a",
+    ["\\"]="\\", ['"']='"', ["'"]="'", ["\n"]="\n", ["\r"]="\r" }
+
+function LitP:str()
+    local s = self.s; local q = s:sub(self.i, self.i); local i = self.i
+    if q == "[" then
+        local j = i + 1; local eq = ""
+        while s:sub(j, j) == "=" do eq = eq .. "=" j = j + 1 end
+        if s:sub(j, j) == "[" then
+            local cl = "]" .. eq .. "]"; local e = s:find(cl, j + 1, true)
+            if not e then return false, nil, "长字符串未闭合" end
+            local v = s:sub(j + 1, e - 1)
+            if v:sub(1, 1) == "\n" then v = v:sub(2) end
+            self.i = e + #cl; return true, v, nil
+        end
+        return false, nil, "非字符串"
+    end
+    if q ~= '"' and q ~= "'" then return false, nil, "非字符串" end
+    i = i + 1; local o = {}
+    while i <= self.n do
+        local c = s:sub(i, i)
+        if c == q then self.i = i + 1 return true, table.concat(o), nil end
+        if c == "\\" then
+            local e = s:sub(i + 1, i + 1)
+            if LIT_STRMAP[e] then o[#o + 1] = LIT_STRMAP[e]; i = i + 2
+            elseif litIsDig(e) then
+                local d = s:sub(i + 1, i + 3):match("^(%d%d?%d?)")
+                o[#o + 1] = string.char(math.min(255, tonumber(d) or 0)); i = i + 1 + #d
+            elseif e == "x" then
+                local d = s:sub(i + 2, i + 3):match("^(%x%x)")
+                if d then o[#o + 1] = string.char(tonumber(d, 16)); i = i + 4
+                else o[#o + 1] = "x"; i = i + 2 end
+            else o[#o + 1] = e; i = i + 2 end
+        else o[#o + 1] = c; i = i + 1 end
+    end
+    return false, nil, "字符串未闭合"
+end
+
+function LitP:num()
+    local rest = self.s:sub(self.i)
+    local lead = rest:match("^(%s*)") or ""
+    local r2 = rest:sub(#lead + 1)
+    local tok = r2:match("^%-?0[xX]%x+") or r2:match("^%-?%d+%.%d+[eE]?[+-]?%d*")
+         or r2:match("^%-?%.%d+[eE]?[+-]?%d*") or r2:match("^%-?%d+[eE][+-]?%d*")
+         or r2:match("^%-?%d+")
+    if not tok then return false, nil, "非数字" end
+    self.i = self.i + #lead + #tok
+    return true, tonumber(tok) or 0, nil
+end
+
+function LitP:ident()
+    local rest = self.s:sub(self.i)
+    local lead = rest:match("^(%s*)") or ""
+    local id = rest:sub(#lead + 1):match("^([%a_][%w_]*)")
+    if not id then return nil end
+    self.i = self.i + #lead + #id
+    return id
+end
+
+function LitP:val(depth)
+    self:ws()
+    if depth > 80 then return false, nil, "嵌套过深" end
+    local s = self.s; local c = s:sub(self.i, self.i)
+    if c == "" then return false, nil, "意外结束" end
+    if c == "{" then return self:tab(depth + 1) end
+    if c == '"' or c == "'" or c == "[" then return self:str() end
+    local rest = s:sub(self.i)
+    if rest:match("^nil%f[%W]") then self.i = self.i + 3 return true, nil, nil end
+    if rest:match("^true%f[%W]") then self.i = self.i + 4 return true, true, nil end
+    if rest:match("^false%f[%W]") then self.i = self.i + 5 return true, false, nil end
+    if litIsDig(c) or (c == "-" and litIsDig(s:sub(self.i + 1, self.i + 1)))
+        or (c == "." and litIsDig(s:sub(self.i + 1, self.i + 1))) then
+        return self:num()
+    end
+    return false, nil, "无法解析:" .. c
+end
+
+function LitP:tab(depth)
+    self:ws()
+    if self.s:sub(self.i, self.i) ~= "{" then return false, nil, "非table" end
+    self.i = self.i + 1
+    local out = {}; local ai = 1
+    while self.i <= self.n do
+        self:ws()
+        local c = self.s:sub(self.i, self.i)
+        if c == "}" then self.i = self.i + 1 return true, out, nil end
+        if c == "," or c == ";" then self.i = self.i + 1
+        else
+            local save = self.i; local key = nil
+            if c == "[" then
+                self.i = self.i + 1; self:ws()
+                local ok, k = self:val(depth + 1)
+                self:ws()
+                if ok and self.s:sub(self.i, self.i) == "]" then
+                    self.i = self.i + 1; self:ws()
+                    if self.s:sub(self.i, self.i) == "=" then self.i = self.i + 1; key = k
+                    else self.i = save end
+                else self.i = save end
+            end
+            if key == nil and self.i == save then
+                local id = self:ident()
+                if id then
+                    self:ws()
+                    if self.s:sub(self.i, self.i) == "=" and self.s:sub(self.i + 1, self.i + 1) ~= "=" then
+                        self.i = self.i + 1; key = id
+                    else self.i = save end
+                end
+            end
+            local ok, v = self:val(depth + 1)
+            if not ok then self.i = self.i + 1
+            else
+                if key ~= nil then if v ~= nil then out[key] = v end
+                else if v ~= nil then out[ai] = v; ai = ai + 1 end end
+            end
+        end
+    end
+    return false, nil, "table未闭合"
+end
+
+-- 解析单个字面量，返回 ok, value, err, nextPos
+function parseLuaLiteral(lp_src, lp_pos)
+    local p = litNP(lp_src, lp_pos or 1)
+    local ok, v, err = p:val(0)
+    return ok, v, err, p.i
+end
+-- 解析 "{...}" 文本成 table，返回 tbl, err
+function parseLiteralTableText(s)
+    local ok, v, err = parseLuaLiteral(s, 1)
+    if ok and type(v) == "table" then return v, nil end
+    return nil, err or "解析失败"
+end
+-- 解析桥接快照（赋值语句形式），返回 {style=, keyboard=, meta=}
+function parseBridgeSnapshot(src)
+    local function grab(key)
+        local st = src:find(key, 1, true)
+        if not st then return nil end
+        local eq = src:find("=", st + #key, true)
+        if not eq then return nil end
+        local p = litNP(src, eq + 1); p:ws()
+        if src:sub(p.i, p.i) ~= "{" then return nil end
+        local ok, v = p:tab(0)
+        if ok then return v end
+        return nil
+    end
+    return { style = grab("d.style"), keyboard = grab("d.keyboard"), meta = grab("d.meta") }
+end
+-- ============================================================================
+
+-- ============================================================================
+-- 【main 数据编辑·纯文本提取器】只做字符级扫描，永不 load/loadstring/dofile。
+-- 用途：把主题根目录 main.lua 里的顶层字段（preset_keys/action_labels/
+-- asr_config/asr_config2/ai_config/回调 onXxx）的【源码文本】取出来给用户编辑；
+-- 编辑结果仍是纯文本，导出时原样写进 main.lua 的独立生成块。
+-- ============================================================================
+
+-- 若 s 在 i 处是字符串（单/双引号或长括号），返回跳到串尾之后的位置；否则返回 i。
+function mdSkipString(s, i)
+    local c = s:sub(i, i)
+    if c == '"' or c == "'" then
+        local j = i + 1
+        while j <= #s do
+            local ch = s:sub(j, j)
+            if ch == "\\" then j = j + 2
+            elseif ch == c then return j + 1
+            elseif ch == "\n" then return j + 1
+            else j = j + 1 end
+        end
+        return j
+    elseif c == "[" then
+        local j = i + 1; local eq = ""
+        while j <= #s and s:sub(j, j) == "=" do eq = eq .. "=" j = j + 1 end
+        if j <= #s and s:sub(j, j) == "[" then
+            local close = "]" .. eq .. "]"
+            local e = s:find(close, j + 1, true)
+            return e and (e + #close) or (#s + 1)
+        end
+    end
+    return i
+end
+
+-- 在干净文本(code，已去注释、字符串保留)里，从指向 '{' 的 p 扫描到配对 '}' 的下标。
+function mdMatchBrace(code, p)
+    local depth, i, n = 0, p, #code
+    while i <= n do
+        local c = code:sub(i, i)
+        if c == '"' or c == "'" or c == "[" then
+            local ni = mdSkipString(code, i)
+            i = (ni > i) and ni or (i + 1)   -- 保底前进：[x] 非长字符串时 mdSkipString 不推进
+        elseif c == "{" then depth = depth + 1 i = i + 1
+        elseif c == "}" then
+            depth = depth - 1
+            if depth == 0 then return i end
+            i = i + 1
+        else i = i + 1 end
+    end
+    return nil
+end
+
+-- 在干净文本里从指向 'function' 的 p 扫描到该函数匹配的 'end' 之后的位置。
+-- 规则：function/if/for/while/repeat 各开一块；standalone do 开一块（for/while 的 do 不算）；
+-- end/until 各闭一块。跳过字符串。这是语法级近似，覆盖常见回调结构。
+function mdMatchFunctionEnd(code, p)
+    local depth, i, n = 0, p, #code
+    local pendingForWhile = false
+    while i <= n do
+        local c = code:sub(i, i)
+        if c == '"' or c == "'" or c == "[" then
+            local ni = mdSkipString(code, i)
+            i = (ni > i) and ni or (i + 1)
+        elseif c:match("[%a_]") then
+            local tok = code:sub(i, i + 63):match("^[%a_][%w_]*")
+            if not tok then i = i + 1
+            else
+                if tok == "function" or tok == "if" or tok == "repeat" then
+                    depth = depth + 1
+                elseif tok == "for" or tok == "while" then
+                    depth = depth + 1; pendingForWhile = true
+                elseif tok == "do" then
+                    if pendingForWhile then pendingForWhile = false
+                    else depth = depth + 1 end
+                elseif tok == "end" or tok == "until" then
+                    depth = depth - 1
+                    if depth <= 0 then return i + #tok - 1 end
+                end
+                i = i + #tok
+            end
+        else i = i + 1 end
+    end
+    return nil
+end
+
+-- 【r27.56】定位字段定义在原文里的字节区间 [s,e]（含原始注释，按原文切片）。
+-- 定位一律在 stripLuaComments 的等长副本上做：注释/注释块被等长替换为空格，
+-- 故注释里的伪定义（如被注释掉的 name = {...} / function name()）不会被命中。
+-- 返回 s, e（1-based，含两端）；找不到返回 nil。kind="function" 兼容两种写法：
+-- function name(...) ... end / name = function(...) ... end。
+function locateMainField(src, name, kind)
+    if type(src) ~= "string" then return nil end
+    local code = stripLuaComments(src)   -- 等长；注释->空格，字符串原样
+    if kind == "function" then
+        local s = code:find("function%s+" .. name .. "%s*%(", 1)
+        local fs
+        if s then fs = s
+        else
+            local a = code:find("%f[%w]" .. name .. "%s*=%s*function%s*%(", 1)
+            if a then fs = code:find("function", a, true) end
+        end
+        if not fs then return nil end
+        local e = mdMatchFunctionEnd(code, fs)
+        if not e then return nil end
+        return fs, e
+    end
+    local s = code:find("%f[%w]" .. name .. "%s*=%s*{", 1)
+    if not s then return nil end
+    local bs = code:find("{", s, true)
+    local be = bs and mdMatchBrace(code, bs)
+    if not be then return nil end
+    return s, be
+end
+
+-- 提取 `name = { ... }`（kind="table"）或函数定义（kind="function"）的源码文本。
+-- 返回 text, err；找不到返回 nil, "不存在"。text 含原始注释（按原文切片）。
+function extractMainFieldText(src, name, kind)
+    local s, e = locateMainField(src, name, kind)
+    if not s then return nil, "不存在" end
+    return src:sub(s, e)
+end
+
+-- 纯文本轻量校验：table 用字面量解析器解析；function 只查关键字配对存在。
+-- 返回 ok, err。校验只做文本解析，绝不执行代码。
+function validateMainFieldText(text, kind)
+    if type(text) ~= "string" or text:match("^%s*$") then return false, "内容为空" end
+    if kind == "table" then
+        local body = text:gsub("^%s*[%w_]+%s*=%s*", "", 1)
+        local t, err = parseLiteralTableText(stripLuaComments(body))
+        if type(t) ~= "table" then return false, "表格式错误：" .. tostring(err) end
+        return true
+    end
+    local code = stripLuaComments(text)
+    local fs = code:find("function%s+[%w_]+%s*%(") or code:find("function%s*%(")
+    if not fs then return false, "找不到 function 定义" end
+    if not mdMatchFunctionEnd(code, fs) then return false, "function/end 未配对" end
+    return true
+end
+-- ============================================================================
+
+
+-- ============================================================================
+-- 【永不执行主题 Lua】样式脚本纯文本读取器。
+-- 样式脚本（styles/<variant>/main.lua）本质是顶层字面量赋值：
+--   name = "白昼"; background = 0xffdddddd; keyboard = {...}; key = {...};
+--   key.margins = {...}; key.hint = {...}; ...
+-- 这里逐条扫描 "路径 = 字面量"，用 parseLuaLiteral 解析值，按点号路径写入结果表。
+-- 函数体、require、inherit 调用等一律跳过——绝不编译/执行主题代码。
+-- 说明：这是桥接不可用时的降级路径；能读到的静态字面量越多，降级预览越准。
+-- ============================================================================
+local function styleSetPath(root, path, value)
+    local keys = {}
+    for k in tostring(path):gmatch("[^%.]+") do keys[#keys + 1] = k end
+    local t = root
+    for i = 1, #keys - 1 do
+        local k = keys[i]
+        if type(t[k]) ~= "table" then t[k] = {} end
+        t = t[k]
+    end
+    t[keys[#keys]] = value
+end
+
+function parseStyleFileText(path, parentEnv)
+    local src = readFile(path)
+    if not src then return nil, "样式文件不存在: " .. tostring(path) end
+    local code = stripLuaComments(src)
+    local out = {}
+    -- 已有主题根字面量（name/style/keyboard 等）作为底
+    if type(parentEnv) == "table" then
+        for _, k in ipairs({ "name", "style", "keyboard", "author", "preset_keys" }) do
+            if parentEnv[k] ~= nil then out[k] = parentEnv[k] end
+        end
+    end
+    local assignments = 0
+    -- 逐"逻辑行"扫描：样式赋值的 "=" 之后是字面量，可能跨多行（table {...}）。
+    -- 用游标在整份源码上前进：遇到 "路径 = " 就解析其后的字面量，解析完跳到值末尾。
+    local n, i = #code, 1
+    while i <= n do
+        -- 找下一个 "标识符(含点) = "（排除 == ~= <= >=）
+        local s1, e1 = code:find("([%a_][%w_%.]*)%s*=", i)
+        if not s1 then break end
+        local seg = code:sub(s1)
+        local lhs = seg:match("^([%a_][%w_%.]*)%s*=")
+        local eq = code:find("=", s1, true)
+        local nxtc = code:sub(eq + 1, eq + 1)
+        if not lhs or nxtc == "=" or nxtc == "~" or nxtc == "<" or nxtc == ">" then
+            i = eq + 1
+        else
+            local vs = eq + 1
+            local ok, v, err, after = parseLuaLiteral(code, vs)
+            if ok then
+                if v ~= nil then styleSetPath(out, lhs, v); assignments = assignments + 1 end
+                i = after
+            else
+                -- 值不是字面量（函数调用/表达式/变量名）：跳过到行尾，绝不执行。
+                local le = code:find("\n", vs, true) or (n + 1)
+                i = le + 1
+            end
+        end
+    end
+    if assignments == 0 and not next(out) then return nil, "未读到任何样式字面量" end
+    return out
+end
+-- ============================================================================
+
 function writeFile(p, s)
     local f, err = io.open(p, "w")
     if not f then return false, err end
@@ -487,6 +858,9 @@ end
 -- 已兜底 #nil/索引 nil。这里只做一次 pcall：能算出的真实数据照常写入 env；出错仅记录
 -- 不崩、不慢、不串色，且真实能算出的配色/键盘数据一项不少。
 function execWithAutoGlobal(chunk, env, chunkArg, src, path)
+    -- 【永不执行主题 Lua·熔断】历史 chunk 执行器，已禁用；仅由已熔断的
+    -- sandboxLoad 调用，正常路径不会走到这里。保留定义只为兼容。
+    if true then return false, "execWithAutoGlobal 已禁用：工作室永不执行 Lua" end
     local unpack_ = unpack or table.unpack
     local function noteErrLine(msg)
         local ln = msg:match(":(%d+)[:%s]")
@@ -517,6 +891,10 @@ function execWithAutoGlobal(chunk, env, chunkArg, src, path)
 end
 
 function sandboxLoad(path, parentEnv)
+    -- 【永不执行主题 Lua·熔断】此函数历史上会编译执行主题脚本。
+    -- 现已全量改为纯文本查询（parseThemeRootStatic / parseStyleFileText /
+    -- parseKeyboardStatic），保留定义只为兼容旧调用点，直接返回 nil，绝不执行 Lua。
+    if true then return nil, "sandboxLoad 已禁用：工作室永不执行主题 Lua，请用纯文本解析函数" end
     local src = readFile(path)
     if not src then return nil, "文件不存在: " .. tostring(path) end
     local env = {}
@@ -1066,17 +1444,13 @@ function readBridgeSnapshot()
         return nil
     end
 
-    -- ③ 解析 Lua 字面量
-    local okChunk, chunk = pcall(function() return loadstring(src) end)
-    if not okChunk or not chunk then
+    -- ③ 纯文本解析快照（绝不执行 Lua）：Java 端 snapshot() 输出的是受限字面量
+    --    （local d={} / d.style={...} / d.keyboard={...} / d.meta={...} / return d），
+    --    用 parseBridgeSnapshot 做字符级解析即可，不再 loadstring 求值。
+    local data = parseBridgeSnapshot(src)
+    if type(data) ~= "table" then
         bridgeAvailable = nil
-        bridgeDiag = "loadstring 编译快照失败"
-        return nil
-    end
-    local okRun, data = pcall(chunk)
-    if not okRun or type(data) ~= "table" then
-        bridgeAvailable = nil
-        bridgeDiag = "快照 chunk 执行失败"
+        bridgeDiag = "快照文本解析失败"
         return nil
     end
 
@@ -1114,6 +1488,10 @@ end
 local styleEdits = {}   -- 样式字段 path -> value
 local kbdEdits   = {}   -- 键盘字段 path -> value
 local kbdOps     = {}   -- 键盘结构操作：{kind=..., ...} 有序
+-- 【main 数据编辑】主题根目录 main.lua 里的顶层字段源码文本：字段名 -> 用户编辑后的完整赋值/函数文本。
+-- 只存文本、绝不执行；导出时按字段名写进 main.lua 的独立生成块（单块 upsert）。
+mainDataEdits = {}
+mainDataRemove = {} -- 恢复原始：字段名 -> true，导出时从生成块删掉该字段（让原文件定义生效）
 local dirtyCount = 0    -- 改动计数（用于提示）
 -- "只影响当前键"：为单键新建的专属样式表 名字->true。导出时这些表要先整表定义，
 -- 再写字段改动；换键盘/配色/主题时随 styleEdits 一起失效。
@@ -1845,7 +2223,8 @@ function buildPresetKeys()
     merge(themeEnv and themeEnv.preset_keys)
     local root = getThemesRoot()
     if root and currentTheme ~= "default" and fileExists(root .. "/default/main.lua") then
-        local denv = sandboxLoad(root .. "/default/main.lua")
+        -- 纯文本读取 default 主题的 preset_keys，绝不执行该主题脚本。
+        local denv = parseThemeRootStatic(root .. "/default/main.lua", "default")
         merge(denv and denv.preset_keys)
     end
     presetKeysCache = t
@@ -4030,6 +4409,39 @@ end
 --   filter     = true 时列表顶部加筛选框：空格分隔多个关键字，需全部命中；不区分大小写
 --   label      = function(v) 生成显示文本（缺省 tostring(v)）
 --   filterHint = 筛选框提示文字
+-- 通用：给 EditText 挂文本变化监听。AndroLua 一般支持「表直接当接口」，
+-- 某些版本要退回 luajava 代理；两种都试。真机 AndroLua 里 EditText 是 Java
+-- 对象（type=="userdata"），绝不能用 type(et) 守卫。
+function addTextWatcher(et, watcher)
+    if et == nil then return end
+    local okWatch = pcall(function() et.addTextChangedListener(watcher) end)
+    if not okWatch then
+        pcall(function() et.addTextChangedListener(luajava.createProxy("android.text.TextWatcher", watcher)) end)
+    end
+end
+
+-- 通用：筛选框的 TextWatcher，把当前文本交给 onChange（筛选列表共用）。
+function attachFilterWatcher(et, onChange)
+    if et == nil then return end
+    local watcher = {
+        afterTextChanged = function(ed)
+            -- Editable.toString() 一定给文本；tostring(ed) 某些 LuaJ 版本给类名，留作兜底
+            local s = ""
+            local ok, v = pcall(function() return ed.toString() end)
+            if ok and type(v) == "string" then
+                s = v
+            else
+                local ok2, v2 = pcall(function() return tostring(ed) end)
+                if ok2 and type(v2) == "string" then s = v2 end
+            end
+            onChange(s)
+        end,
+        beforeTextChanged = function(s, st, c, a) end,
+        onTextChanged = function(s, st, b, c) end,
+    }
+    addTextWatcher(et, watcher)
+end
+
 function listDialog(title, items, cb, opts)
     opts = opts or {}
     local function textOf(v)
@@ -4060,7 +4472,15 @@ function listDialog(title, items, cb, opts)
     show(items)
     lv.onItemClick = function(l, v, p, i)
         local sel = shown[p + 1]
-        if sel ~= nil then dlg.dismiss(); cb(sel) end
+        if sel ~= nil then
+            -- keepOpen=true：导航型列表（选中后还要打开子弹窗），保留本层，
+            -- 让子弹窗的返回/取消能回到这里；否则按原语义选中即关闭。
+            if not opts.keepOpen then dlg.dismiss() end
+            cb(sel)
+        end
+    end
+    if opts.keepOpen then
+        dlg.setButton2(opts.backLabel or "返回", function() dlg.dismiss() end)
     end
 
     if not opts.filter then
@@ -4116,29 +4536,7 @@ function listDialog(title, items, cb, opts)
         end
     end
 
-    local watcher = {
-        afterTextChanged = function(ed)
-            -- Editable.toString() 一定给文本；tostring(ed) 在某些 LuaJ 版本给类名，留作兜底
-            local s = ""
-            local ok, v = pcall(function() return ed.toString() end)
-            if ok and type(v) == "string" then
-                s = v
-            else
-                local ok2, v2 = pcall(function() return tostring(ed) end)
-                if ok2 and type(v2) == "string" then s = v2 end
-            end
-            apply(s)
-        end,
-        beforeTextChanged = function(s, st, c, a) end,
-        onTextChanged = function(s, st, b, c) end,
-    }
-    -- AndroLua 一般支持「表直接当接口」，失败再退回 luajava 代理
-    local okWatch = pcall(function() et.addTextChangedListener(watcher) end)
-    if not okWatch then
-        pcall(function()
-            et.addTextChangedListener(luajava.createProxy("android.text.TextWatcher", watcher))
-        end)
-    end
+    attachFilterWatcher(et, apply)
 
     dlg.setView(rootL)
     dlg.show()
@@ -4166,6 +4564,844 @@ function inputDialog(title, hint, initial, cb)
     end)
     dlg.setButton2("取消", function() dlg.dismiss() end)
     dlg.show()
+end
+
+-- ========== 通用「筛选 + 双列网格 + 点击项」弹窗骨架 ==========
+-- preset_keys 逐项编辑（修改模式）与事件选择（选择+新增模式）共用同一套 UI：
+-- 说明文字 + 筛选框 + 双列 GridView（每项两行：主键 / 摘要）+ 空态提示 + 底部按钮。
+-- 每次显示/筛选都通过 opts.items() 现取，编辑/新增/删除后 ctx.refresh() 即刷新。
+-- 严格只做 UI 与回调分发，不执行任何主题 Lua。
+--   opts = {
+--     title, tip, filterHint,          -- 标题 / 顶部说明 / 筛选框提示
+--     heightDp,                        -- 网格高度（默认 380）
+--     items = function() return arr end,-- arr 每项 { key, summary }
+--     onPick = function(item, pos, ctx) end,  -- 点某项；ctx.close()/ctx.refresh()/ctx.query()
+--     buttons = { {label=, fn=function(ctx) end}, ... },  -- 底部按钮，最多 3 个（setButton/2/3）
+--   }
+function gridPickDialog(opts)
+    opts = opts or {}
+    local dlg = LuaDialog(activity)
+    dlg.setTitle(opts.title or "选择")
+
+    local root = LinearLayout(activity)
+    root.setOrientation(LinearLayout.VERTICAL)
+    root.setPadding(dp(8), dp(6), dp(8), dp(4))
+    if opts.tip then
+        local tip = TextView(activity)
+        tip.setTextSize(11)
+        tip.setTextColor(0xFF8B949E)
+        tip.setText(opts.tip)
+        root.addView(tip, LinearLayout.LayoutParams(-1, -2))
+    end
+
+    local filterEt = EditText(activity)
+    filterEt.setSingleLine(true)
+    filterEt.setTextSize(13)
+    filterEt.setHint(opts.filterHint or "输入关键字筛选")
+    root.addView(filterEt, LinearLayout.LayoutParams(-1, dp(42)))
+
+    local gv = GridView(activity)
+    gv.setNumColumns(2)
+    gv.setColumnWidth(dp(160))
+    gv.setHorizontalSpacing(dp(6))
+    gv.setVerticalSpacing(dp(6))
+    gv.setGravity(Gravity.CENTER)
+    local gvItem = {
+        LinearLayout;
+        layout_width = "fill";
+        layout_height = "wrap";
+        padding = "6dp";
+        orientation = "vertical";
+        { TextView; id = "gk"; textSize = "13sp"; textColor = 0xFFE3B341; layout_width = "fill"; layout_height = "wrap"; };
+        { TextView; id = "gs"; textSize = "10sp"; textColor = 0xFF8B949E; layout_width = "fill"; layout_height = "wrap"; };
+    }
+    local emptyTv = TextView(activity)
+    emptyTv.setText("没有匹配项")
+    emptyTv.setTextSize(12)
+    emptyTv.setTextColor(0xFF8B949E)
+    emptyTv.setVisibility(8)
+
+    local ctx = {}
+    local shown = {}
+    function ctx.query() return tostring(filterEt.getText()) end
+    function ctx.close() dlg.dismiss() end
+
+    -- 筛选：与 preset_keys 原逻辑一致——按空白切多个词，全部命中（plain 字面匹配）
+    local function showList(q)
+        q = tostring(q or ""):lower()
+        local terms = {}
+        for t in q:gmatch("%S+") do terms[#terms + 1] = t end
+        local all = opts.items() or {}
+        shown = {}
+        for _, it in ipairs(all) do
+            local hay = ((it.key or "") .. " " .. (it.summary or "")):lower()
+            local hit = true
+            for _, t in ipairs(terms) do
+                if not hay:find(t, 1, true) then hit = false; break end
+            end
+            if hit then shown[#shown + 1] = it end
+        end
+        local adapter = LuaAdapter(activity, gvItem)
+        for _, it in ipairs(shown) do
+            adapter.add({ gk = { text = it.key or "" }, gs = { text = it.summary or "" } })
+        end
+        gv.setAdapter(adapter)
+        if #shown == 0 then
+            gv.setVisibility(8); emptyTv.setVisibility(0)
+        else
+            gv.setVisibility(0); emptyTv.setVisibility(8)
+        end
+    end
+    function ctx.refresh() showList(ctx.query()) end
+
+    gv.onItemClick = function(l, v, p, i)
+        local it = shown[p + 1]
+        if it and opts.onPick then
+            local ok, e = pcall(opts.onPick, it, p + 1, ctx)
+            if not ok then toast("操作出错：" .. tostring(e)) end
+        end
+    end
+    attachFilterWatcher(filterEt, showList)
+    showList("")
+
+    root.addView(gv, LinearLayout.LayoutParams(-1, dp(opts.heightDp or 380), 1))
+    root.addView(emptyTv, LinearLayout.LayoutParams(-1, -2))
+    dlg.setView(root)
+    -- r27.40：点号 setButton 语义（闭包捕获、不接 self），经间接层保持，勿改成 setter(dlg,...)
+    local setters = {
+        function(label, fn) dlg.setButton(label, fn) end,
+        function(label, fn) dlg.setButton2(label, fn) end,
+        function(label, fn) dlg.setButton3(label, fn) end,
+    }
+    for i, btn in ipairs(opts.buttons or {}) do
+        local setter = setters[i]
+        if setter then
+            setter(btn.label, function()
+                if btn.fn then
+                    local ok, e = pcall(btn.fn, ctx)
+                    if not ok then toast("操作出错：" .. tostring(e)) end
+                end
+            end)
+        end
+    end
+    dlg.show()
+    return ctx
+end
+
+-- 通用：从 preset_keys 预置事件里选一个，或手动输入事件串。
+-- 两处 kind=="event"（categoryPanel / 通道面板）原本各写一遍，统一到这里。
+-- 【选择 + 新增模式】复用 gridPickDialog：双列列出预置事件，点某项直接选中返回；
+-- 底部「新增事件」弹输入框手填，与 preset_keys 的「修改模式」共用同一套弹窗骨架。
+-- manualTitle 可指定"手动输入"对话框标题；不传则用字段名。
+function eventChoiceDialog(name, cur, done, manualTitle)
+    gridPickDialog({
+        title = "选择 " .. tostring(name),
+        tip = "双列列出预置事件；点某一项即选中，底部「新增事件」可手动输入。",
+        filterHint = "输入关键字筛选预置事件",
+        heightDp = 320,
+        items = function()
+            local arr = {}
+            local keyList = {}
+            for key, _ in pairs(presetKeysCache or {}) do keyList[#keyList + 1] = key end
+            table.sort(keyList)
+            for _, key in ipairs(keyList) do
+                local l = resolveEventLabel(key)
+                arr[#arr + 1] = {
+                    key = key,
+                    summary = (l and l ~= "" and l ~= key) and l or "",
+                }
+            end
+            return arr
+        end,
+        onPick = function(item, pos, ctx)
+            ctx.close()
+            done(item.key)
+        end,
+        buttons = {
+            { label = "新增事件", fn = function(ctx)
+                -- 不关本层：inputDialog 叠在事件选择窗之上。
+                -- 取消输入框 → 只关输入框，回到本窗；确定 → 提交并关闭本窗回父面板。
+                inputDialog(manualTitle or name, "如 a / space / Return", cur,
+                    function(s)
+                        done(s ~= "" and s or nil)
+                        ctx.close()
+                    end)
+            end },
+            { label = "返回", fn = function(ctx) ctx.close() end },
+        },
+    })
+end
+
+-- ========== 【main 数据编辑】主题根 main.lua 顶层字段的纯文本编辑 ==========
+-- 绝不执行主题 Lua：回显=字符级提取源码文本，写入=纯文本校验后存进 mainDataEdits，
+-- 保存时由 upsertMainDataBlock 把文本原样写进 main.lua 的独立生成块。
+MAIN_DATA_FIELDS = {
+    { name = "preset_keys",   kind = "table", label = "preset_keys — 预设按键表" },
+    { name = "action_labels", kind = "table", label = "action_labels — 动作标签文案" },
+    { name = "asr_config",    kind = "table", label = "asr_config — 语音引擎 ai1" },
+    { name = "asr_config2",   kind = "table", label = "asr_config2 — 语音引擎 ai2" },
+    { name = "ai_config",     kind = "table", label = "ai_config — AI 文本配置" },
+    { name = "onStartInput",          kind = "function", label = "回调 onStartInput — 开始输入" },
+    { name = "onSpeechResults",       kind = "function", label = "回调 onSpeechResults — 语音结果" },
+    { name = "onConfigurationChanged",kind = "function", label = "回调 onConfigurationChanged" },
+    { name = "onWindowShown",         kind = "function", label = "回调 onWindowShown" },
+    { name = "onWindowHidden",        kind = "function", label = "回调 onWindowHidden" },
+    { name = "onFinishInput",         kind = "function", label = "回调 onFinishInput" },
+    { name = "onDestroy",             kind = "function", label = "回调 onDestroy" },
+}
+MAIN_DATA_BY_LABEL = {}
+for _, f in ipairs(MAIN_DATA_FIELDS) do MAIN_DATA_BY_LABEL[f.label] = f end
+
+function mainFieldTemplate(f)
+    if f.kind == "function" then
+        return "-- 输入法在对应时机调用；工作室只做文本保存，不执行\n"
+            .. "function " .. f.name .. "(...)\n    -- 在此填写回调逻辑\nend"
+    end
+    return f.name .. " = {\n    -- 在此填写字段，例如：\n    -- key = \"值\",\n}"
+end
+
+-- 取字段当前源码文本：本次编辑值优先 > 主数据生成块里的生效值 > 主题 main.lua 原位置 > 模板。
+-- 【r27.56】生成块（文件末尾）在 Lua 加载时覆盖正文原定义，才是"真正生效的已保存内容"；
+-- 优先读它，避免就地改造前历史保存的字段被原位置旧值遮蔽、回显成旧内容。
+function mainFieldCurrentText(f)
+    if mainDataEdits[f.name] then return mainDataEdits[f.name] end
+    local src = themeDir and readFile(themeDir .. "/main.lua")
+    if src and extractMainDataBlockField then
+        local blockText = extractMainDataBlockField(src, f.name)
+        if blockText then return blockText end
+    end
+    local text = extractMainFieldText(src, f.name, f.kind)
+    if text then return text end
+    return mainFieldTemplate(f)
+end
+
+-- ========== Lua 代码纯文本高亮（只扫描字符，绝不执行 Lua） ==========
+-- 用于 main 数据编辑的 EditText：关键字/字符串/注释/数字/字段/函数名分色。
+-- 严格遵守"永不执行 Lua"：这里只做字节扫描 + 原文切片，不 load/loadstring/dofile。
+-- Span 下标是 UTF-16 code unit，而 Lua 的 # 是字节数，故先建立 byte->UTF16 映射。
+-- 注意：真机 AndroLua 词法把 default 当保留字（报 unexpected symbol near default），
+-- 故字段名一律避开 default/switch/case 等词，改用 normalText 等安全名。
+LUA_HI_COLORS = {
+    normalText = 0xFFC9D1D9,   -- 普通文本：浅灰
+    comment    = 0xFF8B949E,   -- 注释：灰
+    strText    = 0xFF7EE787,   -- 字符串：绿
+    kwText     = 0xFF79C0FF,   -- 关键字：蓝
+    numText    = 0xFFFFA657,   -- 数字：橙
+    fieldText  = 0xFFE3B341,   -- 字段/赋值左侧：黄
+    funcText   = 0xFFD2A8FF,   -- 函数名/表构造器：紫
+}
+LUA_HI_KEYWORDS = {
+    ["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true,
+    ["elseif"] = true, ["end"] = true, ["false"] = true, ["for"] = true,
+    ["function"] = true, ["if"] = true, ["in"] = true, ["local"] = true,
+    ["nil"] = true, ["not"] = true, ["or"] = true, ["repeat"] = true,
+    ["return"] = true, ["then"] = true, ["true"] = true, ["until"] = true,
+    ["while"] = true,
+}
+
+-- 返回字符串前 bytePos-1 个字节对应的 UTF-16 code unit 数（emoji 代理对计 2）。
+function luaHiUtf16(s, bytePos)
+    local n, i = 0, 1
+    local stop = math.min(bytePos, #s + 1)
+    while i < stop do
+        local c = s:byte(i)
+        local cp, step
+        if c < 0x80 then cp = c; step = 1
+        elseif c < 0xE0 then cp = (c - 0xC0) * 0x40 + ((s:byte(i + 1) or 0x80) - 0x80); step = 2
+        elseif c < 0xF0 then cp = (c - 0xE0) * 0x1000 + ((s:byte(i + 1) or 0x80) - 0x80) * 0x40 + ((s:byte(i + 2) or 0x80) - 0x80); step = 3
+        else cp = (c - 0xF0) * 0x40000 + ((s:byte(i + 1) or 0x80) - 0x80) * 0x1000 + ((s:byte(i + 2) or 0x80) - 0x80) * 0x40 + ((s:byte(i + 3) or 0x80) - 0x80); step = 4 end
+        n = n + (cp >= 0x10000 and 2 or 1)
+        i = i + step
+    end
+    return n
+end
+
+-- 给一段 Lua 文本上色，返回 SpannableString；若 Span 类不可用则原样返回字符串。
+-- r27.64: 可选 target 参数——传入 EditText 当前的 Editable 时，直接把 span 打到它上面，
+-- 不新建文本，从而保留 undo 栈与输入法管理的光标位置。返回值仍是该 target。
+function luaHighlightText(text, target, collector)
+    if type(text) ~= "string" then return text end
+    if not (_SpannableString and _Spannable and _FgSpan) then return text end
+    local ss = target
+    if ss == nil then
+        local ok, v = pcall(function() return _SpannableString(text) end)
+        if not ok or not v then return text end
+        ss = v
+    end
+    local n = #text
+    local C = LUA_HI_COLORS
+    -- byte 位置 -> UTF-16 位置（一次 O(n) 构建，后续 span 查表 O(1)）。
+    local u16 = {}
+    local acc, j = 0, 1
+    while j <= n do
+        u16[j] = acc
+        local c = text:byte(j)
+        local cp, step
+        if c < 0x80 then cp = c; step = 1
+        elseif c < 0xE0 then cp = (c - 0xC0) * 0x40 + ((text:byte(j + 1) or 0x80) - 0x80); step = 2
+        elseif c < 0xF0 then cp = (c - 0xE0) * 0x1000 + ((text:byte(j + 1) or 0x80) - 0x80) * 0x40 + ((text:byte(j + 2) or 0x80) - 0x80); step = 3
+        else cp = (c - 0xF0) * 0x40000 + ((text:byte(j + 1) or 0x80) - 0x80) * 0x1000 + ((text:byte(j + 2) or 0x80) - 0x80) * 0x40 + ((text:byte(j + 3) or 0x80) - 0x80); step = 4 end
+        acc = acc + (cp >= 0x10000 and 2 or 1)
+        j = j + step
+    end
+    u16[n + 1] = acc
+    local function span(from, to, color)
+        if to <= from then return end
+        local a, b = u16[from], u16[to]
+        if a and b and b > a then
+            local ok, fsp = pcall(function() return _FgSpan(color) end)
+            if ok and fsp then
+                pcall(function() ss.setSpan(fsp, a, b, _Spannable.SPAN_EXCLUSIVE_EXCLUSIVE) end)
+                -- 原位更新模式：把本次创建的 span 记录下来，供下次先移除再重打
+                if collector ~= nil then pcall(function() collector[#collector + 1] = fsp end) end
+            end
+        end
+    end
+    span(1, n + 1, C.normalText)
+
+    local function isAlpha(c) return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 end
+    local function isDigit(c) return c >= 48 and c <= 57 end
+    local function isAlnum(c) return isAlpha(c) or isDigit(c) end
+
+    local i = 1
+    while i <= n do
+        local c = text:byte(i)
+        if c == 45 and text:byte(i + 1) == 45 then
+            -- 注释：-- 行注释 或 --[=[ 长注释
+            local e
+            if text:byte(i + 2) == 91 then
+                local k, eq = i + 3, 0
+                while text:byte(k) == 61 do eq = eq + 1; k = k + 1 end
+                if text:byte(k) == 91 then
+                    local close = "]" .. string.rep("=", eq) .. "]"
+                    local cs = text:find(close, k + 1, true)
+                    e = cs and (cs + #close - 1) or n
+                end
+            end
+            if not e then
+                local nl = text:find("\n", i, true)
+                e = nl and (nl - 1) or n
+            end
+            span(i, e + 1, C.comment)
+            i = e + 1
+        elseif c == 34 or c == 39 then
+            -- 短字符串 "..." / '...'（跳过转义）
+            local q, k = c, i + 1
+            while k <= n do
+                local ch = text:byte(k)
+                if ch == 92 then k = k + 2
+                elseif ch == q then k = k + 1; break
+                elseif ch == 10 then break
+                else k = k + 1 end
+            end
+            span(i, math.min(k, n + 1), C.strText)
+            i = math.max(k, i + 1)
+        elseif c == 91 then
+            -- 长字符串 [[...]] / [=[...]=]
+            local k, eq = i + 1, 0
+            while text:byte(k) == 61 do eq = eq + 1; k = k + 1 end
+            if text:byte(k) == 91 then
+                local close = "]" .. string.rep("=", eq) .. "]"
+                local cs = text:find(close, k + 1, true)
+                local e = cs and (cs + #close - 1) or n
+                span(i, e + 1, C.strText)
+                i = e + 1
+            else
+                i = i + 1
+            end
+        elseif isAlpha(c) then
+            -- 标识符：关键字 / 后跟 ( { 视为函数或表构造器 / 后跟 = 视为字段
+            local k = i + 1
+            while k <= n and isAlnum(text:byte(k)) do k = k + 1 end
+            local w = text:sub(i, k - 1)
+            if LUA_HI_KEYWORDS[w] then
+                span(i, k, C.kwText)
+            else
+                local m = k
+                while m <= n do
+                    local ch = text:byte(m)
+                    if ch == 32 or ch == 9 or ch == 10 or ch == 13 then m = m + 1 else break end
+                end
+                local nx = text:byte(m)
+                if nx == 40 or nx == 123 then span(i, k, C.funcText)
+                elseif nx == 61 then span(i, k, C.fieldText) end
+            end
+            i = k
+        elseif isDigit(c) then
+            -- 数字（含小数、0x 十六进制）
+            local k = i + 1
+            while k <= n do
+                local ch = text:byte(k)
+                if isAlnum(ch) or ch == 46 then k = k + 1 else break end
+            end
+            span(i, k, C.numText)
+            i = k
+        else
+            i = i + 1
+        end
+    end
+    return ss
+end
+
+-- 给 EditText 挂 Lua 高亮：先对初始文本上色，之后输入时实时重染（busy 防递归）。
+-- 超长文本（>40000 字节）跳过实时重染，避免每次按键都全量扫描造成卡顿。
+function attachLuaHighlight(et, text)
+    -- 注意：真机 AndroLua 里 EditText 是 Java 对象，type(et)=="userdata" 而非 "table"，
+    -- 绝不能用 type(et) 做守卫，否则直接 return 会导致编辑框空白（当前值丢失）。
+    if et == nil then return end
+    if type(text) ~= "string" then text = tostring(text or "") end
+    -- 第一步：无条件先把当前值当纯文本写进去，保证任何时候都能看到原文。
+    local okBase = pcall(function() et.setText(text) end)
+    if not okBase then return end
+    -- 第二步：高亮是增强，失败也不影响已写入的文本。luaHighlightText 在 Span 类
+    -- 不可用时会原样返回字符串，此时跳过第二次 setText。
+    local okHi, ss = pcall(function() return luaHighlightText(text) end)
+    if okHi and ss and type(ss) ~= "string" then
+        pcall(function() et.setText(ss) end)
+    end
+    -- r27.64: 关键修复——高亮改为「原位操作 span」，绝不再 setText / setSelection。
+    -- 旧实现每次文本变化都 et.setText(ss2) 重建 Editable，带来两个副作用：
+    --   1) 清空 EditText 的 undo 栈 → 撤回指令无法作用于编辑器；
+    --   2) 成对符号（如 ()）上屏后，输入法经 InputConnection 异步回移光标；
+    --      旧实现紧接着用「setText 前读到的旧光标」setSelection，把它抢先写死，
+    --      表现就是「左移动作在上屏前就完成了」。
+    -- 现在只对当前 Editable 增删 ForegroundColorSpan，文本对象与光标都不碰，
+    -- undo 栈与输入法光标管理完全保留。
+    local busy = false
+    local lastSpans = {}   -- 上一次打到 ed 上的 span，重染前先移除
+    local watcher = {
+        afterTextChanged = function(ed)
+            if busy then return end
+            local ok, s = pcall(function() return ed.toString() end)
+            if not ok or type(s) ~= "string" then return end
+            if #s > 40000 then return end
+            busy = true
+            -- 1) 先移除旧 span（只移除我们打的 ForegroundColorSpan，不碰文本/光标）
+            for _, sp in ipairs(lastSpans) do
+                pcall(function() ed.removeSpan(sp) end)
+            end
+            lastSpans = {}
+            -- 2) 把新高亮直接打到当前 Editable 上；collector 收集本次 span 供下次移除
+            pcall(function()
+                luaHighlightText(s, ed, lastSpans)
+            end)
+            busy = false
+        end,
+        beforeTextChanged = function() end,
+        onTextChanged = function() end,
+    }
+    addTextWatcher(et, watcher)
+end
+
+-- 通用：多行 Lua 代码编辑弹窗骨架（tip + 高亮编辑框 + 三个按钮）。
+-- opts: title, tipText, text, minLines, buttons={{label=..., fn=function(txt)...end}, ...}
+-- 每个按钮的 fn 在点击时被调用，参数是【当前编辑框文本内容字符串】（不是 getText 函数本身！）；
+-- 返回 false 可阻止关闭。
+-- 只负责 UI 与高亮，具体校验/写回逻辑由调用方的 fn 决定，保持"永不执行 Lua"。
+function codeEditDialog(opts)
+    opts = opts or {}
+    local lay = LinearLayout(activity)
+    lay.setOrientation(LinearLayout.VERTICAL)
+    lay.setPadding(dp(12), dp(8), dp(12), dp(4))
+    if opts.tipText then
+        local tip = TextView(activity)
+        tip.setTextSize(11)
+        tip.setTextColor(0xFF8B949E)
+        tip.setText(opts.tipText)
+        lay.addView(tip, LinearLayout.LayoutParams(-1, -2))
+    end
+    local et = EditText(activity)
+    et.setGravity(Gravity.TOP)
+    et.setTextSize(opts.textSize or 14)
+    et.setMinLines(opts.minLines or 10)
+    attachLuaHighlight(et, opts.text or "")
+    et.setLayoutParams(LinearLayout.LayoutParams(-1, dp(opts.heightDp or 300)))
+    lay.addView(et)
+
+    local dlg = LuaDialog(activity)
+    dlg.setTitle(opts.title or "编辑")
+    dlg.setView(lay)
+    local function getText() return tostring(et.getText()) end
+    local function setBtn(label, fn) dlg.setButton(label, fn) end
+    local function setBtn2(label, fn) dlg.setButton2(label, fn) end
+    local function setBtn3(label, fn) dlg.setButton3(label, fn) end
+    local setters = { setBtn, setBtn2, setBtn3 }
+    for i, btn in ipairs(opts.buttons or {}) do
+        local setter = setters[i]
+        if setter then
+            setter(btn.label, function()
+                -- 传【文本内容字符串】给按钮回调；切勿传 getText 函数本身，
+                -- 否则 fn(raw) 里 raw:match(...) 会报 "attempt to index a function value"。
+                -- 【r27.57】按钮回调整体 pcall：真机 AndroLua 里未捕获的 Lua 异常会
+                -- 直接结束 Activity（表现为"工具自己退出"）。这里兜住异常、把具体
+                -- 错误 toast 出来、并保持弹窗不关，便于定位且不丢用户正在编辑的内容。
+                local ok, keep = pcall(function()
+                    return btn.fn and btn.fn(getText())
+                end)
+                if not ok then
+                    logErr("按钮:" .. tostring(btn.label), keep)
+                    -- 落盘取证：工具不退出，但把 Lua 堆栈写进文件，便于事后定位
+                    pcall(function()
+                        local f = io.open("/sdcard/Download/主题工作室_按钮错误.txt", "a")
+                        if f then
+                            f:write("\n===== " .. os.date("%m-%d %H:%M:%S")
+                                .. " 按钮[" .. tostring(btn.label) .. "] =====\n"
+                                .. tostring(keep) .. "\n")
+                            f:close()
+                        end
+                    end)
+                    pcall(toast, btn.label .. "失败：" .. tostring(keep))
+                    return   -- 出错时保持弹窗打开，不清空、不退出
+                end
+                if keep ~= false and btn.close ~= false then dlg.dismiss() end
+            end)
+        end
+    end
+    dlg.show()
+    return dlg
+end
+
+function mainDataFieldDialog(f)
+    local cur = mainFieldCurrentText(f)
+    local function onWrite(s)
+        local ok, err = validateMainFieldText(s, f.kind)
+        if not ok then
+            toast("文本格式校验未通过：" .. tostring(err) .. "\n（仍保留在编辑器，可继续修改）")
+            return false   -- 校验失败：保持编辑框不关闭
+        end
+        -- 与原文相同则视为未改动：清掉编辑与恢复标记
+        local src = themeDir and readFile(themeDir .. "/main.lua")
+        local orig = extractMainFieldText(src, f.name, f.kind)
+        local changed = (orig == nil) or (s ~= orig)
+        if changed then
+            mainDataEdits[f.name] = s
+            mainDataRemove[f.name] = nil
+            markDirty(1)
+            pcall(refreshDirty)
+            toast("已记录改动（保存主题时写入 main.lua）")
+        else
+            mainDataEdits[f.name] = nil
+            mainDataRemove[f.name] = nil
+            toast("与原文一致，未产生改动")
+        end
+    end
+    local function onRestore()
+        local src = themeDir and readFile(themeDir .. "/main.lua")
+        local orig = extractMainFieldText(src, f.name, f.kind)
+        local hadEdit = mainDataEdits[f.name] ~= nil
+        local hadRemove = mainDataRemove[f.name] == true
+        if orig then
+            -- 原文件里有该字段：直接删掉覆盖/恢复标记，回到原文
+            mainDataEdits[f.name] = nil
+            mainDataRemove[f.name] = nil
+            if hadEdit or hadRemove then markDirty(1) end
+            toast("已恢复为原文件定义")
+        else
+            -- 原文件没有：标记删除，使生成块也不再输出该字段
+            mainDataEdits[f.name] = nil
+            if not hadRemove then mainDataRemove[f.name] = true; markDirty(1) end
+            toast("已移除该字段（保存后不再生成）")
+        end
+        pcall(refreshDirty)
+    end
+    codeEditDialog({
+        title = f.label,
+        tipText = "纯文本编辑：工作室只保存文本，不会执行这些 Lua 代码；保存主题后由输入法加载生效。",
+        text = cur,
+        buttons = {
+            { label = "写入", fn = onWrite },
+            { label = "恢复原始", fn = onRestore },
+            { label = "取消", fn = function() end },
+        },
+    })
+end
+
+-- ========== preset_keys 逐项编辑器（纯文本拆项 + 筛选 + 左右分栏） ==========
+-- 绝不执行主题 Lua：stripLuaComments 等长剥离注释后，用花括号/字符串配对定位每一项，
+-- 只做原文切片；编辑/删除/新增都只替换对应片段，重建整段再走 mainDataEdits 单块写回。
+
+-- 把 preset_keys 整段文本拆成逐项。
+-- 返回 items, tail：每项 { key=键名, pre=该项前的原文(含注释/逗号/缩进), raw=键到值的原文(不含逗号) }；
+-- tail 为最后一项之后到闭合 '}' 之前的原文。解析失败返回 {}, ""。
+function pkParseItems(full)
+    local items, tail = {}, ""
+    if type(full) ~= "string" then return items, tail end
+    local code = stripLuaComments(full)   -- 等长：注释已变空格，字符串保留
+    local s = code:find("preset_keys%s*=%s*{", 1)
+    if not s then return items, tail end
+    local b = code:find("{", s, true)
+    if not b then return items, tail end
+    local e = mdMatchBrace(code, b)
+    if not e then return items, tail end
+    local bodyEnd = e - 1
+    local i, lastEnd = b + 1, b + 1
+    while i <= bodyEnd do
+        local prevI = i   -- 保底：任何分支若未能推进，强制 +1，杜绝死循环
+        local c = code:sub(i, i)
+        if c:match("%s") or c == "," then
+            i = i + 1
+        else
+            -- 解析键：标识符 / "字符串" / '字符串' / [字符串] / [数字]
+            local keyStart, key, ni = i, nil, i
+            if c == '"' or c == "'" then
+                local ns = mdSkipString(code, i)
+                if ns > i then key = full:sub(i + 1, ns - 2); ni = ns end
+            elseif c == "[" then
+                local cb = code:find("]", i + 1, true)
+                if cb and cb <= bodyEnd then
+                    local inner = full:sub(i + 1, cb - 1)
+                    inner = inner:gsub("^[\"']", ""):gsub("[\"']$", "")
+                    key = inner; ni = cb + 1
+                end
+            else
+                local tok = code:sub(i, bodyEnd):match("^[%a_][%w_]*")
+                if tok then key = tok; ni = i + #tok end
+            end
+            if not key then
+                i = i + 1
+            else
+                -- 跳空白找 '='
+                local eq = ni
+                while eq <= bodyEnd and code:sub(eq, eq):match("%s") do eq = eq + 1 end
+                if code:sub(eq, eq) ~= "=" then
+                    i = ni
+                else
+                    local v = eq + 1
+                    while v <= bodyEnd and code:sub(v, v):match("%s") do v = v + 1 end
+                    local vend = v
+                    local vc = code:sub(v, v)
+                    if vc == "{" then
+                        vend = mdMatchBrace(code, v) or v
+                    elseif vc == '"' or vc == "'" then
+                        local ns = mdSkipString(code, v)
+                        vend = (ns > v) and (ns - 1) or v
+                    elseif vc == "[" then
+                        local ns = mdSkipString(code, v)
+                        vend = (ns > v) and (ns - 1) or v
+                    else
+                        local j = v
+                        while j <= bodyEnd and code:sub(j, j) ~= "," and code:sub(j, j) ~= "\n" do
+                            local cc = code:sub(j, j)
+                            if cc == '"' or cc == "'" or cc == "[" then
+                                local ns = mdSkipString(code, j)
+                                j = (ns > j) and ns or (j + 1)
+                            else j = j + 1 end
+                        end
+                        vend = j - 1
+                    end
+                    if vend < v then vend = v end
+                    -- 若值末尾之后到行尾只有空白（行内注释已被剥离成空格），把它并入本项原文
+                    local nl = code:find("\n", vend, true) or (bodyEnd + 1)
+                    local between = code:sub(vend + 1, nl - 1)
+                    local rawEnd = vend
+                    if between:match("^%s*$") then rawEnd = nl - 1 end
+                    items[#items + 1] = {
+                        key = key,
+                        pre = full:sub(lastEnd, keyStart - 1),
+                        raw = full:sub(keyStart, rawEnd),
+                    }
+                    lastEnd = rawEnd + 1
+                    i = rawEnd + 1
+                end
+            end
+        end
+        if i <= prevI then i = prevI + 1 end
+    end
+    tail = full:sub(lastEnd, e - 1)
+    return items, tail
+end
+
+-- 用 items/tail 重建 preset_keys 整段文本（保留原有大括号与括号后内容）。
+function pkRebuild(full, items, tail)
+    if type(full) ~= "string" then return full end
+    local code = stripLuaComments(full)
+    local s = code:find("preset_keys%s*=%s*{", 1)
+    if not s then return full end
+    local b = code:find("{", s, true)
+    local e = b and mdMatchBrace(code, b)
+    if not e then return full end
+    local out = { full:sub(1, b) }
+    for _, it in ipairs(items) do
+        out[#out + 1] = it.pre
+        out[#out + 1] = it.raw
+    end
+    out[#out + 1] = tail
+    out[#out + 1] = full:sub(e)
+    return table.concat(out)
+end
+
+-- 取某项摘要：label / send / 其它简单字段，供左侧列表第二行显示。
+function pkSummary(raw)
+    if type(raw) ~= "string" then return "" end
+    local function grab(f)
+        return raw:match(f .. '%s*=%s*"([^"]*)"')
+            or raw:match(f .. "%s*=%s*'([^']*)'")
+            or raw:match(f .. "%s*=%s*([%w_%.]+)")
+    end
+    local label = grab("label")
+    local send = grab("send")
+    local parts = {}
+    if label then parts[#parts + 1] = "label=" .. label end
+    if send then parts[#parts + 1] = "send=" .. send end
+    if #parts == 0 then
+        local head = raw:match("^%s*[^\n]+")
+        parts[#parts + 1] = head and head:sub(1, 48) or ""
+    end
+    return table.concat(parts, "  ")
+end
+
+function presetKeysDialog(f)
+    if not themeDir then toast("请先选择主题"); return end
+    local function loadFull()
+        return mainFieldCurrentText({ name = "preset_keys", kind = "table" })
+    end
+    local full = loadFull()
+    local items, tail = pkParseItems(full)
+    if #items == 0 then
+        toast("未能拆出 preset_keys 项，请改用整段编辑")
+        mainDataFieldDialog(f)
+        return
+    end
+
+    local ctx   -- 前向声明：gridPickDialog 建好后回填，供 commit/restoreAll 刷新列表
+
+    -- 数据源：现取 items，附原始项引用 src 供编辑窗口使用（修改模式）
+    local function itemsOf()
+        local arr = {}
+        for _, it in ipairs(items) do
+            arr[#arr + 1] = { key = it.key, summary = pkSummary(it.raw), src = it }
+        end
+        return arr
+    end
+
+    -- 写回：只替换单项片段后重建整段，仍走 mainDataEdits 单块 upsert
+    local function commit(newFull, msg)
+        local ok, err = validateMainFieldText(newFull, "table")
+        if not ok then
+            toast("校验未通过：" .. tostring(err) .. "（改动未保存，可继续修改）")
+            return false
+        end
+        local src = themeDir and readFile(themeDir .. "/main.lua")
+        local orig = extractMainFieldText(src, "preset_keys", "table")
+        if orig and newFull == orig then
+            mainDataEdits["preset_keys"] = nil
+            mainDataRemove["preset_keys"] = nil
+            toast("与原文一致，未产生改动")
+        else
+            mainDataEdits["preset_keys"] = newFull
+            mainDataRemove["preset_keys"] = nil
+            markDirty(1)
+            toast(msg)
+        end
+        pcall(refreshDirty)
+        full = newFull
+        items, tail = pkParseItems(full)
+        if ctx then ctx.refresh() end
+        return true
+    end
+
+    -- 点某一项：弹出独立编辑窗口（修改模式）
+    local function editItemDialog(it)
+        codeEditDialog({
+            title = "编辑：" .. it.key,
+            tipText = "纯文本编辑，只保存不执行 Lua。",
+            text = it.raw,
+            textSize = 12,
+            buttons = {
+                { label = "写入", fn = function(raw)
+                    if raw:match("^%s*$") then toast("该项内容为空"); return false end
+                    local built = {}
+                    for _, x in ipairs(items) do
+                        built[#built + 1] = { key = x.key, pre = x.pre, raw = (x == it) and raw or x.raw }
+                    end
+                    return commit(pkRebuild(full, built, tail), "已记录该项改动（保存主题时写入 main.lua）")
+                end },
+                { label = "删除该项", fn = function()
+                    local built = {}
+                    for _, x in ipairs(items) do
+                        if x ~= it then built[#built + 1] = { key = x.key, pre = x.pre, raw = x.raw } end
+                    end
+                    if #built == #items then toast("未选中有效项"); return false end
+                    return commit(pkRebuild(full, built, tail), "已删除该项（保存主题时写入 main.lua）")
+                end },
+                { label = "取消", fn = function() end },
+            },
+        })
+    end
+
+    local function addItem()
+        inputDialog("新增 preset_keys 项", "键名（如 MY_KEY）", "", function(key)
+            key = tostring(key):gsub("^%s+", ""):gsub("%s+$", "")
+            if key == "" then toast("键名不能为空"); return end
+            local dupe = false
+            for _, it in ipairs(items) do if it.key == key then dupe = true; break end end
+            if dupe then toast("键名已存在：" .. key); return end
+            local built = {}
+            for _, it in ipairs(items) do built[#built + 1] = { key = it.key, pre = it.pre, raw = it.raw } end
+            built[#built + 1] = { key = key, pre = ",\n    ", raw = key .. ' = { label = "' .. key .. '", send = "' .. key .. '" }' }
+            commit(pkRebuild(full, built, tail), "已新增该项（保存主题时写入 main.lua）")
+        end)
+    end
+    local function restoreAll()
+        mainDataEdits["preset_keys"] = nil
+        mainDataRemove["preset_keys"] = nil
+        full = loadFull()
+        items, tail = pkParseItems(full)
+        if ctx then ctx.refresh() end
+        pcall(refreshDirty)
+        toast("已恢复为原文件的 preset_keys")
+    end
+
+    ctx = gridPickDialog({
+        title = "preset_keys 逐项编辑（共 " .. #items .. " 项）",
+        tip = "双列列出每一项；点某一项弹出编辑窗口。写入只保存文本，不执行 Lua。",
+        filterHint = "筛选 key / label / send（共 " .. #items .. " 项）",
+        items = itemsOf,
+        onPick = function(item, pos, c)
+            editItemDialog(item.src)
+        end,
+        buttons = {
+            { label = "新增项", fn = addItem },
+            { label = "恢复全部", fn = restoreAll },
+            { label = "返回", fn = function(c) c.close() end },
+        },
+    })
+end
+
+function mainDataDialog()
+    if not currentTheme or not themeDir then
+        toast("请先选择主题")
+        return
+    end
+    -- 【双列 + 保留父层】点字段打开编辑框时本列表不关闭，编辑框的"取消/返回"
+    -- 只关它自己，从而回到这里；这里再点"返回"才回主界面。
+    gridPickDialog({
+        title = "main 数据编辑（主题根 main.lua）",
+        tip = "双列列出字段；点某项编辑，编辑框的返回只回到本列表。",
+        filterHint = "筛选字段名 / 说明",
+        heightDp = 400,
+        items = function()
+            local arr = {}
+            for _, f in ipairs(MAIN_DATA_FIELDS) do
+                local desc = f.label:match("—%s*(.+)$") or f.label
+                arr[#arr + 1] = { key = f.name, summary = desc, f = f }
+            end
+            return arr
+        end,
+        onPick = function(item, pos, ctx)
+            local f = item.f
+            if not f then return end
+            if f.name == "preset_keys" then
+                presetKeysDialog(f)
+            else
+                mainDataFieldDialog(f)
+            end
+            -- 不调 ctx.close()：保留 main 数据列表作为上层
+        end,
+        buttons = {
+            { label = "返回", fn = function(c) c.close() end },
+        },
+    })
 end
 
 -- HSV 取色（复用经过验证的纯 Lua 实现 + Bitmap 预渲染）
@@ -4820,21 +6056,7 @@ local function editCatItem(it, done)
         colorDialog("修改 " .. it.name, type(it.v) == "number" and it.v or nil,
             function(n) if n then done(n) end end)
     elseif it.kind == "event" then
-        local opts = { "✎ 手动输入…" }
-        local keyList = {}
-        for key, _ in pairs(presetKeysCache or {}) do keyList[#keyList + 1] = key end
-        table.sort(keyList)
-        for _, key in ipairs(keyList) do
-            local l = resolveEventLabel(key)
-            opts[#opts + 1] = (l and l ~= "" and l ~= key) and (key .. "  " .. l) or key
-        end
-        listDialog("选择 " .. it.name, opts, function(sel)
-            if sel == "✎ 手动输入…" then
-                inputDialog(it.name, "如 a / space / Return", it.v, function(s) done(s ~= "" and s or nil) end)
-            else
-                done(sel:match("^([^%s]+)") or sel)
-            end
-        end, { filter = true, filterHint = "输入关键字筛选预置事件" })
+        eventChoiceDialog(it.name, it.v, done, it.name)
     else
         local isNum = (it.kind == "number")
         inputDialog("修改 " .. it.name, isNum and "输入数字" or "留空=删除该项", it.v, function(s)
@@ -5350,21 +6572,7 @@ channelEditDialog = function(r, k, chId)
             colorDialog("修改 " .. it.name, type(it.v) == "number" and it.v or nil,
                 function(n) if n then done(n) end end)
         elseif it.kind == "event" then
-            local opts = { "✎ 手动输入…" }
-            local keyList = {}
-            for key, _ in pairs(presetKeysCache or {}) do keyList[#keyList + 1] = key end
-            table.sort(keyList)
-            for _, key in ipairs(keyList) do
-                local l = resolveEventLabel(key)
-                opts[#opts + 1] = (l and l ~= "" and l ~= key) and (key .. "  " .. l) or key
-            end
-            listDialog("选择 " .. it.name, opts, function(sel)
-                if sel == "✎ 手动输入…" then
-                    inputDialog("事件字符串", "如 a / space / Return", it.v, function(s) done(s ~= "" and s or nil) end)
-                else
-                    done(sel:match("^([^%s]+)") or sel)
-                end
-            end, { filter = true, filterHint = "输入关键字筛选预置事件" })
+            eventChoiceDialog(it.name, it.v, done, "事件字符串")
         else
             local isNum = (it.kind == "number")
             inputDialog("修改 " .. it.name, isNum and "输入数字" or "留空=删除该项", it.v, function(s)
@@ -5496,7 +6704,7 @@ keyEditDialog = function(r, k)
             if it == sel and ids[i] then channelEditDialog(r, k, ids[i]); return end
         end
         channelEditDialog(r, k, "click")
-    end)
+    end, { keepOpen = true })
 end
 
 -- 插键类型选择
@@ -5732,7 +6940,7 @@ function toolbarEntryDialog()
         if sel:find("样式（背景") then toolbarSettingsDialog()
         elseif sel:find("按键列表") then if tbKeysDialog then tbKeysDialog() end
         else styleEditorDialog() end
-    end)
+    end, { keepOpen = true })
 end
 
 -- 工具栏 keys 原文编辑
@@ -5764,13 +6972,13 @@ tbKeysDialog = function()
     dlg.setView(lay)
     dlg.setButton("写入", function()
         local s = tostring(et.getText())
-        local ok, tbl = pcall(function() return load("return {" .. s .. "}")() end)
-        if ok and type(tbl) == "table" then
+        local tbl, perr = parseLiteralTableText("{" .. s .. "}")
+        if type(tbl) == "table" then
             setValue("toolbar.keys", tbl)
             dlg.dismiss(); renderPreview()
             toast("已更新工具栏（保存主题时写入）")
         else
-            toast("Lua 语法错误：" .. tostring(tbl))
+            toast("按键列表格式错误：" .. tostring(perr))
         end
     end)
     dlg.setButton2("取消", function() dlg.dismiss() end)
@@ -5828,18 +7036,224 @@ function opToLua(op)
     return nil
 end
 
--- 向文件追加生成块（保留原内容）
--- 【改为"追加"而非"先删旧块再写"】覆盖原主题需要连续保存：上一次保存的块已经落盘，
--- 若这次先 strip 掉它再只写本次增量，上一次的改动就全丢了（块是增量补丁，不是全量快照）。
--- 追加多个块时后者覆盖前者，语义正好是"在已保存结果上继续改"，天然幂等且不丢历史改动。
-function appendBlockTo(path, lines)
+-- 向文件写入生成块：单块维护（同 path 就地改写，新 path 才追加，块恒为 1）。
+-- 【为什么改掉原来的"每次追加一块"】连续保存时旧方案每次都追加一个新块，块越堆越多、
+-- 文件无限增大。新方案把块当作"当前所有改动的最终快照"：块里已有的 path 直接替换其值行，
+-- 块里没有的才追加。行的先后仍是"整表定义在前、字段赋值在后、删除 nil 在最后"（由
+-- buildWriteLines 保证顺序），改写只动值不动顺序，故覆盖语义不变。
+-- 行格式统一为 "<path> = <literal>"；无 path 的行（保留兼容）原样留在块里，不改。
+local function linePath(line)
+    -- 只认 luaPath 会产生的标识符/点/数字下标形式；"table.insert(...)" 这类不算 path。
+    return line:match("^%s*([%a_][%w_%.%[%]\"']*)%s*=")
+end
+function upsertBlockTo(path, lines)
     if #lines == 0 then return true end
     local src = readFile(path) or ""
-    if not src:find("\n$") then src = src .. "\n" end
-    local out = { src, "\n", BLOCK_BEGIN, "  -- ", os.date("%Y-%m-%d %H:%M:%S"), "\n" }
-    for _, ln in ipairs(lines) do table.insert(out, ln); table.insert(out, "\n") end
-    table.insert(out, BLOCK_END)
-    table.insert(out, "\n")
+
+    local head, tail = src, ""
+    local oldLines, posOf = {}, {}
+
+    -- 收一行：同 path 只保留最后一次出现的值（旧多块场景下后者覆盖前者，最终值即最后一次）
+    local function addLine(t)
+        local p = linePath(t)
+        if p and posOf[p] then
+            oldLines[posOf[p]].text = t
+        else
+            local i = #oldLines + 1
+            oldLines[i] = { p = p, text = t }
+            if p then posOf[p] = i end
+        end
+    end
+
+    -- 1) 扫描并删除【所有】历史生成块，把块内各行收进 oldLines（去重取最终值）。
+    -- 必须收全部：旧版本每次保存都追加一块，Lua 里后者覆盖前者；若只 upsert 第一个，
+    -- 后面残留的旧块会在新块之后执行、把本次改动覆盖掉。收拢成单块才彻底。
+    local bs = src:find(BLOCK_BEGIN, 1, true)
+    if bs then
+        head = src:sub(1, bs - 1)
+        local p = bs
+        while true do
+            local b = src:find(BLOCK_BEGIN, p, true)
+            if not b then break end
+            local e = src:find(BLOCK_END, b, true)
+            if not e then break end
+            for ln in (src:sub(b + #BLOCK_BEGIN, e - 1) .. "\n"):gmatch("([^\n]*)\n") do
+                local t = ln:gsub("^%s+", ""):gsub("%s+$", "")
+                if t ~= "" and t:sub(1, 2) ~= "--" then addLine(t) end
+            end
+            p = e + #BLOCK_END
+        end
+        tail = src:sub(p)
+    end
+    if not head:find("\n$") then head = head .. "\n" end
+
+    -- 2) 本次每行：同 path 就地改值，新 path 追加
+    for _, ln in ipairs(lines) do
+        addLine(type(ln) == "string" and ln or tostring(ln))
+    end
+
+    -- 3) 重组：正文 + 单个块 + 尾部残留
+    local out = { head, "\n", BLOCK_BEGIN, "  -- ", os.date("%Y-%m-%d %H:%M:%S"), "\n" }
+    for _, l in ipairs(oldLines) do out[#out + 1] = l.text; out[#out + 1] = "\n" end
+    out[#out + 1] = BLOCK_END
+    out[#out + 1] = "\n"
+    if tail ~= "" then
+        if not tail:match("^\n") then out[#out + 1] = "\n" end
+        out[#out + 1] = tail
+    end
+    return atomicWriteFile(path, table.concat(out))
+end
+
+-- ===== 【main 数据】独立生成块：单块 upsert，按字段名维护，块恒为 1 =====
+-- 与上面的样式/键盘生成块（BLOCK_BEGIN）互不干扰：main 数据写在主题根 main.lua，
+-- 用自己的标记对。块内每个字段一段：
+--   -- @mf:<字段名>
+--   <用户编辑的完整源码文本>
+--   -- @me
+-- 同名字段就地换整段；新字段追加；恢复原始则删段（让原文件里的定义生效）。
+MAIN_DATA_BEGIN = "-- >>>>> Theme Studio main数据，请勿手改 >>>>>"
+MAIN_DATA_END   = "-- <<<<< Theme Studio main数据结束 <<<<<"
+MAIN_F_BEGIN = "-- @mf:"
+MAIN_F_END   = "-- @me"
+
+-- 【r27.56】从 main 数据生成块里取某字段当前保存的文本（回显用，块内值覆盖正文）。
+-- 纯文本扫描，绝不执行 Lua。找不到返回 nil。
+function extractMainDataBlockField(src, name)
+    if type(src) ~= "string" then return nil end
+    local p = 1
+    local found = nil
+    while true do
+        local b = src:find(MAIN_DATA_BEGIN, p, true)
+        if not b then break end
+        local e = src:find(MAIN_DATA_END, b, true)
+        if not e then break end
+        local body = src:sub(b + #MAIN_DATA_BEGIN, e - 1)
+        local cur = nil; local buf = {}
+        local function flush()
+            if cur == name then
+                while #buf > 0 and buf[1]:match("^%s*$") do table.remove(buf, 1) end
+                while #buf > 0 and buf[#buf]:match("^%s*$") do table.remove(buf, #buf) end
+                found = table.concat(buf, "\n")
+            end
+            cur = nil; buf = {}
+        end
+        for ln in (body .. "\n"):gmatch("([^\n]*)\n") do
+            local t = ln:gsub("^%s+", ""):gsub("%s+$", "")
+            if t:sub(1, #MAIN_F_BEGIN) == MAIN_F_BEGIN then
+                flush()
+                local nm = t:sub(#MAIN_F_BEGIN + 1):gsub("^%s+", ""):gsub("%s+$", "")
+                if nm ~= "" then cur = nm end
+            elseif t == MAIN_F_END then
+                flush()
+            elseif cur then
+                buf[#buf + 1] = ln
+            end
+        end
+        flush()
+        p = e + #MAIN_DATA_END
+    end
+    return found
+end
+
+-- fields: name -> 完整文本；removes: name -> true。返回是否成功。
+function upsertMainDataBlock(path, fields, removes)
+    fields = fields or {}; removes = removes or {}
+    local src = readFile(path) or ""
+    local head, tail = src, ""
+    local oldBy, order = {}, {}
+
+    local function absorbBlock(b, e)
+        local body = src:sub(b + #MAIN_DATA_BEGIN, e - 1)
+        local cur = nil; local buf = {}
+        local function flush()
+            if cur then
+                if oldBy[cur] == nil then order[#order + 1] = cur end
+                while #buf > 0 and buf[1]:match("^%s*$") do table.remove(buf, 1) end
+                while #buf > 0 and buf[#buf]:match("^%s*$") do table.remove(buf, #buf) end
+                oldBy[cur] = table.concat(buf, "\n")
+            end
+            cur = nil; buf = {}
+        end
+        for ln in (body .. "\n"):gmatch("([^\n]*)\n") do
+            local t = ln:gsub("^%s+", ""):gsub("%s+$", "")
+            if t:sub(1, #MAIN_F_BEGIN) == MAIN_F_BEGIN then
+                flush()
+                local nm = t:sub(#MAIN_F_BEGIN + 1):gsub("^%s+", ""):gsub("%s+$", "")
+                if nm ~= "" then cur = nm end
+            elseif t == MAIN_F_END then
+                flush()
+            elseif cur then
+                buf[#buf + 1] = ln
+            end
+        end
+        flush()
+        return b, e
+    end
+
+    -- 1) 删所有历史 main 数据块，收拢其中字段（后者覆盖前者）
+    local bs = src:find(MAIN_DATA_BEGIN, 1, true)
+    if bs then
+        head = src:sub(1, bs - 1)
+        local p = bs
+        while true do
+            local b = src:find(MAIN_DATA_BEGIN, p, true)
+            if not b then break end
+            local e = src:find(MAIN_DATA_END, b, true)
+            if not e then break end
+            absorbBlock(b, e)
+            p = e + #MAIN_DATA_END
+        end
+        tail = src:sub(p)
+    end
+    if not head:find("\n$") then head = head .. "\n" end
+
+    -- 2)【r27.56 就地优先】本次字段：能在正文原位置定位到定义 → 直接替换原位置文本；
+    --    定位不到（原文件本无此字段）→ 才写进末尾生成块。
+    --    就地成功的同时必须把该字段从 oldBy（历史生成块收拢值）里删掉：
+    --    否则末尾生成块的旧值会覆盖正文刚写好的新值，回显/运行都读到旧的。
+    --    定位统一走 locateMainField（内部 stripLuaComments 等长去注释），
+    --    注释/注释块里的伪定义不会被误改到。
+    local inPlaceDone = {}   -- 本次已就地写入的字段，后续不再进生成块
+    for nm, text in pairs(fields) do
+        text = tostring(text)
+        local kind = (text:match("^%s*function%s+") or text:match("^%s*[%w_]+%s*=%s*function%s*%("))
+            and "function" or "table"
+        local s, e = locateMainField(head, nm, kind)
+        if s then
+            head = head:sub(1, s - 1) .. text .. head:sub(e + 1)
+            oldBy[nm] = nil          -- 清历史块旧值，防止末尾覆盖
+            inPlaceDone[nm] = true
+        end
+    end
+
+    -- 3) 应用本次：删除优先，其次覆盖/追加（顺序稳定）
+    for nm in pairs(removes) do oldBy[nm] = nil end
+    for nm, text in pairs(fields) do
+        if inPlaceDone[nm] then
+            -- 已就地写入正文，不进生成块
+        else
+            if oldBy[nm] == nil then order[#order + 1] = nm end
+            oldBy[nm] = tostring(text)
+        end
+    end
+
+    -- 4) 重组：正文 + 单块 + 尾部残留
+    local out = { head, "\n", MAIN_DATA_BEGIN, "\n" }
+    for _, nm in ipairs(order) do
+        local text = oldBy[nm]
+        if text and text ~= "" then
+            out[#out + 1] = MAIN_F_BEGIN .. nm .. "\n"
+            out[#out + 1] = text
+            if not text:match("\n$") then out[#out + 1] = "\n" end
+            out[#out + 1] = MAIN_F_END .. "\n"
+        end
+    end
+    out[#out + 1] = MAIN_DATA_END
+    out[#out + 1] = "\n"
+    if tail ~= "" then
+        if not tail:match("^\n") then out[#out + 1] = "\n" end
+        out[#out + 1] = tail
+    end
     return atomicWriteFile(path, table.concat(out))
 end
 
@@ -5961,21 +7375,88 @@ function buildWriteLines()
     for _, ln in ipairs(plain) do table.insert(styleLines, ln) end
     for _, ln in ipairs(plainNil) do table.insert(styleLines, ln) end
 
-    -- 3) 键盘写回语句：字段 + 结构操作 + 删除（删除放最后，避免被后续赋值重建）
+    -- 3) 键盘写回语句。
+    -- 【单块维护的关键】只要发生过结构操作（增删/移动/交换），就整表覆盖 rows 一行，
+    -- 而不是逐条重放 insert/swap。kbdEnv.rows 已是编辑后的完整状态（每个结构操作都
+    -- 直接改了它），整表写回后 upsert 按 path "rows" 就地改这一行，块不增长。
+    -- 若仍用逐条 insert/swap，这些语句没有唯一 path、无法就地改写，会越攒越多。
     local kbdLines = {}
-    for path, v in pairs(kbdEdits) do
-        if v ~= "\255UNSET\255" then
-            table.insert(kbdLines, luaPath(path) .. " = " .. serializeValue(v))
+    local hasStructOp = false
+    for _, op in ipairs(kbdOps) do
+        if op.kind ~= "top" then hasStructOp = true; break end
+    end
+
+    if hasStructOp and type(kbdEnv) == "table" and type(kbdEnv.rows) == "table" then
+        -- 顶层非 rows 字段（key_width/key_height/ascii_mode 等）仍用 path 行覆盖
+        for path, v in pairs(kbdEdits) do
+            if path ~= "rows" and path:sub(1, 5) ~= "rows." and v ~= "\255UNSET\255" then
+                table.insert(kbdLines, luaPath(path) .. " = " .. serializeValue(v))
+            end
+        end
+        for _, op in ipairs(kbdOps) do
+            if op.kind == "top" then
+                local ln = opToLua(op); if ln then table.insert(kbdLines, ln) end
+            end
+        end
+        table.insert(kbdLines, "rows = " .. serializeValue(kbdEnv.rows))
+    else
+        -- 无结构操作：字段 + 顶层赋值 + 删除（全是 path 行，upsert 就地改，不累积）
+        for path, v in pairs(kbdEdits) do
+            if v ~= "\255UNSET\255" then
+                table.insert(kbdLines, luaPath(path) .. " = " .. serializeValue(v))
+            end
+        end
+        for _, op in ipairs(kbdOps) do
+            local ln = opToLua(op); if ln then table.insert(kbdLines, ln) end
+        end
+        for path, v in pairs(kbdEdits) do
+            if v == "\255UNSET\255" then table.insert(kbdLines, luaPath(path) .. " = nil") end
         end
     end
-    for _, op in ipairs(kbdOps) do
-        local ln = opToLua(op)
-        if ln then table.insert(kbdLines, ln) end
-    end
-    for path, v in pairs(kbdEdits) do
-        if v == "\255UNSET\255" then table.insert(kbdLines, luaPath(path) .. " = nil") end
-    end
+    table.sort(kbdLines, function(a, b)
+        -- rows 整表定义必须排在任何 rows.* 字段赋值之前，否则 index 未定义会被覆盖
+        local ar = a:match("^%s*rows%s*=") and 0 or 1
+        local br = b:match("^%s*rows%s*=") and 0 or 1
+        if ar ~= br then return ar < br end
+        return a < b
+    end)
     return styleLines, kbdLines, kbdFile
+end
+
+-- ===== 保存前并发检测（借用上游 editor commit() 的思想，只做读取比对）=====
+-- 缓存绑定桥接类，供指纹比对使用；失败返回 nil（此时并发检测自动降级为跳过，不阻断保存）。
+local _saveBridgeCls = false   -- false=未尝试; nil=不可用; table=类
+local function getSaveBridgeCls()
+    if _saveBridgeCls ~= false then return _saveBridgeCls or nil end
+    local ok, cls = pcall(function()
+        return luajava.bindClass("com.osfans.trime.theme.ThemeDataBridge")
+    end)
+    if ok and cls and cls.checkFileUnchanged and cls.fileFingerprint then
+        _saveBridgeCls = cls
+    else
+        _saveBridgeCls = nil
+    end
+    return _saveBridgeCls or nil
+end
+
+-- 计算本次保存会写回的目标文件路径列表（prepare/commit 共用，保证路径算法一致）。
+-- 仅 inPlace（覆盖原主题）需要并发检测；生成新主题写的是全新副本，无并发问题。
+local function saveTargets(dst, inPlace, variant, kbdFile, hasMainData)
+    local t = {}
+    if not inPlace then return t end
+    local styleTarget
+    if variant == "（主题 main.lua 内嵌样式）" then
+        styleTarget = dst .. "/main.lua"
+    elseif variant then
+        styleTarget = dst .. "/styles/" .. variant .. "/main.lua"
+    end
+    if styleTarget then t[#t + 1] = styleTarget end
+    if kbdFile then t[#t + 1] = dst .. "/keyboards/" .. kbdFile end
+    -- main 数据写在主题根 main.lua；若样式也在 main.lua，避免重复指纹目标
+    if hasMainData and styleTarget ~= dst .. "/main.lua" then
+        t[#t + 1] = dst .. "/main.lua"
+    end
+    return t
 end
 
 -- 第一步（快）：校验 + 生成复制清单 + 预先算好要写回的语句
@@ -5990,7 +7471,8 @@ function exportPrepare(newName, inPlace)
         .. "; theme=" .. tostring(currentTheme) .. " variant=" .. tostring(currentVariant)
         .. " kbd=" .. tostring(currentKbdFile) .. "; dirty=" .. tostring(dirtyCount)
         .. " style=" .. ecnt(styleEdits) .. "+" .. ecnt(newStyleTables)
-        .. " kbd=" .. ecnt(kbdEdits) .. "+" .. ecnt(kbdOps))
+        .. " kbd=" .. ecnt(kbdEdits) .. "+" .. ecnt(kbdOps)
+        .. " mainData=" .. ecnt(mainDataEdits) .. "-" .. ecnt(mainDataRemove))
     if not currentTheme or not themeDir then return nil, "请先选择主题" end
 
     local dst, files = nil, {}
@@ -6013,19 +7495,38 @@ function exportPrepare(newName, inPlace)
     if not inPlace then newName = (tostring(newName):match("^%s*(.-)%s*$")) end
 
     local styleLines, kbdLines, kbdFile = buildWriteLines()
+    local hasMainData = (next(mainDataEdits) ~= nil or next(mainDataRemove) ~= nil)
     exlog("prepared styleLines=" .. #styleLines .. " kbdLines=" .. #kbdLines
-        .. " kbdFile=" .. tostring(kbdFile))
-    if #styleLines == 0 and #kbdLines == 0 then
+        .. " kbdFile=" .. tostring(kbdFile) .. " mainData=" .. tostring(hasMainData))
+    if #styleLines == 0 and #kbdLines == 0 and not hasMainData then
         return nil, "没有可写入的改动"
     end
     if #kbdLines > 0 and not kbdFile then
         return nil, "找不到当前键盘文件，无法写入键盘改动"
     end
 
+    -- 记录每个待写目标的原始指纹（SHA-256），写回前用它做并发检测。
+    -- 只记覆盖保存；生成新主题写副本，不涉及。拿不到桥接就记空表，检测时自动跳过。
+    local fps = {}
+    local cls = getSaveBridgeCls()
+    if cls and inPlace then
+        for _, path in ipairs(saveTargets(dst, inPlace, currentVariant, kbdFile, hasMainData)) do
+            local ok, fp = pcall(function() return cls.fileFingerprint(path) end)
+            if ok and fp and fp ~= "" then fps[path] = fp end
+        end
+    end
+
+    -- main 数据编辑快照（浅拷贝，避免保存过程中被界面清空）
+    local mainFields, mainRemoves = {}, {}
+    for k, v in pairs(mainDataEdits) do mainFields[k] = v end
+    for k in pairs(mainDataRemove) do mainRemoves[k] = true end
+
     return {
         name = newName, dst = dst, files = files, inPlace = inPlace,
         styleLines = styleLines, kbdLines = kbdLines,
         kbdFile = kbdFile, variant = currentVariant,
+        mainFields = mainFields, mainRemoves = mainRemoves,
+        fps = fps,
         idx = 1, t0 = nowMs(),
     }
 end
@@ -6039,6 +7540,26 @@ end
 -- 第三步：把改动写进目标（覆盖原主题时就是原文件；生成新主题时是副本）
 function exportCommit(ctx)
     local dst = ctx.dst
+
+    -- 【并发检测】写回前二次校验待改原文件未被外部修改（上游 editor commit() 的核心机制）。
+    -- exportPrepare 到这一步之间，另存新主题要复制几百文件、耗时数秒，官方编辑器可能改了原文件；
+    -- 若仍基于旧内容追加会覆盖掉别人的改动。这里比对 prepare 时记下的 SHA-256，变了就中止。
+    -- 桥接不可用或没记到指纹时自动跳过（降级为旧行为），不阻断保存。
+    if ctx.inPlace and ctx.fps and next(ctx.fps) then
+        local cls = getSaveBridgeCls()
+        if cls then
+            for path, fp in pairs(ctx.fps) do
+                local ok, state = pcall(function() return cls.checkFileUnchanged(path, fp) end)
+                if ok and state == "CHANGED" then
+                    error("文件已被其他程序修改，为保护改动，本次保存已中止："
+                        .. tostring(path) .. "\n请重新打开主题工作室再试。")
+                elseif ok and state == "MISSING" then
+                    error("目标文件已不存在，保存中止：" .. tostring(path))
+                end
+                -- "OK"/"UNAVAILABLE" 都继续：UNAVAILABLE 表示桥接此刻读不到，按旧行为放行
+            end
+        end
+    end
 
     -- 4) 改名只在"生成新主题"时做。覆盖原主题绝不能改名，否则设置里的主题名会变。
     -- 【只改正文，绝不碰生成块】先把正文与末尾生成块切开，只对正文改 name，
@@ -6066,6 +7587,20 @@ function exportCommit(ctx)
         atomicWriteFile(mainPath, head .. tailPart)
     end
 
+    -- main 数据写回主题根 main.lua：独立生成块，按字段名 upsert，绝不执行任何主题代码。
+    -- 放在改名之后：改名重写过 main.lua，必须在它之后写，避免块被覆盖。
+    local mainWriteCount = 0
+    do
+        local mf, mr = ctx.mainFields or {}, ctx.mainRemoves or {}
+        if next(mf) or next(mr) then
+            local mainPath = dst .. "/main.lua"
+            if ctx.inPlace then backupFileQuiet(mainPath) end
+            upsertMainDataBlock(mainPath, mf, mr)
+            for _ in pairs(mf) do mainWriteCount = mainWriteCount + 1 end
+            for _ in pairs(mr) do mainWriteCount = mainWriteCount + 1 end
+        end
+    end
+
     if #ctx.styleLines > 0 then
         local target
         if ctx.variant == "（主题 main.lua 内嵌样式）" then
@@ -6075,18 +7610,19 @@ function exportCommit(ctx)
         end
         if target then
             if ctx.inPlace then backupFileQuiet(target) end
-            appendBlockTo(target, ctx.styleLines)
+            upsertBlockTo(target, ctx.styleLines)
         end
     end
 
     if #ctx.kbdLines > 0 and ctx.kbdFile then
         local kbdTarget = dst .. "/keyboards/" .. ctx.kbdFile
         if ctx.inPlace then backupFileQuiet(kbdTarget) end
-        appendBlockTo(kbdTarget, ctx.kbdLines)
+        upsertBlockTo(kbdTarget, ctx.kbdLines)
     end
 
-    exlog("commit done style=" .. tostring(#ctx.styleLines) .. " kbd=" .. tostring(#ctx.kbdLines))
-    ctx.writes = #ctx.styleLines + #ctx.kbdLines
+    exlog("commit done style=" .. tostring(#ctx.styleLines) .. " kbd=" .. tostring(#ctx.kbdLines)
+        .. " mainData=" .. tostring(mainWriteCount))
+    ctx.writes = #ctx.styleLines + #ctx.kbdLines + mainWriteCount
 
     -- 回读验证：确认生成块确实写进了目标文件
     pcall(function()
@@ -6110,6 +7646,8 @@ function resetEditsAfterSave()
     kbdEdits = {}
     kbdOps = {}
     newStyleTables = {}
+    mainDataEdits = {}
+    mainDataRemove = {}
     dirtyCount = 0
     pcall(refreshDirty)
 end
@@ -6313,12 +7851,15 @@ row2.setPadding(dp(4), dp(6), dp(4), 0)
 root.addView(row2)
 local btnStyle = mkBtn(row2)
 local btnSettings = mkBtn(row2)
+local btnMainData = mkBtn(row2)
 local btnView = mkBtn(row2)
 btnStyle.setText("样式编辑")
 btnSettings.setText("键盘调整")
+btnMainData.setText("main数据")
 btnView.setText("视图/诊断")
 btnStyle.setTextColor(0xFFE3B341)
 btnSettings.setTextColor(0xFF3FB950)
+btnMainData.setTextColor(0xFF79C0FF)
 btnStyle.onClick = function() styleEditorDialog() end
 btnSettings.onClick = function() kbdSettingsDialog() end
 
@@ -6655,7 +8196,8 @@ function pickKbdByShape(cands, refKbd)
     local limit = math.min(#cands, 8)   -- 安全阀：同名变体极多时别把启动拖成秒级
     for i = 1, limit do
         local f = cands[i]
-        local ok, env = pcall(parseKeyboardData, themeDir .. "/keyboards/" .. f)
+        -- 纯文本静态解析键盘 rows，绝不执行键盘脚本。
+        local ok, env = pcall(parseKeyboardStatic, themeDir .. "/keyboards/" .. f)
         if ok and keyboardRowsOK(env) then
             envs[f] = env
             if kbdShape(env, false) == struct then pass[#pass + 1] = f end
@@ -6892,6 +8434,9 @@ function buildKeyboardDataEnv(kbdDir)
 end
 
 function parseKeyboardData(path)
+    -- 【永不执行主题 Lua·熔断】历史键盘脚本求值入口，已禁用。
+    -- 键盘布局统一走 parseKeyboardStatic（纯文本抠 rows），绝不编译/执行脚本。
+    if true then return nil end
     local src = readFile(path)
     if not src then return nil end
     local kbdDir = path:match("^(.*)/[^/]+$")  -- 键盘脚本所在目录 = 键盘 VM 的 finder 根
@@ -7489,37 +9034,14 @@ function parseKeyboardStatic(path)
         end
     end
     if not be then return fail("rows 字面量花括号不配对") end
-    local code = "return " .. src:sub(bs, be)
-    -- 干净 env：基础库 + 元表 __index 让任何未定义标识符（函数/类/变量引用）
-    -- 返回安全桩，保证字面量里形如 click=FUNC("q") 的调用也落到桩上，绝不执行真机代码。
-    local clean = {}
-    clean._G = clean
-    setmetatable(clean, {
-        __index = function(t, k)
-            if type(k) ~= "string" or k == "" then return nil end
-            local v = makeSafeStub()
-            rawset(t, k, v)
-            return v
-        end
-    })
-    clean.type = type; clean.pairs = pairs; clean.ipairs = ipairs
-    clean.tostring = tostring; clean.tonumber = tonumber
-    clean.math = math; clean.table = table; clean.string = string
-    clean.unpack = unpack or table.unpack; clean.print = print; clean.pcall = pcall
-    clean.select = select
-    local f
-    if load then
-        local ok, g = pcall(load, code, "=rows", "t", clean)
-        if ok and g then f = g end
-    end
-    if not f and loadstring then f = loadstring(code) end
-    if not f then return fail("rows 字面量编译失败") end
-    local ok, rows = pcall(f)
-    if not ok or type(rows) ~= "table" or #rows == 0 then
-        return fail("rows 字面量求值失败或为空（非数组型）")
+    -- 纯文本解析 rows 字面量表，绝不 load/求值。动态生成的键（调用/引用）
+    -- 解析器读不出来，会跳过；rowsLookReal 仍负责剔除不可信结果。
+    local rows = parseLiteralTableText(src:sub(bs, be))
+    if type(rows) ~= "table" or rowsCount(rows) == 0 then
+        return fail("rows 字面量解析失败或为空（非数组型）")
     end
     if not rowsLookReal(rows) then
-        return fail("rows 字面量里的键是动态生成的（调用桩/引用），静态解析不可信")
+        return fail("rows 字面量里的键是动态生成的（调用/引用），静态解析不可信")
     end
     out.rows = rows
     return out
@@ -7545,9 +9067,37 @@ end
 --   有的主题按 id 直接返回，有的按 alphabet 判中英/数字，有的读别的全局变量。
 --   任何"复刻分支"的写法都会在下一个主题上失效；唯一通用的办法就是把函数原样执行、
 --   用与真机相同的入参调用它。
+-- 【永不执行主题 Lua】get_keyboard 从"把函数体 load 成函数执行"改为
+-- "纯文本规则分析"：从函数体里读出 if 条件与 return 值，生成一个由工作室自己的
+-- 代码构成的判断函数。主题代码一个字节都不会被编译/执行。
+-- 支持的常见写法（覆盖内置 default 及绝大多数主题）：
+--   if id == "" then return <值> end
+--   if id ~= "" then return <值> end
+--   if string.find(alphabet, "%d") then return "qwerty36" end   -- 字母表含数字
+--   if string.find(alphabet, "/") then return "qwerty27" end    -- 字母表含 /
+--   return keyboard / return "xxx"                              -- 兜底
+-- <值> 可为带引号字面量、标识符 keyboard / id / name。未识别的分支一律跳过。
+local function gkResolve(v, id, alphabet, themeEnv)
+    if type(v) ~= "string" then return nil end
+    if v:sub(1, 1) == '"' or v:sub(1, 1) == "'" then
+        local ok, s = parseLuaLiteral(v, 1)
+        if ok and type(s) == "string" then return s end
+        return v:sub(2, -2)
+    end
+    if v == "id" then return id end
+    if v == "alphabet" then return alphabet end
+    if v == "keyboard" or v == "name" or v == "style" then
+        local t = type(themeEnv) == "table" and themeEnv or {}
+        return t[v]
+    end
+    -- 主题自定义全局变量（小写）：尝试从主题根的 name/style/keyboard 字面量里取
+    local t = type(themeEnv) == "table" and themeEnv or {}
+    return t[v]
+end
+
 function extractThemeGetKeyboard(src, themeEnv)
     if type(src) ~= "string" then return nil end
-    -- 找函数定义（跳过注释行里的示例代码：主题里常有 "-- function get_keyboard(...)" 说明）
+    -- 找函数定义（跳过注释行里的示例代码）
     local function findDef(pat)
         local p = 1
         while true do
@@ -7558,14 +9108,9 @@ function extractThemeGetKeyboard(src, themeEnv)
             p = h + 1
         end
     end
-    local head = findDef("function%s+get_keyboard%s*%(")
-    if not head then
-        -- 兼容 get_keyboard = function(...) 写法
-        head = findDef("get_keyboard%s*=%s*function%s*%(")
-    end
+    local head = findDef("function%s+get_keyboard%s*%(") or findDef("get_keyboard%s*=%s*function%s*%(")
     if not head then return nil end
-
-    -- 从函数头开始做块计数，找到配对的 end（function/if/do 开块，end 闭块）
+    -- 块计数找配对 end
     local pos, depth, body = head, 0, nil
     local len = #src
     while pos <= len do
@@ -7580,30 +9125,60 @@ function extractThemeGetKeyboard(src, themeEnv)
         pos = nl + 1
     end
     if not body then return nil end
+    local code = stripLuaComments(body)
 
-    -- 干净环境：标准库保留，主题声明变量注入，其余未知全局给空串（避免 nil 索引/调用崩溃）
-    local clean = {}
-    clean._G = clean
-    clean.string, clean.table, clean.math = string, table, math
-    clean.type, clean.tostring, clean.tonumber = type, tostring, tonumber
-    clean.pairs, clean.ipairs, clean.select = pairs, ipairs, select
-    if type(themeEnv) == "table" then
-        for _, k in ipairs({ "keyboard", "name", "style" }) do
-            if themeEnv[k] ~= nil then clean[k] = themeEnv[k] end
+    -- 提取规则：按 if 分支顺序。每条 = {kind, arg, ret}
+    local rules = {}
+    -- if id == "" / id ~= ""  / id == "xxx"
+    for cond, ret in code:gmatch("if%s+id%s*(==?%s*[\"'][^\"']*[\"']%s*)then%s*return%s+([%w\"'%.]+)") do
+        local ne = cond:find("~=") ~= nil
+        local val = cond:match("[\"']([^\"']*)[\"']")
+        rules[#rules + 1] = { kind = ne and "id_ne" or "id_eq", arg = val, ret = ret }
+    end
+    -- if string.find(alphabet, "PAT") then return V
+    for pat, ret in code:gmatch("string%.find%s*%(%s*alphabet%s*,%s*[\"']([^\"']*)[\"']%s*%)%s*then%s*return%s+([%w\"'%.]+)") do
+        rules[#rules + 1] = { kind = "alphabet_pat", arg = pat, ret = ret }
+    end
+    -- 其它 alphabet 判定：if alphabet == "xxx" then return V
+    for val, ret in code:gmatch("if%s+alphabet%s*==%s*[\"']([^\"']*)[\"']%s*then%s*return%s+([%w\"'%.]+)") do
+        rules[#rules + 1] = { kind = "alphabet_eq", arg = val, ret = ret }
+    end
+    -- 兜底 return（最后一个裸 return，不在 if 行内）
+    local fallback = nil
+    for line in (code .. "\n"):gmatch("[^\n]*\n") do
+        if not line:find("%f[%w]if%f[%W]") then
+            local r = line:match("return%s+([%w\"'%.]+)")
+            if r then fallback = r end
         end
     end
-    setmetatable(clean, { __index = function(_, k)
-        if k == "keyboard" then return (type(themeEnv) == "table" and themeEnv.keyboard) or "" end
-        return ""
-    end })
+    if #rules == 0 and not fallback then return nil end
 
-    local loader = load or loadstring
-    if not loader then return nil end
-    local ok, fn = pcall(loader, body, "=get_keyboard", "t", clean)
-    if not ok or type(fn) ~= "function" then return nil end
-    if not pcall(fn) then return nil end
-    local gk = rawget(clean, "get_keyboard")
-    return type(gk) == "function" and gk or nil
+    -- 生成判断函数：全部逻辑是工作室自己的代码，不执行主题代码。
+    return function(id, alphabet)
+        id = id or ""
+        alphabet = alphabet or ""
+        for _, r in ipairs(rules) do
+            local hit = false
+            if r.kind == "id_eq" then hit = (id == r.arg)
+            elseif r.kind == "id_ne" then hit = (id ~= r.arg)
+            elseif r.kind == "alphabet_eq" then hit = (alphabet == r.arg)
+            elseif r.kind == "alphabet_pat" then
+                -- 只解释两种最常用 pattern：%d（含数字）、字面量子串（含 / 等）
+                if r.arg == "%d" or r.arg == "%d+" then hit = alphabet:find("%d") ~= nil
+                elseif r.arg == "%a" or r.arg == "%a+" then hit = alphabet:find("%a") ~= nil
+                else hit = alphabet:find(r.arg, 1, true) ~= nil end
+            end
+            if hit then
+                local v = gkResolve(r.ret, id, alphabet, themeEnv)
+                if type(v) == "string" and v ~= "" then return v end
+            end
+        end
+        if fallback then
+            local v = gkResolve(fallback, id, alphabet, themeEnv)
+            if type(v) == "string" and v ~= "" then return v end
+        end
+        return nil
+    end
 end
 
 function parseThemeRootStatic(path, fallbackName)
@@ -7633,42 +9208,22 @@ function parseThemeRootStatic(path, fallbackName)
                 end
             end
             if be then
-                local clean = {}
-                clean._G = clean
-                setmetatable(clean, { __index = function(t, k)
-                    if type(k) ~= "string" or k == "" then return nil end
-                    local v = makeSafeStub(); rawset(t, k, v); return v
-                end})
-                clean.type = type; clean.pairs = pairs; clean.ipairs = ipairs
-                clean.tostring = tostring; clean.tonumber = tonumber
-                clean.string = string; clean.table = table; clean.math = math
-                local fn
-                if load then
-                    local ok, g = pcall(load, "return " .. src:sub(bs, be), "=preset_keys", "t", clean)
-                    if ok and g then fn = g end
-                end
-                if fn then
-                    local ok, t = pcall(fn)
-                    if ok and type(t) == "table" then out.preset_keys = t end
-                end
+                -- 纯文本解析 preset_keys 字面量表，绝不 load/求值。
+                local t = parseLiteralTableText(src:sub(bs, be))
+                if type(t) == "table" then out.preset_keys = t end
             end
         end
     end
     return out
 end
 
--- 脚本求值兜底只跑一次（桥接不可用 + 静态解析失败时才触发）
-local _scriptKbdRetry = false
-
 function loadKeyboard(kbdFile, bridgeKbd, opts)
     if not themeDir then return end
     opts = type(opts) == "table" and opts or {}
-    -- 【启动路径禁止执行键盘脚本】
-    -- parseKeyboardData 会在 clean 环境里跑完整份键盘脚本（require 链、循环、动态 rows）。
-    -- 万象这类主题的脚本在 LuaJ 下可能要几百毫秒到数秒，遇到死循环就永远不返回 ——
-    -- 主线程被占住，工具白屏 + 输入法一起 ANR，用户看到的就是「打开就卡死」。
-    -- 所以默认只做纯字面量静态解析；只有用户手动点选键盘时才放开脚本求值。
-    local allowScript = opts.allowScript == true and opts.noScript ~= true
+    -- 【永不执行键盘脚本】无论启动、手动点选还是降级重试，键盘布局一律只做
+    -- 纯文本静态解析（parseKeyboardStatic 抠 rows 字面量）。任何主题 Lua 代码——
+    -- 包括 gesture_module 这类被 require 进来的模块——都不会被编译/执行。
+    local allowScript = false
     local oldFile, oldEnv = currentKbdFile, kbdEnv   -- 解析失败时沿用同一键盘的旧布局
     clearOwnStyles()         -- 换键盘：单键专属样式绑在旧键盘行列上，一并作废
     -- 【r27.6】换键盘时主动失效上一把键盘的权威快照。
@@ -7705,53 +9260,21 @@ function loadKeyboard(kbdFile, bridgeKbd, opts)
         renderPreview()
         return
     end
-    -- 【首选·通用方案】在"完全隔离、零真机对象"的 clean 万能桩环境里求值键盘脚本的数据部分：
-    -- require"keys"/"qwerty36" 链会加载纯数据模块、拼出依赖 allk 的动态 rows；
-    -- 所有 import/PreferenceManager/sp.edit/ThemeManager.setStyle 等真机调用全落到纯 Lua 桩上
-    -- no-op，物理上不可能 coercion 崩溃。用户确认 tool 与输入法不同 Lua 实例，不污染输入法。
-    local kbd, dataErr = nil, nil
-    if allowScript then
-        local okData, d = pcall(parseKeyboardData, kbdPath)
-        if okData and d and keyboardRowsOK(d) then
-            kbd = d
-            kbdSourceNote = "[键盘配置来源] 通用求值键盘脚本数据（clean 隔离环境 + 共享 require，动态 rows 已还原）"
-        else
-            dataErr = (not okData) and tostring(d) or (d and "rows 未构造" or "读取失败")
-        end
-    else
-        dataErr = "启动阶段跳过脚本求值（只做静态解析）"
-    end
-    -- 【兜底·纯静态解析】只抠 rows 字面量（不执行任何脚本代码）
-    if not (kbd and keyboardRowsOK(kbd)) then
-        kbd = parseKeyboardStatic(kbdPath)
-        if kbd and keyboardRowsOK(kbd) then
-            kbdSourceNote = "[键盘配置来源] 静态解析（抠 rows 字面量）"
-                .. (allowScript and ("；脚本求值失败：" .. tostring(dataErr))
-                             or "；启动阶段未执行脚本")
-        end
+    -- 【纯文本静态解析】只抠 rows 字面量，绝不执行键盘脚本或其 require 模块。
+    local kbd = parseKeyboardStatic(kbdPath)
+    if kbd and keyboardRowsOK(kbd) then
+        kbdSourceNote = "[键盘配置来源] 静态解析（纯文本抠 rows，未执行任何脚本）"
     end
     -- 解析失败但内存里已有同一键盘的布局：沿用它，别掉到默认 qwerty36
     if not (kbd and keyboardRowsOK(kbd)) and oldFile == kbdFile and keyboardRowsOK(oldEnv) then
         kbd = oldEnv
-        kbdSourceNote = "[键盘配置来源] 本次解析失败（" .. tostring(dataErr) .. "），沿用内存中同一键盘的布局"
+        kbdSourceNote = "[键盘配置来源] 本次静态解析失败，沿用内存中同一键盘的布局"
     end
     if kbd and keyboardRowsOK(kbd) then
         kbdEnv = kbd
         kbdFallbackNote = "键盘布局取自 " .. kbdFile
     else
         kbdSourceNote = "[键盘配置来源] 静态解析未拿到 rows，回退内置/默认键盘"
-
-        -- 桥接不可用 + 静态解析失败时，脚本求值是唯一能还原动态 rows 的路。
-        -- 但绝不在这里同步执行：推迟到首帧之后跑一次，先让界面用内置键盘出来，
-        -- 否则脚本一慢就是白屏/ANR（同进程的输入法一起被杀）。
-        if not allowScript and not (bridgeKbd and keyboardRowsOK(bridgeKbd))
-            and not _scriptKbdRetry then
-            _scriptKbdRetry = true
-            local f = kbdFile
-            uiHandler.postDelayed(function()
-                pcall(loadKeyboard, f, nil, { allowScript = true })
-            end, 400)
-        end
 
         -- 回退：优先 default 主题的 qwerty36（纯字面量，能给出正确的 36 键布局），
         -- 避免先撞上当前主题的 qwerty27 又变回 27 键。样式/配色仍来自当前主题。
@@ -7827,7 +9350,11 @@ function loadVariant(variant, bridgeStyle)
         styleDir, styleEnv = themeDir, themeEnv
     else
         styleDir = themeDir .. "/styles/" .. variant
-        styleEnv = sandboxLoad(styleDir .. "/main.lua", themeEnv)
+        -- 纯文本读取配色字面量，绝不执行该样式脚本（含其 require 模块）。
+        styleEnv = parseStyleFileText(styleDir .. "/main.lua", themeEnv)
+        if not styleEnv then
+            styleEnv = themeEnv  -- 读不到就退回主题根内嵌样式，至少不空
+        end
     end
     -- 用于确认偏移到底定义在哪个 style、桥接是否导出、字段名是否正确。
     if not _offsetScanDone then
@@ -7932,6 +9459,7 @@ function loadTheme(name)
     buildLabelImgIndex()
     fontIndex = nil          -- 换了主题：字体索引作废，等真正用到字体时再建（懒加载）
     styleEdits, kbdEdits, kbdOps = {}, {}, {}
+    mainDataEdits, mainDataRemove = {}, {}  -- 换主题：main 数据编辑作废（属于旧主题）
     dirtyCount = 0
     refreshDirty()
     if not themeEnv then toast("主题加载失败：" .. name) return end
@@ -8030,6 +9558,10 @@ end
 btnExport.onClick = function()
     local ok, e = pcall(saveThemeDialog)
     if not ok then logErr("保存", e); toast("保存出错：" .. tostring(e)) end
+end
+btnMainData.onClick = function()
+    local ok, e = pcall(mainDataDialog)
+    if not ok then logErr("main数据", e); toast("打开 main 数据失败：" .. tostring(e)) end
 end
 
 -- 读取当前输入法默认偏好的所有项，返回 { {key=..., val=...}, ... }（按 key 排序）
@@ -8182,7 +9714,7 @@ btnView.onClick = function()
         elseif c:find("复制报错") then
             copyText(#errLog > 0 and table.concat(errLog, "\n") or "（暂无报错）")
         end
-    end)
+    end, { keepOpen = true })
 end
 
 -- 让 dirtyCount 变化时刷新提示：包装 markDirty
