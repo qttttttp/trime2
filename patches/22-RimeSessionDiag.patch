@@ -1,0 +1,68 @@
+diff --git a/app/src/main/java/com/osfans/trime/core/Rime.java b/app/src/main/java/com/osfans/trime/core/Rime.java
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java
+@@ -740,6 +740,14 @@
+     // 由主题脚本 onWindowHidden 回调调用；内部按 API level 守卫：API 28+ 用 M_PURGE，低版本 no-op。
+     public static native void purgeNativeMemory();
+ 
++    // r27.63：诊断专用。真正销毁 librime session（session_.reset -> destroy_session），
++    // 释放会话/引擎/词典持有的活内存；返回销毁前的 schema id 供随后恢复。
++    // 仅用于内存诊断，不要在正常打字流程调用（会丢当前编码）。
++    public static native String releaseRimeSessionForDiag();
++
++    // r27.63：诊断专用。重建 session 并切回指定 schema，做到用户无感知恢复。
++    public static native boolean restoreRimeSessionForDiag(String schemaId);
++
+     public static native SchemaItem[] getRimeSchemaList();
+ 
+     public static native String getCurrentRimeSchema();
+diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime_jni/rime_jni.cc
+--- a/app/src/main/jni/librime_jni/rime_jni.cc
++++ b/app/src/main/jni/librime_jni/rime_jni.cc
+@@ -185,6 +185,23 @@
+     return rime->sync_user_data();
+   }
+ 
++  // r27.63：诊断专用。先读出当前 schema id，再真正销毁会话（destroy_session），
++  // 释放会话/引擎/翻译器/词典持有的活内存。返回销毁前的 schema id 供随后恢复。
++  // 注意：currentSchemaId() 内部会确保 session 存在，故必须在 reset 之前调用。
++  std::string releaseSessionForDiag() {
++    std::string schema = currentSchemaId();
++    session_.reset();
++    return schema;
++  }
++
++  // r27.63：诊断专用。重建会话并切回原 schema，做到用户无感知恢复。
++  // session() 会在 session_ 为空时重新 create_session；随后 select_schema。
++  bool restoreSessionForDiag(std::string_view schemaId) {
++    if (!session()) return false;
++    if (schemaId.empty()) return true;
++    return selectSchema(schemaId);
++  }
++
+  private:
+   RimeApi *rime;
+   std::shared_ptr<SessionHolder> session_;
+@@ -347,6 +364,22 @@
+ #endif
+ }
+ 
++// r27.63：诊断专用——真正销毁 librime session，返回销毁前的 schema id。
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_osfans_trime_core_Rime_releaseRimeSessionForDiag(JNIEnv *env,
++                                                          jclass /* thiz */) {
++  std::string schema = Rime::Instance().releaseSessionForDiag();
++  return env->NewStringUTF(schema.c_str());
++}
++
++// r27.63：诊断专用——重建 session 并切回原 schema，用户无感知恢复。
++extern "C" JNIEXPORT jboolean JNICALL
++Java_com_osfans_trime_core_Rime_restoreRimeSessionForDiag(
++    JNIEnv *env, jclass /* thiz */, jstring schema_id) {
++  bool ok = Rime::Instance().restoreSessionForDiag(*CString(env, schema_id));
++  return ok ? JNI_TRUE : JNI_FALSE;
++}
++
+ extern "C" JNIEXPORT jobjectArray JNICALL
+ Java_com_osfans_trime_core_Rime_getRimeSchemaList(JNIEnv *env,
+                                                   jclass /* thiz */) {

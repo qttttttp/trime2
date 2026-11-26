@@ -1,0 +1,28 @@
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java
+@@ -181,7 +181,6 @@
+                 startRime(false);
+                 runnable.run();
+                 lifecycleImpl.emitState(RimeLifecycle.State.READY);
+-                publishCurrentStatus();
+             }
+ 
+             @Override
+@@ -222,7 +221,7 @@
+         withRimeContext((Callable<String>) () -> {
+             Rime.exitRime();
+             Rime.startRime(true);
+-            publishCurrentStatus();
++            // r27.50：移除 0.9.1 新增的 publishCurrentStatus()（启动期主动调 native getRimeStatus 触发 native 崩溃）
+             return null;
+         });
+     }
+@@ -230,7 +229,7 @@
+         withRimeContext((Callable<String>) () -> {
+             Rime.exitRime();
+             Rime.startRime(false);
+-            publishCurrentStatus();
++            // r27.50：移除 0.9.1 新增的 publishCurrentStatus()（重载输入法时 native 崩溃）
+             return null;
+         });
+     }

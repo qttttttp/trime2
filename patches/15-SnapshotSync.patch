@@ -1,0 +1,99 @@
+--- a/app/src/main/java/com/osfans/trime/InputView.java
++++ b/app/src/main/java/com/osfans/trime/InputView.java
+@@ -47,16 +47,31 @@
+     private Globals globals;
+     private View oldView;
+ 
+-    // ===== 主题工作室数据桥接：当前键盘脚本执行后的 Globals 静态快照 =====
++    // ===== 主题工作室数据桥接：当前实际显示键盘的 Globals 静态快照 =====
+     // 同进程的 tools Lua（主题工作室）通过 ThemeDataBridge 读取它，拿到真实键盘布局，
+-    // 避免在工具沙箱里重跑键盘脚本。每次 setKeyboard 成功后更新。
++    // 避免在工具沙箱里重跑键盘脚本。
++    // 【快照与"当前实际显示的键盘"绑定，而不是与"是否重新跑了脚本"绑定】
++    // 每次 setKeyboard 显示目标键盘时都同步：普通切换、缓存命中、.reload 重建、
++    // 自定义 View 键盘、key_maps 符号键盘都会刷新。工作室侧会自行适配非 rows 布局，
++    // 因此这里不再按 rows 过滤，如实反映当前键盘（rows/flex_box/keys/key_maps）。
+     private static Globals sCurrentKeyboardGlobals;
+ 
+-    /** 主题工作室数据桥接：返回当前键盘 Globals（可能为空） */
++    /** 主题工作室数据桥接：返回当前显示键盘的 Globals（可能为空） */
+     public static Globals getCurrentKeyboardGlobals() {
+         return sCurrentKeyboardGlobals;
+     }
+ 
++    /**
++     * 主题工作室数据桥接：把"当前实际显示键盘"的 Globals 同步到静态快照。
++     * freshGlobals 为本次新建环境（缓存未命中时传入），否则按 id 从并行缓存取。
++     * 不再过滤键盘类型：rows / flex_box / keys / key_maps 都同步，工作室侧适配展示方式。
++     */
++    private void syncCurrentKeyboardGlobals(String id, Globals freshGlobals) {
++        Globals g = freshGlobals != null ? freshGlobals : mKeyboardGlobalsCache.get(id);
++        if (g == null) return;
++        sCurrentKeyboardGlobals = g;
++    }
++
+     public InputView(@NonNull Context context) {
+         super(context);
+         setClipChildren(false);
+@@ -140,6 +155,8 @@
+     // 2. 视图缓存：SchemaId -> KeyboardView 实例
+     private final Map<String, KeyboardView> mViewCache = new HashMap<>();
+     private final Map<String, SymbolsKeyboardView> mSymbolsViewCache = new HashMap<>();
++    // 主题工作室数据桥接：与视图缓存并行的 Globals 缓存，缓存命中时用它在出口同步快照
++    private final Map<String, Globals> mKeyboardGlobalsCache = new HashMap<>();
+ 
+     public void setKeyboard(String id) {
+         if (".last".equals(id)) {
+@@ -169,6 +186,8 @@
+             // 解析后才是真正的键盘名（如 wanxiang），缓存键用的也是它
+             mViewCache.remove(id);
+             mSymbolsViewCache.remove(id);
++            // 主题工作室数据桥接：连同 Globals 缓存一起清掉，让脚本重跑后重新写入快照
++            mKeyboardGlobalsCache.remove(id);
+         }
+         sLoadedKeyboard = id;
+         Log.w("TAG", "setKeyboard:e " + id + " (schema=" + mCurrentSchemaId + ")");
+@@ -187,8 +206,11 @@
+                     LuaValue ret = func.call();
+                     try { LuaPatchManager.applyFile(globals, globals, base); }
+                     catch (Exception e) { ThemeManager.sendMsg("键盘补丁: " + e); }
+-                    sCurrentKeyboardGlobals = globals;  // 主题工作室数据桥接
+                     if (ret.isuserdata(View.class)) {
++                        // 主题工作室数据桥接：自定义 View 键盘也是一种键盘，先把它的 Globals
++                        // 存入缓存并同步快照，再显示（缓存命中分支稍后也能据此刷新）。
++                        mKeyboardGlobalsCache.put(id, globals);
++                        syncCurrentKeyboardGlobals(id, globals);
+                         setKeyboardView(ret.touserdata(View.class));
+                         return;
+                     }
+@@ -199,8 +221,8 @@
+                 ThemeManager.sendMsg("setKeyboard " + e);
+             }
+             //Log.w("TAG", "setKeyboard: "+globals.checktable().dump().tojstring() );
+-            // 主题工作室数据桥接：保存当前键盘 Globals 静态快照
+-            sCurrentKeyboardGlobals = globals;
++            // 主题工作室数据桥接：把本次脚本环境存入并行缓存，真正写快照放到出口统一做
++            mKeyboardGlobalsCache.put(id, globals);
+             // 创建并存入缓存
+             if (globals.get("rows").istable()) {
+                 targetView = new RowKeyboardView(getContext(), globals);
+@@ -214,6 +236,8 @@
+                     symbolsView = new SymbolsKeyboardView(getContext(), globals);
+                     mSymbolsViewCache.put(id, symbolsView);
+                 }
++                // 主题工作室数据桥接：符号键盘提前 return，出口走不到，这里先同步快照
++                syncCurrentKeyboardGlobals(id, globals);
+                 TrimeService.getInstance().showCustomView(symbolsView);
+                 mCurrentSchemaId = null;
+                 return;
+@@ -226,6 +250,10 @@
+             mViewCache.put(id, targetView);
+         }
+         setKeyboardView(targetView);
++        // 主题工作室数据桥接：在唯一出口按"最终要显示的键盘"统一同步快照。
++        // 缓存命中时 targetView 来自 mViewCache，globals 从并行缓存取，快照随之刷新；
++        // 缓存未命中时 globals 是本轮新建环境。不再过滤键盘类型，工作室侧适配展示。
++        syncCurrentKeyboardGlobals(id, null);
+     }
+ 
+     private String getKeyboardId(String id) {

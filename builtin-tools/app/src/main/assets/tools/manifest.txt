@@ -1,0 +1,6 @@
+# 资源目录|安装到 rime/tools 下的名称（可选）
+# assets/tools/<目录>/ 只要根级有 main.lua 就会被安装，安装名默认用目录名，
+# 所以新增工具只需放一个目录；本文件只负责把目录名换成中文显示名。
+# 资源目录用 ASCII，避免非 ASCII 路径在打包/解包链路上出问题。
+yijian-update|一键更新
+theme-studio|主题工作室

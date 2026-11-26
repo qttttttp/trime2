@@ -1,0 +1,15 @@
+diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-03 10:28:35.000000000 +0800
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java	2026-11-21 17:50:51.940175760 +0800
+@@ -67,6 +67,11 @@
+         return mGlobals;
+     }
+ 
++    /** 主题工作室数据桥接：暴露当前配色表（配色脚本执行后的最终 LuaTable） */
++    public static LuaTable getColor() {
++        return mColor;
++    }
++
+     public static void vibrate(VibrationEffect ve) {
+         if (vibrator == null) {
+             Context context = LuaApplication.getInstance();
