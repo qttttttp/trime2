@@ -1,0 +1,245 @@
+diff --git a/app/src/main/java/com/osfans/trime/core/Rime.java b/app/src/main/java/com/osfans/trime/core/Rime.java
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java
+@@ -748,6 +748,10 @@
+     // r27.63：诊断专用。重建 session 并切回指定 schema，做到用户无感知恢复。
+     public static native boolean restoreRimeSessionForDiag(String schemaId);
+ 
++    // r27.66：诊断专用。只读采集 /proc/self/smaps 按文件类型聚合 PSS，
++    // 加 malloc 分配器统计，返回格式化报告。不修改任何状态，可安全重复调用。
++    public static native String dumpMemoryAnalysisForDiag();
++
+     public static native SchemaItem[] getRimeSchemaList();
+ 
+     public static native String getCurrentRimeSchema();
+diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime_jni/rime_jni.cc
+--- a/app/src/main/jni/librime_jni/rime_jni.cc
++++ b/app/src/main/jni/librime_jni/rime_jni.cc
+@@ -10,6 +10,14 @@
+ 
+ #include <string>
+ #include <vector>
++#include <array>
++#include <map>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cctype>
++#include <algorithm>
++#include <malloc.h>
+ 
+ #include "jni-utils.h"
+ #include "objconv.h"
+@@ -342,6 +350,196 @@
+   return Rime::Instance().getOption(*CString(env, option));
+ }
+ 
++//============================================================
++// r27.66：只读内存映射诊断。不改任何状态、不释放任何内存，
++// 仅采集 /proc/self/smaps 按文件聚合 PSS + malloc 分配器统计，
++// 用于定位"anonymous 活内存"与"mmap 词库文件"各占多少。
++//============================================================
++namespace memdiag {
++
++struct Agg {
++  long pss_kb = 0;
++  int  maps = 0;
++  std::string top_path;
++  long top_kb = 0;
++};
++
++// 把 smaps 的一个 pathname 归类。词库文件通常是 .table.bin/.prism.bin，
++// 用户词典是 leveldb 的 .ldb/CURRENT/MANIFEST/LOG，都在 Documents/rime 下。
++static const char* classify(const std::string& path) {
++  if (path.empty()) return "anonymous(堆/栈/匿名mmap)";
++  if (path.find("userdb") != std::string::npos ||
++      path.find("leveldb") != std::string::npos ||
++      path.find("user_dict") != std::string::npos ||
++      path.size() >= 4 && path.compare(path.size() - 4, 4, ".ldb") == 0 ||
++      path.find("CURRENT") != std::string::npos ||
++      path.find("MANIFEST") != std::string::npos)
++    return "用户词典(leveldb)";
++  if (path.find(".table.bin") != std::string::npos ||
++      path.find(".prism.bin") != std::string::npos ||
++      path.find("rime") != std::string::npos && path.find(".bin") != std::string::npos)
++    return "静态词库(table/prism)";
++  if (path.compare(0, 6, "[anon:") == 0) return "ART/[anon]";
++  if (path == "[heap]") return "[heap]";
++  if (path.find(".so") != std::string::npos) return "so库";
++  if (path.find(".dex") != std::string::npos ||
++      path.find(".art") != std::string::npos ||
++      path.find(".oat") != std::string::npos ||
++      path.find(".apk") != std::string::npos)
++    return "dex/art/apk";
++  if (path[0] == '/') return "其它文件映射";
++  return "其它";
++}
++
++static std::string formatMb(long kb) {
++  char buf[64];
++  snprintf(buf, sizeof(buf), "%.1f", kb / 1024.0);
++  return buf;
++}
++
++// 读 /proc/self/smaps_rollup 的若干字段
++static void readRollup(std::array<long, 6>& out) {
++  out = {0, 0, 0, 0, 0, 0};  // Pss, Pss_Anon, Pss_File, Pss_Shmem, Rss, Private_Dirty
++  FILE* f = fopen("/proc/self/smaps_rollup", "r");
++  if (!f) return;
++  char line[256];
++  const char* keys[6] = {"Pss:", "Pss_Anon:", "Pss_File:", "Pss_Shmem:", "Rss:", "Private_Dirty:"};
++  while (fgets(line, sizeof(line), f)) {
++    for (int i = 0; i < 6; ++i) {
++      if (strncmp(line, keys[i], strlen(keys[i])) == 0) {
++        out[i] = atol(line + strlen(keys[i]));
++        break;
++      }
++    }
++  }
++  fclose(f);
++}
++
++// 读 /proc/self/smaps，按分类聚合 PSS，并记录每类最大单映射
++static void readSmaps(std::map<std::string, Agg>& agg) {
++  FILE* f = fopen("/proc/self/smaps", "r");
++  if (!f) return;
++  char line[512];
++  std::string cur_path;
++  long cur_pss = 0;
++  auto flush = [&]() {
++    if (cur_pss <= 0) return;
++    const char* cat = classify(cur_path);
++    Agg& a = agg[cat];
++    a.pss_kb += cur_pss;
++    a.maps += 1;
++    if (cur_pss > a.top_kb) { a.top_kb = cur_pss; a.top_path = cur_path.empty() ? "(anonymous)" : cur_path; }
++  };
++  while (fgets(line, sizeof(line), f)) {
++    // 映射头格式: "7f...-7f... r--p 00000 ... /path/to/file"
++    if (strchr(line, '-') && strstr(line, " ") && isxdigit((unsigned char)line[0])) {
++      // 只在行首是十六进制地址且含 perms 时视为头行
++      if (strspn(line, "0123456789abcdefABCDEF") > 4 && line[strspn(line, "0123456789abcdefABCDEF")] == '-') {
++        flush();
++        cur_path.clear();
++        cur_pss = 0;
++        // 路径是第 6 个字段之后（addr perms offset dev inode path）
++        char* p = line;
++        for (int field = 0; field < 5; ++field) {
++          while (*p && *p != ' ') ++p;
++          while (*p == ' ') ++p;
++        }
++        if (*p && *p != '\n') {
++          cur_path = p;
++          while (!cur_path.empty() && (cur_path.back() == '\n' || cur_path.back() == ' ')) cur_path.pop_back();
++        }
++        continue;
++      }
++    }
++    if (strncmp(line, "Pss:", 4) == 0) cur_pss += atol(line + 4);
++  }
++  flush();
++  fclose(f);
++}
++
++struct MallocSnap {
++  bool ok = false;
++  size_t arena = 0, uordblks = 0, fordblks = 0, keepcost = 0, hblkhd = 0;
++};
++
++// mallinfo2 仅较新 NDK 有；用 dlsym 兼容，失败回退 mallinfo（字段窄但可读）
++static MallocSnap readMalloc() {
++  MallocSnap s;
++#if defined(__ANDROID__) && defined(MALLOC_MALLINFO2_H)
++  using Fn = struct mallinfo2 (*)();
++  static Fn fn = nullptr;
++  static bool resolved = false;
++  if (!resolved) {
++    fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "mallinfo2"));
++    resolved = true;
++  }
++  if (fn) {
++    auto m = fn();
++    s.ok = true;
++    s.arena = m.arena; s.uordblks = m.uordblks; s.fordblks = m.fordblks;
++    s.keepcost = m.keepcost; s.hblkhd = m.hblkhd;
++    return s;
++  }
++#endif
++  struct mallinfo m = mallinfo();
++  s.ok = true;
++  s.arena = (size_t)m.arena; s.uordblks = (size_t)m.uordblks;
++  s.fordblks = (size_t)m.fordblks; s.keepcost = (size_t)m.keepcost;
++  s.hblkhd = (size_t)m.hblkhd;
++  return s;
++}
++
++static std::string buildReport() {
++  std::array<long, 6> r{};
++  readRollup(r);
++  std::map<std::string, Agg> agg;
++  readSmaps(agg);
++  MallocSnap mi = readMalloc();
++
++  char buf[512];
++  std::string out;
++  out.reserve(4096);
++  out += "========== native 内存映射诊断(r27.66) ==========\n";
++  snprintf(buf, sizeof(buf), "SDK=%d\n", android_get_device_api_level());
++  out += buf;
++  out += "\n-- smaps_rollup (MB) --\n";
++  snprintf(buf, sizeof(buf),
++           "Pss=%.1f  Pss_Anon=%.1f  Pss_File=%.1f  Pss_Shmem=%.1f  Rss=%.1f  Private_Dirty=%.1f\n",
++           r[0]/1024.0, r[1]/1024.0, r[2]/1024.0, r[3]/1024.0, r[4]/1024.0, r[5]/1024.0);
++  out += buf;
++  out += "Pss_Anon = 匿名活内存(堆/栈/分配器/librime对象)  Pss_File = 文件映射(词库mmap/dex/so)\n";
++
++  out += "\n-- 按文件类型聚合 PSS (MB / 映射数) --\n";
++  // 按 pss 降序
++  std::vector<std::pair<std::string, Agg>> vec(agg.begin(), agg.end());
++  std::sort(vec.begin(), vec.end(), [](const std::pair<std::string, Agg>& a,
++                                       const std::pair<std::string, Agg>& b) {
++    return a.second.pss_kb > b.second.pss_kb;
++  });
++  for (const auto& kv : vec) {
++    const Agg& a = kv.second;
++    snprintf(buf, sizeof(buf), "%-30s %8s / %4d  最大单映射: %s MB\n",
++             kv.first.c_str(), formatMb(a.pss_kb).c_str(), a.maps, formatMb(a.top_kb).c_str());
++    out += buf;
++    snprintf(buf, sizeof(buf), "    └ %s\n", a.top_path.c_str());
++    out += buf;
++  }
++
++  out += "\n-- malloc 分配器 (MB) --\n";
++  if (mi.ok) {
++    snprintf(buf, sizeof(buf),
++             "arena=%.1f  uordblks(已分配)=%.1f  fordblks(空闲)=%.1f  keepcost(可归还)=%.1f  hblkhd(mmap)=%.1f\n",
++             mi.arena/1048576.0, mi.uordblks/1048576.0, mi.fordblks/1048576.0,
++             mi.keepcost/1048576.0, mi.hblkhd/1048576.0);
++    out += buf;
++  } else {
++    out += "mallinfo 不可用\n";
++  }
++  return out;
++}
++
++}  // namespace memdiag
++
+ // r27.55：归还 native 层已 free 但未还给内核的空闲页。
+ // Android 的 malloc 分配器默认保留空闲页以加速下次分配，长时间输入后
+ // 累积显著，表现为 native PSS 一路涨。M_PURGE 强制立即归还，不杀进程、
+@@ -364,6 +562,15 @@
+ #endif
+ }
+ 
++// r27.66：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
++// 不修改任何状态、不释放任何内存，可安全重复调用。
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_osfans_trime_core_Rime_dumpMemoryAnalysisForDiag(JNIEnv *env,
++                                                          jclass /* thiz */) {
++  std::string report = memdiag::buildReport();
++  return env->NewStringUTF(report.c_str());
++}
++
+ // r27.63：诊断专用——真正销毁 librime session，返回销毁前的 schema id。
+ extern "C" JNIEXPORT jstring JNICALL
+ Java_com_osfans_trime_core_Rime_releaseRimeSessionForDiag(JNIEnv *env,
