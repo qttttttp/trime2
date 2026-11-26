@@ -73,22 +73,10 @@ SHA-256: 42:C0:18:B9:FD:B6:01:DC:73:7D:1D:C8:5E:2C:A7:40:E0:99:28:A1:E4:0C:7E:B7
 | `03-clipboard-broadcast.patch` | 剪贴板内容变化后发送本地广播 `com.trime2.CLIP_CHANGED` |
 | `04-http-stream.patch` | 新增 `Http.putFile()`，WebDAV 流式上传任意大小/二进制文件 |
 | `05-file-offset-compat.patch` | 编译修复：32 位 ABI 下 native 编不过（见下），无使用示例 |
-| `06-mlkit-offline.patch` | 接入 ML Kit 手写识别，模型下载地址指向面板内置的本地 http 服务（127.0.0.1:18080），模型不打包进 APK |
-| `07-boost-vmd.patch` | 编译修复：librime 新版用到 Boost.VMD，`Boost.cmake` 模块列表补 `vmd` |
-| `08-opencc-missing-dict.patch` | 编译修复：新版 OpenCC 用 `JPShinjitai*` 取代 `JPVariants`，`installOpenCCData` 缺字典时跳过而不是抛异常 |
-| `09-rime-property.patch` | lua侧与librime简单通讯,Rime.setProperty("string","string") , Rime.getProperty("string"),librime-lua:env.engine.context:get_property("string")和set_property("string","string")|
-
-**构建前必跑一次覆盖自检**
-
-```bash
-python3 tools/check-local-changes.py /path/to/trime2
-```
-
-它列出「本地改了、但补丁里没有」的文件。CI 只认补丁，本地却认所有未提交改动——这个不对称已经害过两次（`07`、`08` 都是本地改了没进补丁，CI 直接编译失败）。不属于 CI 的本地专属改动（例如 gradle 分发包指向本地文件）写进源码树根目录的 `.unpatched-allow`。
 
 ### 01-voice-asr.patch
 
-改动要点：新增 `AiClient.transcribeAudio()`（multipart 上传 WAV 到 `/v1/audio/transcriptions`）与 `looksLikeAsr()`（按模型名 `sensevoice`/`whisper`/`paraformer`/`asr` 自动分流）；`asr_config` 新增可选 `api` 字段强制指定接口。
+改动要点：新增 `AiClient.transcribeAudio()`（multipart 上传 WAV 到 `/v1/audio/transcriptions`）与 `looksLikeAsr()`（按模型名 `sensevoice`/`whisper`/`paraformer`/`asr` 自动分流）；`asr_config` 新增可选 `api` 字段强制指定接口；语音输入改为「长按说话、松手上屏」。
 
 主题 `main.lua` 的写法（以硅基流动为例）：
 
@@ -193,154 +181,9 @@ Http.putFile(
 
 纯编译修复，无运行时用法：`add_compile_definitions(_FILE_OFFSET_BITS=0)`，绕开 bionic 在 32 位 + `minSdk 21` 下对 `fseeko`/`ftello` 声明的 API 24 守卫。
 
-### 06-mlkit-offline.patch
+---
 
-接入 ML Kit 数字墨水手写识别，模型地址配成**两条**：官方 https 优先，面板内置的本地 http 服务兜底。（也可以只留本地一条，见下文 `--url-prefix`。）
-
-ML Kit 的下载地址写在 AAR 的 `assets/manifest.json` 里。把中文几个 pack 的 `download_urls` 改成 `http://127.0.0.1:18080/<pack>.zip` 后，手写面板在模型未登记时自动起本地服务（服务根目录 = lua 脚本所在目录），ML Kit 从回环地址抓 zip，sha1 校验、解包、登记全部由官方代码完成，`isModelDownloaded()` 天然为 true。
-
-**双地址模式（本地优先，在线兜底）**
-
-当前构建产出的是双地址：每个中文 pack 的 `download_urls` 是
-
-```json
-["http://127.0.0.1:18080/<pack>.zip",
- "https://dl.google.com/handwriting/models/<原文件名>.zip"]
-```
-
-脚本目录里有 zip 就走回环地址，毫秒级完成、不碰网络。由 `make-offline-aar.py --local-first` 生成，官方地址从原始 AAR 里原样取（官方文件名规则与 pack 名不同，不能靠拼接）。
-
-**GMS 不会自己试第二条地址（实测）**
-
-真机日志（`lf302` 之前那一版）证明：三个 pack 全部 `404`，紧接着就是
-
-```
-zzai: Failed to download file group zh-Hani-CN
-3 failure(s) in total:
---- Failure 1 --- zzcg: HTTP_ERROR HttpCode: 404;
---- Failure 2 --- zzcg: HTTP_ERROR HttpCode: 404;
---- Failure 3 --- zzcg: HTTP_ERROR HttpCode: 404;
-```
-
-也就是说 `download_urls` 的多地址是**按序尝试直到成功的列表**这件事并不成立——第一条返回 404，整个 file group 直接失败，第二条 https 从未被请求。所以「本地没有文件时用网络」不能靠 manifest 的第二条地址，只能由本地服务自己完成：
-
-```
-GMS ──GET──> 127.0.0.1:18080/<pack>.zip
-               ├─ 文件存在   → 200 + 文件内容（走本地）
-               └─ 文件不存在 → 302 Location: https://dl.google.com/...（转在线）
-```
-
-本地服务在 404 之前先查 APK 内 `assets/manifest.json`，用 `org.json.JSONObject` 取该 pack 的官方 https 地址，回 `302`。GMS 的 okhttp 跟随重定向，下载的是官方文件本身，sha1 校验、解包、登记仍由官方代码完成。manifest 第二地址保留着没有坏处，但**不要指望它**。
-
-302 这条路径已实测跑通（`lf302` 版首次替换脚本后的真机日志）：
-
-```
-模型服务：本地没有 lstm_chinese_tflite_4_192_tflite_20181109_zip.zip，302 转在线
-模型服务：本地没有 qrnn_zh_cn_reco_20191217_fst_20190322_recospec_zip.zip，302 转在线
-模型服务：本地没有 zh_cn_20190322_compact_fst_zip.zip，302 转在线
-模型已就绪
-模型线路 302转在线 3，未请求 1
-```
-
-同一台设备、同一份 APK，上一版脚本（只回 404）三次重试全部 `HTTP_ERROR 404`；换成 302 后直接 `模型已就绪`。两组日志的差别只有脚本，说明**跟随重定向成立，多地址按序回落不成立**。模型下载后由 GMS 登记缓存，之后不再访问网络。
-
-**为什么不是在线优先**：`dl.google.com` 在国内时通时不通（各测试点结果不一致，DNS 污染常见），把它放第一条会让国内用户先卡在超时上；而这 4 个模型是 2018/2019 年的固定文件（`lstm_…_20181109`、`qrnn_…_20191217`），官方端多年没更新，在线拿到的和本地 sha1 一致——在线优先没有任何收益，只有等待和失败率。
-
-面板每次下载结束打印一行线路，直接说明走了哪条：
-
-| 日志 | 含义 |
-|---|---|
-| `模型线路 本地 4` | 4 个包全由本地服务发出 |
-| `模型线路 302转在线 3，未请求 1` | 本地没有 zip，服务 302 把 GMS 引到官方地址（已实测可成功） |
-| `模型线路 无地址404 3` | 本地没有 zip，manifest 里也没解析出在线地址（解析失败或纯本地单地址包） |
-| `模型线路 在线直下（本地无请求）` | 本地服务一次请求都没收到（服务没起或地址顺序不对） |
-| `模型线路 未请求 N` | 只下了其中几个包，剩下 N 个本次不需要 |
-
-`CFG.verbose = true` 时会逐个包列出文件名，以及 APK 内地址的顺序是「本地→在线」还是「在线→本地」。
-
-> 代价：本地有 zip 时几乎瞬间完成；没有 zip 时由服务端 302 到官方，耗时取决于 `dl.google.com` 的可达性。国内网络下最稳的做法仍是把 4 个 zip 放在脚本目录。纯本地单地址可用 `--url-prefix`（不带任何 `-first` 开关）。
->
-> **不要把 manifest 的第二条地址当成冗余清理掉**：脚本 302 的目标就是从这里解析出来的（找 `download_urls` 里第一个 `https://`）。删成单地址后本地缺文件只能回 404，302 链直接断掉。
-
-**AAR 里那条 https 检查必须改掉**
-
-`digital-ink-recognition` 的下载器（`zzwu.zzc`）在发请求前判断地址是否以 `https` 开头，不是就抛 `INSECURE_URL_ERROR`——所以只把地址改成 `http://127.0.0.1` 还不够，编译出来必定失败。构建后由 `tools/postprocess-apk.sh` 调 `tools/patch-dex-https.py`：按字符串特征定位该分支，把 `if-nez` 改成 `goto`（3 字节），再重算 dex 头部 `checksum`/`signature`、重新对齐签名。
-
-```lua
-0x32ad9e:  39 01 19  (if-nez v1, +0x19)   -- 编译产物，会抛错
-0x32ad9e:  28 19 00  (goto +0x19)          -- 修正后，跳过整个抛错块
-```
-
-CI 与本地 `build.sh` 都已内置这一步，产物自检里断言该位置必须是 `goto`，否则构建失败。这个修正等价于让 AAR 跳过"只允许 https"的校验，之所以可接受，是因为模型地址是本机回环，流量不出设备；将来若改用公网地址，应当配 https 而不是依赖它。
-
-> 本地优先之后，这段 patch 从"兜底"变成了**主路径**：正常情况下 4 个 pack 都从 `127.0.0.1` 取，走的就是这条被放行的 http。没有它，本地优先版第一步就 `INSECURE_URL_ERROR`。它的作用不是让产物像定版，而是让回环地址能被 GMS 接受——两者恰好是同一处字节。
-
-**构建基线必须锁定子模块版本**
-
-CI 拉取子模块时默认 checkout 到上游 `.gitmodules` 里记录的旧 commit，与真机验证过的定版构建不同，产物会出现 `librime_jni.so` 少 500 KB、`shared/opencc` 少 5 个条目、词典数据不一致等差异。workflow 的「拉取子模块」步骤末尾用 `pin` 把 8 个关键子模块锁定到定版使用的 commit（librime / OpenCC / octagram / predict / snappy / lua / lua-deps / data/rime/essay），并把 JNI 缓存 key 升到 `v2`，避免复用旧版本编出的 `.so`。
-
-
-| 指标 | 定版 | 现构建 | 处理 |
-|---|---|---|---|
-| `librime_jni.so` | 5959144 | 5958240 | 不比较。子模块已 pin 到同一 commit，本地构建产物也是 5959144，剩下这 904 字节差异来自 CI 工具链（NDK 等），未追查，与下载链路无关 |
-| `shared/opencc` | 30 条目 | 27 条目 | 不比较。差的 3 个是 `s2seal/t2seal/seal2t`（文言转换配置），pin 的 OpenCC `025f371` 的 `data/config` 里已没有这些文件，定版那 3 个是本地增量构建的残留 |
-| manifest 地址 | 4×2 | 4×2 | **断言**。每个 pack 必须正好两条，且第一条是官方 https、第二条是 `127.0.0.1:18080` |
-| `JPShinjitaiCharacters.txt` 等关键字典 | 有 | 有 | **断言**。缺了说明 08 补丁没生效 |
-
-自检步骤只对后两项报错，前两项打印数值供对照，不再让上游正常演进卡死构建（这条规则是 CI 被 `27 < 28` 误杀一次之后定下来的）。
-
-补丁做四件事：
-
-| 文件 | 改动 |
-|---|---|
-| `AndroidManifest.xml` | 加 `xmlns:tools` 与 `<uses-sdk tools:overrideLibrary="...">`，让 minSdk 21 的包能引入要求 23 的库 |
-| `app/build.gradle.kts` | 补 AAR 的传递依赖（AAR 本体由上游已有的 `fileTree("libs")` 带入，不用写这一行） |
-| `app/proguard-rules.pro` | keep `com.google.mlkit.**` 与 `com.google.android.gms.internal.mlkit_**` |
-| `mlkit/MlkitModelInstaller.java`（新增） | 把 APK 内 `assets/mlkit-offline/` 的模型复制到本地目录（assets 为空时静默跳过），`TrimeService.onCreate()` 里挂一行调用 |
-
-第三条容易漏：上游 `isMinifyEnabled = true`，而 Lua 通过 `luajava.bindClass` 反射调用，R8 看不到引用，不 keep 会整包被裁，编译全绿但一调用就 `ClassNotFoundException`。
-
-**AAR 与模型的管理方式**：
-
-- **AAR 不入库**：CI 构建 `应用补丁` 步骤之后自动执行——从 Google Maven 下载原版 AAR（sha1 校验 `2f4ebc12…`）→ `tools/make-offline-aar.py --url-prefix http://127.0.0.1:18080 --pkg com.nirenr.trime` 改写 → 断言已指向本地服务 → 放入 `app/libs/`。本地手动构建同理（`build.sh` 已内置）；
-- **模型不打包**：构建时 `rm -rf app/src/main/assets/mlkit-offline` 再建空目录，APK 只带 AAR 和 installer 逻辑，体积约 16 MB。使用者把 4 个模型 zip 放到 `手写面板.lua` 所在目录即可（文件名与 pack 名一致，见 `pack-map.tsv`）；不放也能跑，脚本会让本地服务 302 到官方地址，但那样就依赖 `dl.google.com` 的可达性；
-  - 产物自检里有硬断言：APK 内只要出现 `assets/mlkit-offline/*.zip` 就 `exit 1`，防止以后又把 25 MB 模型塞回去；
-  - `MlkitModelInstaller` 在 assets 为空时静默跳过，不会因为目录空而报错；这条路径保留是为了将来「模型随包」仍能一键启用；
-- workflow 的恢复名单不含 `app/libs`（不再入库），`git reset --hard` 冲掉后由构建步骤现场重建。
-
-AAR 生成工具见 `tools/make-offline-aar.py`：
-
-```bash
-# 双地址（本地优先，在线兜底）—— 当前构建用的就是这条
-python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
-    --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
-    --url-prefix "http://127.0.0.1:18080" --local-first --out ./offline
-
-# 纯本地（只留本地一条地址，必须放 zip，速度最快）
-python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
-    --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
-    --url-prefix "http://127.0.0.1:18080" --out ./offline
-
-# 在线优先（旧方案，仅海外网络或已有代理时考虑）
-python3 tools/make-offline-aar.py --aar digital-ink-recognition-19.0.0.aar \
-    --pkg com.nirenr.trime --langs zh-Hani,zh-Hani-CN \
-    --url-prefix "http://127.0.0.1:18080" --online-first --out ./offline
-```
-
-配套的手写面板是 `scripts/手写面板.lua`：覆盖在键盘上的一块画板，抬笔即识别，点候选上屏；带模型自动下载、脏索引自愈（官方 delete → 清 prefs 硬重置）、反查编码等功能。
-
-反查编码已抽成独立模块 `scripts/单字反查.lua`，手写面板用 `dofile` 加载，其他脚本也能同样复用：
-
-```lua
-local m = dofile("/storage/emulated/0/Documents/rime/scripts/单字反查.lua")
-m.init(svc)                       -- 找数据文件；idx 缺失/无效时后台自动生成
-m.codeOfCandidate("花")            -- 索引没就绪返回 nil
-m.onReady(function() ... end)     -- 索引建好后回调一次（面板用它刷新候选小字）
-m.lookbackType() / m.saveLookbackType(t) / m.CODE_TYPES / m.isReady()
-```
-
-数据只认 `单字编码.idx + 单字编码.text`（`gen-code-table.py` 生成，`HEX8 OFFSET7 LEN5` 行宽 23 字节）。idx 缺失或与 `.text` 不配套时模块后台重建，**建好之前 `codeOfCandidate` 一律返回 nil** —— 候选照常显示，只是不带反查小字；建好后自动可用并回调刷新。整表 `.lua` / `.text` 整载的兜底被刻意去掉了：整载要占内存、拖慢首次调用，而索引本来就毫秒级。
-
+## 四、如何新增补丁
 
 ### 1. 准备本地源码
 
@@ -611,13 +454,6 @@ patches/                              # 补丁集合（按文件名顺序应用�
   03-clipboard-broadcast.patch
   04-http-stream.patch
   05-file-offset-compat.patch
-  06-mlkit-offline.patch
-  07-boost-vmd.patch
-  08-opencc-missing-dict.patch
-tools/make-offline-aar.py             # 生成离线 AAR（改写 download_urls）
-tools/patch-dex-https.py              # 修正 AAR 内 https 校验分支
-tools/postprocess-apk.sh              # 修正 + 对齐 + 重签
-tools/check-local-changes.py          # 检查本地改动是否都进了补丁
 signing/trime2-100y.keystore          # 可选，已用 secret 时可删
 README.md
 ```
