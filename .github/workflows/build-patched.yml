@@ -832,7 +832,7 @@ jobs:
             echo "### 发布历史"
             echo
             echo "- ** Latest**：本仓库的 \`patched-latest\` 固定在发布页顶部，只保留最新一次构建的 APK（每次发布前自动清理旧资产；清理失败不影响发布），下载链接长期不变。"
-            echo "- **历史版本**：每次构建另发一条以 \`patched-日期-上游短sha\` 命名的正式 Release，在 [发布列表](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases) 里按时间排列，可下载任意旧版 APK 与对应完整源码。"
+            echo "- **历史版本**：按上游版本保留——上游有更新才新增一条以 \`patched-日期-上游短sha\` 命名的正式 Release；同一上游版本的重复构建只保留最后一条。在 [发布列表](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases) 里可下载各版本的 APK 与对应完整源码。"
             echo
             echo "上游 ${UP_LINK} ${UP_SUBJECT} ｜ 构建 [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) ｜ arm64-v8a ${SIZE_MB} MB"
             echo
@@ -904,6 +904,39 @@ jobs:
           files: app/build/outputs/apk/release/*.apk
           prerelease: false
           make_latest: true
+
+      # 发布页历史构建去重：按上游版本保留，每个上游版本只留最后一条。
+      # - 上游有更新：历史里没有同 sha 的 Release，本次直接新增一条；
+      # - 上游没更新（例如仅改补丁/脚本触发的重建）：删掉同 sha 的旧 Release 再发本次，
+      #   于是同一上游版本永远只留最后构建的那条，不会在发布页堆一串重复条目。
+      # 版本身份用 body 里的 upstream-sha 识别（tag 名含日期与运行号，不能直接比）。
+      # 清理属辅助操作，任何 GitHub API 抖动都不能阻断发布，故 continue-on-error + 逐条容错。
+      - name: 历史构建去重（同上游版本只留最后一条）
+        if: startsWith(github.ref, 'refs/tags/') == false
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          echo "本次 upstream-sha = ${UPSTREAM_SHA}"
+          TAGS=$(gh release list --repo "$GITHUB_REPOSITORY" --json tagName -q '.[].tagName' 2>/dev/null || true)
+          n=0
+          for tag in $TAGS; do
+            [ "$tag" = "patched-latest" ] && continue
+            case "$tag" in patched-*) ;; *) continue ;; esac
+            body=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+            sha=$(printf '%s\n' "$body" | sed -n 's/.*upstream-sha: *\([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+            if [ -n "$sha" ] && [ "$sha" = "$UPSTREAM_SHA" ]; then
+              echo "删除同版本旧历史 Release: $tag (upstream-sha=${sha:0:7})"
+              if ! gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>&1; then
+                # 旧版 gh 不支持 --cleanup-tag：删 Release 后手动删 tag
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes 2>&1 || true
+                git push --delete origin "refs/tags/$tag" 2>&1 || true
+              fi
+              n=$((n+1))
+            fi
+          done
+          echo "已清理 $n 条同上游版本的旧历史 Release"
 
       # 每次构建再发一条独立 Release(日期+上游短sha 的 tag),在发布页按时间累积成历史。
       # make_latest:false 保证它不会抢走 patched-latest 的 Latest 标记；
