@@ -1,3 +1,4 @@
+diff --git a/app/src/main/java/com/osfans/trime/PrefLauncher.java b/app/src/main/java/com/osfans/trime/PrefLauncher.java
 --- a/app/src/main/java/com/osfans/trime/PrefLauncher.java
 +++ b/app/src/main/java/com/osfans/trime/PrefLauncher.java
 @@ -70,6 +70,7 @@
@@ -8,18 +9,17 @@
      private boolean enabled;
      private final ThreadPoolExecutor nameWorker=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>());
      private final HomeConfigNames configNames=new HomeConfigNames(PrefLauncher::nameGlobals);
-@@ -229,6 +230,10 @@
-         scroll=new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); scroll.setVerticalScrollBarEnabled(false);
+@@ -230,6 +231,9 @@
          content=vertical(); content.setPadding(dp(16),dp(4),dp(16),dp(16));
          scroll.addView(content,new ScrollView.LayoutParams(-1,-2)); root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
-+        // r27.47/0.9.1：最近使用工具快捷栏，放在“切换输入法”状态卡片之前
-+        section("最近使用工具");
-+        recentTools=new RecentToolsBar(this,a.surface,a.outline,a.ink);
-+        content.addView(recentTools,new LinearLayout.LayoutParams(-1,-2));
          buildStatus();
++        // r27.68/0.9.1：最近使用工具快捷栏，移到“切换输入法”状态卡片下方（标题已移入组件内部）
++        recentTools=new RecentToolsBar(this,a);
++        content.addView(recentTools,new LinearLayout.LayoutParams(-1,-2));
          boolean narrow=getResources().getConfiguration().screenWidthDp<360 || getResources().getConfiguration().fontScale>1.2f;
          boolean compact=getResources().getConfiguration().fontScale>1.1f;
-@@ -353,7 +358,7 @@
+         section("外观配置");
+@@ -353,7 +357,7 @@
      }
      @Override public void onConfigurationChanged(Configuration config) {super.onConfigurationChanged(config);buildHome();}
      @Override public void onWindowFocusChanged(boolean focus) {super.onWindowFocusChanged(focus);if(focus)refreshStatus();}
@@ -28,9 +28,10 @@
      @Override protected void onStart(){super.onStart();mToken=getWindow().getDecorView().getWindowToken();
          getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.DEFAULT_INPUT_METHOD),false,imeObserver);
          getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ENABLED_INPUT_METHODS),false,imeObserver);
+diff --git a/app/src/main/java/com/osfans/trime/ToolActivity.java b/app/src/main/java/com/osfans/trime/ToolActivity.java
 --- a/app/src/main/java/com/osfans/trime/ToolActivity.java
 +++ b/app/src/main/java/com/osfans/trime/ToolActivity.java
-@@ -186,6 +186,7 @@
+@@ -183,6 +183,7 @@
              mHistory.remove(text);
          mHistory.add(0, text);
          //ClipboardUtil.saveToolHistory(mHistory);
@@ -40,7 +41,7 @@
          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
 --- /dev/null
 +++ b/app/src/main/java/com/osfans/trime/ToolHistory.java
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,266 @@
 +/*
 + * r27.45：最近使用工具的历史（独立文件，不触碰上游代码）。
 + * 历史存在 rime/tools/.recent_tools，每行一个工具目录名（UTF-8）。
@@ -157,6 +158,126 @@
 +        return picked;
 +    }
 +
++    //========== r27.68：show 字段 / 显示名 / 2×2 按钮取值 ==========
++
++    /**
++     * 纯文本读取工具目录下 init.lua 的 show 字段（绝不执行 Lua）。
++     * 识别 show=true / show = true / show="true" / show = "true"（大小写不敏感），
++     * 并跳过以 -- 开头的注释行与行尾 -- 注释。值为 true 表示「固定显示在工具条」。
++     */
++    public static boolean isShown(String toolsDir, String name) {
++        if (toolsDir == null || name == null) return false;
++        File init = new File(new File(toolsDir, name), "init.lua");
++        if (!init.isFile()) return false;
++        BufferedReader r = null;
++        try {
++            r = new BufferedReader(
++                    new InputStreamReader(new FileInputStream(init), StandardCharsets.UTF_8));
++            String line;
++            while ((line = r.readLine()) != null) {
++                String s = line;
++                // 去掉行尾 Lua 注释（只认 --，init.lua 里字符串不含长注释）
++                int dash = s.indexOf("--");
++                if (dash >= 0) s = s.substring(0, dash);
++                s = s.trim();
++                if (!s.startsWith("show")) continue;
++                // 必须是 show 这个标识符，后面跟 =（容忍 show=true 与 show = true）
++                String rest = s.substring(4).trim();
++                if (!rest.startsWith("=")) continue;
++                String val = rest.substring(1).trim();
++                val = val.replace("\"", "").replace("'", "");
++                if ("true".equalsIgnoreCase(val)) return true;
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "读取 show 字段失败: " + name + " " + e.getMessage());
++        } finally {
++            if (r != null) {
++                try { r.close(); } catch (Exception ignored) {}
++            }
++        }
++        return false;
++    }
++
++    /**
++     * 读取工具显示名：优先 init.lua 的 appname（纯文本，不执行 Lua），否则用目录名。
++     * 只识别形如 appname="xxx" / appname = 'xxx' 的单行赋值。
++     */
++    public static String displayName(String toolsDir, String name) {
++        if (name == null) return "";
++        if (toolsDir != null) {
++            File init = new File(new File(toolsDir, name), "init.lua");
++            BufferedReader r = null;
++            try {
++                if (init.isFile()) {
++                    r = new BufferedReader(
++                            new InputStreamReader(new FileInputStream(init), StandardCharsets.UTF_8));
++                    String line;
++                    while ((line = r.readLine()) != null) {
++                        String s = line;
++                        int dash = s.indexOf("--");
++                        if (dash >= 0) s = s.substring(0, dash);
++                        s = s.trim();
++                        if (!s.startsWith("appname")) continue;
++                        String rest = s.substring(7).trim();
++                        if (!rest.startsWith("=")) continue;
++                        String val = rest.substring(1).trim();
++                        // 去掉成对引号
++                        if (val.length() >= 2 &&
++                                ((val.charAt(0) == '"' && val.charAt(val.length() - 1) == '"')
++                                        || (val.charAt(0) == '\'' && val.charAt(val.length() - 1) == '\''))) {
++                            val = val.substring(1, val.length() - 1);
++                        }
++                        val = val.trim();
++                        if (!val.isEmpty()) return val;
++                    }
++                }
++            } catch (Exception e) {
++                Log.w(TAG, "读取 appname 失败: " + name + " " + e.getMessage());
++            } finally {
++                if (r != null) {
++                    try { r.close(); } catch (Exception ignored) {}
++                }
++            }
++        }
++        return name;
++    }
++
++    /**
++     * r27.68：决定工具条 2×2 共 n 个按钮的取值：
++     * 1) 有 show=true 的工具 → 固定显示；有最近使用时最多 n-1 个（留最后 1 位给最近使用），
++     *    没有最近使用时可占满 n 个；
++     * 2) 没有 show → 用最近使用补足；
++     * 3) 最近使用也不足 → 按目录顺序补足；
++     * 4) 完全没有工具 → 返回空（整栏隐藏）。
++     * 全程去重且保持 show / 最近 / 顺序的相对优先级。
++     */
++    public static List<String> resolveGrid(String toolsDir, int n) {
++        List<String> picked = new ArrayList<>();
++        if (toolsDir == null) return picked;
++        List<String> all = listTools(toolsDir);
++        if (all.isEmpty()) return picked;
++        List<String> recent = load(toolsDir);
++
++        Set<String> seen = new LinkedHashSet<>();
++        // 1) show=true 的工具，按目录顺序
++        int showLimit = recent.isEmpty() ? n : (n - 1); // 有最近使用时留 1 位
++        for (String t : all) {
++            if (picked.size() >= showLimit) break;
++            if (isShown(toolsDir, t) && seen.add(t)) picked.add(t);
++        }
++        // 2) 最近使用补足
++        for (String r : recent) {
++            if (picked.size() >= n) break;
++            if (seen.add(r)) picked.add(r);
++        }
++        // 3) 顺序补足
++        for (String t : all) {
++            if (picked.size() >= n) break;
++            if (seen.add(t)) picked.add(t);
++        }
++        return picked;
++    }
++
 +    private static boolean isTool(String toolsDir, String name) {
 +        if (name == null || name.isEmpty()) return false;
 +        return new File(new File(toolsDir, name), "main.lua").isFile();
@@ -189,18 +310,18 @@
 +}
 --- /dev/null
 +++ b/app/src/main/java/com/osfans/trime/RecentToolsBar.java
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,116 @@
 +/*
-+ * r27.45：设置页顶部的「最近使用工具」快捷栏（独立文件，不触碰上游代码）。
-+ * 横排 3 个按钮，点击以 LuaActivity 启动对应工具的 main.lua。
-+ * 历史不足时用内置工具补足；只启动脚本，不做其它事。
++ * r27.68：设置页「切换输入法」状态卡片下方的工具快捷栏（独立文件，不触碰上游代码）。
++ * 2 列 × 2 行共 4 个按钮，样式与设置页其它卡片一致（HomeCardView）。
++ * 取值：init.lua 里 show=true 的固定显示；有最近使用时 show 最多 3 个、留 1 位给最近使用；
++ * 都没有则按目录顺序补足；一个工具都没有时整栏隐藏。
++ * 只做纯文本读取与脚本启动，绝不执行工具里的 Lua 代码。
 + */
 +package com.osfans.trime;
 +
 +import android.content.Context;
 +import android.content.Intent;
-+import android.graphics.Color;
-+import android.graphics.drawable.GradientDrawable;
 +import android.net.Uri;
 +import android.os.Build;
 +import android.view.Gravity;
@@ -211,82 +332,75 @@
 +
 +import com.androlua.LuaActivity;
 +import com.androlua.LuaApplication;
++import com.osfans.trime.ui.HomeAppearance;
++import com.osfans.trime.ui.HomeCardView;
 +
 +import java.io.File;
++import java.util.List;
 +
 +public class RecentToolsBar extends LinearLayout {
 +
-+    /** 内置工具目录名（即 manifest.txt 的安装名）。 */
-+    private static final String[] DEFAULT_TOOLS = {"主题工作室", "一键更新"};
-+    private static final int BUTTON_COUNT = 3;
-+
++    private static final int BUTTON_COUNT = 4;
 +    private final Context mContext;
++    private final HomeAppearance a;
 +    private String mToolsDir;
-+    // 主题色（r27.46/0.9.1）：默认沿用原深色；PrefLauncher 传入 HomeAppearance 颜色以融入卡片风格
-+    private int mCardColor = Color.rgb(45, 52, 62);
-+    private int mStrokeColor = Color.rgb(90, 100, 115);
-+    private int mTextColor = Color.rgb(230, 230, 230);
-+    private int mCornerDp = 6;
-+    private int mTextSp = 13;
 +
 +    public RecentToolsBar(Context context) {
++        this(context, new HomeAppearance(context, false));
++    }
++
++    /** 0.9.1 卡片式设置页专用构造：复用 HomeAppearance 的视觉令牌，与下方卡片一致。 */
++    public RecentToolsBar(Context context, HomeAppearance a) {
 +        super(context);
 +        mContext = context;
-+        setOrientation(LinearLayout.HORIZONTAL);
-+        setGravity(Gravity.CENTER_VERTICAL);
-+        int pad = dp(8);
-+        setPadding(pad, dp(4), pad, dp(4));
++        this.a = a;
++        setOrientation(LinearLayout.VERTICAL);
 +        try {
 +            mToolsDir = LuaApplication.getInstance().getLuaExtDir("tools");
 +        } catch (Throwable e) {
 +            mToolsDir = null;
 +        }
-+        buildButtons();
++        refresh();
 +    }
 +
-+    /**
-+     * 0.9.1 卡片式设置页专用构造：把外观交给 HomeAppearance 的视觉令牌，
-+     * 使三个工具按钮与设置页其它卡片风格一致。启动逻辑与默认构造完全相同。
-+     */
-+    public RecentToolsBar(Context context, int cardColor, int strokeColor, int textColor) {
-+        this(context);
-+        mCardColor = cardColor;
-+        mStrokeColor = strokeColor;
-+        mTextColor = textColor;
-+        mCornerDp = 12;
-+        mTextSp = 12;
-+        buildButtons();
-+    }
-+
-+    /** 重新读取历史并重建按钮；由 PrefLauncher.onResume 调用。 */
++    /** 重新读取 show / 历史并重建按钮；由 PrefLauncher.onResume 调用。 */
 +    public void refresh() {
 +        removeAllViews();
-+        buildButtons();
-+    }
-+
-+    private void buildButtons() {
-+        if (mToolsDir == null) {
-+            TextView hint = makeButton("（工具目录不可用）");
-+            addView(hint, new LinearLayout.LayoutParams(0, dp(40), 1));
-+            return;
-+        }
-+        java.util.List<String> tools = ToolHistory.resolve(mToolsDir, DEFAULT_TOOLS, BUTTON_COUNT);
++        List<String> tools = ToolHistory.resolveGrid(mToolsDir, BUTTON_COUNT);
 +        if (tools.isEmpty()) {
-+            TextView hint = makeButton("（暂无工具）");
-+            addView(hint, new LinearLayout.LayoutParams(0, dp(40), 1));
++            // 没有任何工具：整栏（含标题）不显示
++            setVisibility(View.GONE);
 +            return;
 +        }
-+        for (final String name : tools) {
-+            TextView btn = makeButton(name);
-+            btn.setOnClickListener(new OnClickListener() {
-+                @Override
-+                public void onClick(View v) {
-+                    openTool(name);
-+                }
-+            });
-+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1);
-+            lp.setMargins(dp(3), 0, dp(3), 0);
-+            addView(btn, lp);
++        setVisibility(View.VISIBLE);
++
++        // 标题，样式与 PrefLauncher.section() 保持一致
++        TextView title = a.text("最近使用工具", 17, a.ink, true);
++        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, -2);
++        tp.topMargin = a.dp(18);
++        tp.bottomMargin = a.dp(10);
++        addView(title, tp);
++        if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
++
++        // 两列两行：每两个按钮一行，各占 1 份宽度
++        for (int i = 0; i < tools.size(); i += 2) {
++            LinearLayout row = new LinearLayout(mContext);
++            row.setOrientation(LinearLayout.HORIZONTAL);
++            row.setGravity(Gravity.TOP);
++            row.setBaselineAligned(false);
++            for (int j = 0; j < 2 && i + j < tools.size(); j++) {
++                final String name = tools.get(i + j);
++                String label = ToolHistory.displayName(mToolsDir, name);
++                HomeCardView card = new HomeCardView(mContext, a,
++                        R.drawable.home_more, a.accent, label, false, null,
++                        v -> openTool(name));
++                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1);
++                if (j > 0) lp.setMarginStart(a.dp(8));
++                row.addView(card, lp);
++            }
++            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-1, -2);
++            rp.bottomMargin = a.dp(8);
++            addView(row, rp);
 +        }
 +    }
 +
@@ -311,24 +425,5 @@
 +        } catch (Exception e) {
 +            Toast.makeText(mContext, "启动工具失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
 +        }
-+    }
-+
-+    private TextView makeButton(String text) {
-+        TextView tv = new TextView(mContext);
-+        tv.setText(text);
-+        tv.setGravity(Gravity.CENTER);
-+        tv.setTextSize(mTextSp);
-+        tv.setTextColor(mTextColor);
-+        tv.setSingleLine(true);
-+        GradientDrawable bg = new GradientDrawable();
-+        bg.setColor(mCardColor);
-+        bg.setCornerRadius(dp(mCornerDp));
-+        bg.setStroke(1, mStrokeColor);
-+        tv.setBackgroundDrawable(bg);
-+        return tv;
-+    }
-+
-+    private int dp(float v) {
-+        return Math.round(v * mContext.getResources().getDisplayMetrics().density);
 +    }
 +}
