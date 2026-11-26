@@ -30,8 +30,8 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
  
  #include "jni-utils.h"
  #include "objconv.h"
-@@ -342,6 +350,196 @@
-   return Rime::Instance().getOption(*CString(env, option));
+@@ -364,6 +372,205 @@
+ #endif
  }
  
 +//============================================================
@@ -224,13 +224,6 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +
 +}  // namespace memdiag
 +
- // r27.55：归还 native 层已 free 但未还给内核的空闲页。
- // Android 的 malloc 分配器默认保留空闲页以加速下次分配，长时间输入后
- // 累积显著，表现为 native PSS 一路涨。M_PURGE 强制立即归还，不杀进程、
-@@ -364,6 +562,15 @@
- #endif
- }
- 
 +// r27.66：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
 +// 不修改任何状态、不释放任何内存，可安全重复调用。
 +extern "C" JNIEXPORT jstring JNICALL
