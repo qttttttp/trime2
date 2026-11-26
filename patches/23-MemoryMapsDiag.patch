@@ -1,11 +1,12 @@
 diff --git a/app/src/main/java/com/osfans/trime/core/Rime.java b/app/src/main/java/com/osfans/trime/core/Rime.java
+index 423620b..32dcc4a 100644
 --- a/app/src/main/java/com/osfans/trime/core/Rime.java
 +++ b/app/src/main/java/com/osfans/trime/core/Rime.java
-@@ -748,6 +748,10 @@
+@@ -748,6 +748,10 @@ public class Rime implements RimeApi, RimeLifecycleOwner {
      // r27.63：诊断专用。重建 session 并切回指定 schema，做到用户无感知恢复。
      public static native boolean restoreRimeSessionForDiag(String schemaId);
  
-+    // r27.66：诊断专用。只读采集 /proc/self/smaps 按文件类型聚合 PSS，
++    // r27.69：诊断专用。只读采集 /proc/self/smaps 按文件类型聚合 PSS/Private_Clean/Private_Dirty，
 +    // 加 malloc 分配器统计，返回格式化报告。不修改任何状态，可安全重复调用。
 +    public static native String dumpMemoryAnalysisForDiag();
 +
@@ -13,6 +14,7 @@ diff --git a/app/src/main/java/com/osfans/trime/core/Rime.java b/app/src/main/ja
  
      public static native String getCurrentRimeSchema();
 diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime_jni/rime_jni.cc
+index 913174f..aa0e51f 100644
 --- a/app/src/main/jni/librime_jni/rime_jni.cc
 +++ b/app/src/main/jni/librime_jni/rime_jni.cc
 @@ -10,6 +10,14 @@
@@ -30,12 +32,12 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
  
  #include "jni-utils.h"
  #include "objconv.h"
-@@ -364,6 +372,205 @@
+@@ -364,6 +372,213 @@ Java_com_osfans_trime_core_Rime_purgeNativeMemory(JNIEnv *env,
  #endif
  }
  
 +//============================================================
-+// r27.66：只读内存映射诊断。不改任何状态、不释放任何内存，
++// r27.69：只读内存映射诊断。不改任何状态、不释放任何内存，
 +// 仅采集 /proc/self/smaps 按文件聚合 PSS + malloc 分配器统计，
 +// 用于定位"anonymous 活内存"与"mmap 词库文件"各占多少。
 +//============================================================
@@ -43,6 +45,8 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +
 +struct Agg {
 +  long pss_kb = 0;
++  long clean_kb = 0;   // r27.69：Private_Clean，可回收的文件映射页
++  long dirty_kb = 0;   // r27.69：Private_Dirty，真占用的脏页
 +  int  maps = 0;
 +  std::string top_path;
 +  long top_kb = 0;
@@ -99,18 +103,20 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +  fclose(f);
 +}
 +
-+// 读 /proc/self/smaps，按分类聚合 PSS，并记录每类最大单映射
++// 读 /proc/self/smaps，按分类聚合 PSS / Private_Clean / Private_Dirty，并记录每类最大单映射
 +static void readSmaps(std::map<std::string, Agg>& agg) {
 +  FILE* f = fopen("/proc/self/smaps", "r");
 +  if (!f) return;
 +  char line[512];
 +  std::string cur_path;
-+  long cur_pss = 0;
++  long cur_pss = 0, cur_clean = 0, cur_dirty = 0;
 +  auto flush = [&]() {
-+    if (cur_pss <= 0) return;
++    if (cur_pss <= 0 && cur_dirty <= 0) return;
 +    const char* cat = classify(cur_path);
 +    Agg& a = agg[cat];
 +    a.pss_kb += cur_pss;
++    a.clean_kb += cur_clean;
++    a.dirty_kb += cur_dirty;
 +    a.maps += 1;
 +    if (cur_pss > a.top_kb) { a.top_kb = cur_pss; a.top_path = cur_path.empty() ? "(anonymous)" : cur_path; }
 +  };
@@ -121,7 +127,7 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +      if (strspn(line, "0123456789abcdefABCDEF") > 4 && line[strspn(line, "0123456789abcdefABCDEF")] == '-') {
 +        flush();
 +        cur_path.clear();
-+        cur_pss = 0;
++        cur_pss = 0; cur_clean = 0; cur_dirty = 0;
 +        // 路径是第 6 个字段之后（addr perms offset dev inode path）
 +        char* p = line;
 +        for (int field = 0; field < 5; ++field) {
@@ -136,6 +142,8 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +      }
 +    }
 +    if (strncmp(line, "Pss:", 4) == 0) cur_pss += atol(line + 4);
++    else if (strncmp(line, "Private_Clean:", 14) == 0) cur_clean += atol(line + 14);
++    else if (strncmp(line, "Private_Dirty:", 14) == 0) cur_dirty += atol(line + 14);
 +  }
 +  flush();
 +  fclose(f);
@@ -183,7 +191,7 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +  char buf[512];
 +  std::string out;
 +  out.reserve(4096);
-+  out += "========== native 内存映射诊断(r27.66) ==========\n";
++  out += "========== native 内存映射诊断(r27.69) ==========\n";
 +  snprintf(buf, sizeof(buf), "SDK=%d\n", android_get_device_api_level());
 +  out += buf;
 +  out += "\n-- smaps_rollup (MB) --\n";
@@ -192,8 +200,9 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +           r[0]/1024.0, r[1]/1024.0, r[2]/1024.0, r[3]/1024.0, r[4]/1024.0, r[5]/1024.0);
 +  out += buf;
 +  out += "Pss_Anon = 匿名活内存(堆/栈/分配器/librime对象)  Pss_File = 文件映射(词库mmap/dex/so)\n";
++  out += "Clean = Private_Clean(可回收文件页)  Dirty = Private_Dirty(真占用脏页)\n";
 +
-+  out += "\n-- 按文件类型聚合 PSS (MB / 映射数) --\n";
++  out += "\n-- 按文件类型聚合 PSS/Clean/Dirty (MB / 映射数) --\n";
 +  // 按 pss 降序
 +  std::vector<std::pair<std::string, Agg>> vec(agg.begin(), agg.end());
 +  std::sort(vec.begin(), vec.end(), [](const std::pair<std::string, Agg>& a,
@@ -202,8 +211,9 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +  });
 +  for (const auto& kv : vec) {
 +    const Agg& a = kv.second;
-+    snprintf(buf, sizeof(buf), "%-30s %8s / %4d  最大单映射: %s MB\n",
-+             kv.first.c_str(), formatMb(a.pss_kb).c_str(), a.maps, formatMb(a.top_kb).c_str());
++    snprintf(buf, sizeof(buf), "%-30s PSS=%7s Clean=%7s Dirty=%7s / %4d 最大: %s MB\n",
++             kv.first.c_str(), formatMb(a.pss_kb).c_str(), formatMb(a.clean_kb).c_str(),
++             formatMb(a.dirty_kb).c_str(), a.maps, formatMb(a.top_kb).c_str());
 +    out += buf;
 +    snprintf(buf, sizeof(buf), "    └ %s\n", a.top_path.c_str());
 +    out += buf;
@@ -224,7 +234,7 @@ diff --git a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/main/jni/librime
 +
 +}  // namespace memdiag
 +
-+// r27.66：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
++// r27.69：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
 +// 不修改任何状态、不释放任何内存，可安全重复调用。
 +extern "C" JNIEXPORT jstring JNICALL
 +Java_com_osfans_trime_core_Rime_dumpMemoryAnalysisForDiag(JNIEnv *env,
