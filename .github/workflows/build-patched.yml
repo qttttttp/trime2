@@ -893,6 +893,28 @@ jobs:
             echo "已清空 patched-latest 旧资产，下一步上传本次构建 APK"
           fi
 
+      # 每次构建前删掉 patched-latest 这条 Release 再重建，让发布页显示的日期
+      # (published_at) 刷新为本次构建时间。GitHub 的 published_at 只在 Release
+      # 首次创建时写入，更新正文或替换 APK 都不会刷新，只能删了重建。
+      # 关键：不能加 --cleanup-tag。patched-latest 这个 tag 已在"生成完整源码快照"
+      # 步骤强制指向扁平化快照 commit，删 tag 再建 Release 会让自动源码包缺失子模块。
+      # 只删 Release、保留 tag，重建时 action-gh-release 沿用现有 tag，源码包仍完整。
+      # 删除失败不阻断发布（此时退化为更新现有 Release，只是日期不刷新）。
+      - name: 删除 patched-latest 旧 Release（刷新发布日期）
+        if: startsWith(github.ref, 'refs/tags/') == false
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if gh release view patched-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "删除 patched-latest 旧 Release（保留 tag）"
+            gh release delete patched-latest --repo "$GITHUB_REPOSITORY" --yes
+            echo "已删除，下一步重建"
+          else
+            echo "patched-latest 尚不存在，无需删除"
+          fi
+
       # 固定 tag 的 rolling Release:链接永久固定、公开仓库任何人无需登录即可下载、
       # 不受 artifact 90 天过期影响。设为正式发布并置顶为 Latest,
       # 这样仓库主页和 /releases 页顶部直接显示"最新发布",不再藏在 tag 里。
