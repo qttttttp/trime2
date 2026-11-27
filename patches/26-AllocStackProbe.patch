@@ -1,0 +1,222 @@
+--- a/app/src/main/jni/librime_jni/rime_jni.cc
++++ b/app/src/main/jni/librime_jni/rime_jni.cc
+@@ -19,6 +19,8 @@
+ #include <algorithm>
+ #include <malloc.h>
+ #include <ctime>
++#include <atomic>
++#include <cstdint>
+ 
+ #include "jni-utils.h"
+ #include "objconv.h"
+@@ -431,6 +433,168 @@
+ // 仅采集 /proc/self/smaps 按文件聚合 PSS + malloc 分配器统计，
+ // 用于定位"anonymous 活内存"与"mmap 词库文件"各占多少。
+ //============================================================
++//============================================================
++// r27.88 / 26号诊断补丁：native 分配栈归因（默认关闭）。
++// 目标：定位"增长发生在 5 个入口之外"时，究竟是哪段 native 代码在持续 new。
++//
++// 设计要点（把风险压到最低）：
++//  1. 只重载全局 operator new / new[]（内部用 malloc），不重载任何 delete。
++//     释放仍走系统默认 operator delete（libc++ 内部即 free）。malloc↔free
++//     天然配对，不存在"new 我方 / delete 系统"的配对崩溃风险。
++//  2. 每次 new 用 __builtin_return_address(0) 取直接调用者 PC，按 PC 聚合
++//     "累计分配字节 / 次数"。PC 是代码地址，dump 时用 dladdr 解析成
++//     "so 名 + 偏移"，配合 addr2line 可定位到源码行。
++//  3. hook 内只做原子加和固定大小静态哈希表的线性探测，绝不申请内存、
++//     绝不调用 dladdr/snprintf/std::string（否则递归）。符号解析只在 dump 做。
++//  4. 默认关闭；关闭时 operator new 仅多一次原子读 + malloc，无其它开销。
++//  5. 只统计 >= 阈值的分配（默认 256B），过滤海量微小临时分配，降低表压力。
++//
++// 局限：累计分配量高 != 泄漏（可能是高频临时分配），需结合多次 dump 的
++//       uordblks 净增趋势判断；且需未 strip 的 so 才能符号化到源码行。
++//============================================================
++namespace allocprobe {
++
++constexpr int kSlots = 4096;          // 必须是 2 的幂
++struct Slot {
++  std::atomic<void*> pc{nullptr};     // nullptr = 空槽；否则为分配点返回地址
++  std::atomic<size_t> bytes{0};
++  std::atomic<long> calls{0};
++};
++static Slot g_slots[kSlots];
++
++static std::atomic<bool> g_enabled{false};
++static std::atomic<size_t> g_threshold{256};     // 只统计 >= 该字节数的分配
++static std::atomic<size_t> g_totalBytes{0};
++static std::atomic<long> g_totalCalls{0};
++static std::atomic<long> g_skipped{0};           // 小分配/表满被跳过的次数
++
++// 64 位混合哈希（MurmurHash3 finalizer 风格），把 PC 打散到各槽
++static inline size_t hashPc(void* p) {
++  uintptr_t x = (uintptr_t)p >> 2;               // 指令地址 4 字节对齐
++  x ^= x >> 16;
++  x *= 0x7feb352dULL;
++  x ^= x >> 15;
++  x *= 0x846ca68bULL;
++  x ^= x >> 16;
++  return (size_t)x;
++}
++
++// 在 operator new 内调用：pc 已由调用方用 __builtin_return_address(0) 取得。
++// 无锁：用原子 CAS 抢占空槽，再用原子加累计，全程不分配。
++static inline void account(void* pc, size_t n) {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  if (n < g_threshold.load(std::memory_order_relaxed)) {
++    g_skipped.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  size_t idx = hashPc(pc) & (kSlots - 1);
++  for (int probe = 0; probe < kSlots; ++probe) {
++    Slot& s = g_slots[(idx + probe) & (kSlots - 1)];
++    void* cur = s.pc.load(std::memory_order_relaxed);
++    if (cur == pc) {
++      s.bytes.fetch_add(n, std::memory_order_relaxed);
++      s.calls.fetch_add(1, std::memory_order_relaxed);
++      break;
++    }
++    if (cur == nullptr) {
++      void* expected = nullptr;
++      if (s.pc.compare_exchange_strong(expected, pc, std::memory_order_relaxed)) {
++        s.bytes.fetch_add(n, std::memory_order_relaxed);
++        s.calls.fetch_add(1, std::memory_order_relaxed);
++        break;
++      }
++      // CAS 失败：别的线程刚占了此槽，继续探测
++    }
++  }
++  g_totalBytes.fetch_add(n, std::memory_order_relaxed);
++  g_totalCalls.fetch_add(1, std::memory_order_relaxed);
++}
++
++static void enable(bool on, int thresholdBytes) {
++  if (!on) {
++    g_enabled.store(false, std::memory_order_release);
++    return;
++  }
++  for (int i = 0; i < kSlots; ++i) {
++    g_slots[i].pc.store(nullptr, std::memory_order_relaxed);
++    g_slots[i].bytes.store(0, std::memory_order_relaxed);
++    g_slots[i].calls.store(0, std::memory_order_relaxed);
++  }
++  g_totalBytes.store(0, std::memory_order_relaxed);
++  g_totalCalls.store(0, std::memory_order_relaxed);
++  g_skipped.store(0, std::memory_order_relaxed);
++  if (thresholdBytes > 0) {
++    g_threshold.store((size_t)thresholdBytes, std::memory_order_relaxed);
++  }
++  g_enabled.store(true, std::memory_order_release);
++}
++
++struct Row {
++  size_t bytes;
++  long calls;
++  void* pc;
++};
++
++// dump 阶段调用：此处允许分配（std::string/vector）与 dladdr 符号解析。
++// 注意：先把 g_enabled 关掉，避免报告自身的分配污染统计（调用方负责恢复）。
++static std::string report() {
++  std::string out;
++  char buf[320];
++  out.reserve(16384);
++  out += "========== native 分配栈归因 r27.88 ==========\n";
++  snprintf(buf, sizeof(buf), "状态=%s  阈值>=%zuB  累计=%zuMB/%ld次  跳过=%ld\n",
++           g_enabled.load(std::memory_order_relaxed) ? "开启" : "关闭",
++           g_threshold.load(std::memory_order_relaxed),
++           (size_t)(g_totalBytes.load(std::memory_order_relaxed) / 1048576),
++           g_totalCalls.load(std::memory_order_relaxed),
++           g_skipped.load(std::memory_order_relaxed));
++  out += buf;
++
++  std::vector<Row> rows;
++  rows.reserve(kSlots);
++  for (int i = 0; i < kSlots; ++i) {
++    void* pc = g_slots[i].pc.load(std::memory_order_relaxed);
++    size_t b = g_slots[i].bytes.load(std::memory_order_relaxed);
++    if (pc != nullptr && b > 0) {
++      rows.push_back({b, g_slots[i].calls.load(std::memory_order_relaxed), pc});
++    }
++  }
++  std::sort(rows.begin(), rows.end(),
++            [](const Row& a, const Row& b) { return a.bytes > b.bytes; });
++
++  out += "\n-- Top 分配点 (累计MB / 次数 / 库+偏移) --\n";
++  const int TOP = 30;
++  for (int i = 0; i < (int)rows.size() && i < TOP; ++i) {
++    Dl_info info;
++    const char* lib = "?";
++    unsigned long off = 0;
++    if (dladdr(rows[i].pc, &info) != 0 && info.dli_fname != nullptr) {
++      const char* slash = strrchr(info.dli_fname, '/');
++      lib = slash != nullptr ? slash + 1 : info.dli_fname;
++      off = (unsigned long)((char*)rows[i].pc - (char*)info.dli_fbase);
++    }
++    snprintf(buf, sizeof(buf), "  %2d  %7zuMB %7ld次  %s+0x%lx\n",
++             i + 1, (size_t)(rows[i].bytes / 1048576), rows[i].calls, lib, off);
++    out += buf;
++  }
++  out += "\n说明: 累计高=该路径分配猛；结合多次 dump 的 uordblks 净增判断是否泄漏。\n";
++  out += "符号化: addr2line -Cfipe <未strip的so> 0x<偏移> 定位源码行。\n";
++  return out;
++}
++
++}  // namespace allocprobe
++
++// 全局 operator new：仅此两个重载，delete 全部用系统默认（free），配对安全。
++void* operator new(std::size_t n) {
++  void* p = std::malloc(n ? n : 1);
++  if (!p) throw std::bad_alloc();
++  allocprobe::account(__builtin_return_address(0), n);
++  return p;
++}
++void* operator new[](std::size_t n) { return ::operator new(n); }
++
++//---- allocprobe 分配栈归因结束 ----
++
+ namespace memdiag {
+ 
+ struct Agg {
+@@ -829,6 +993,26 @@
+   return (jlong)((before - after) / 1024);
+ }
+ 
++// r27.88 / 26号：分配栈归因控制。开启后按调用点聚合 native 分配，dump 出 so+偏移。
++extern "C" JNIEXPORT void JNICALL
++Java_com_osfans_trime_core_Rime_setAllocStackProbeForDiag(JNIEnv *env,
++                                                          jclass /* thiz */,
++                                                          jboolean on,
++                                                          jint thresholdBytes) {
++  allocprobe::enable(on == JNI_TRUE, (int)thresholdBytes);
++}
++
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_osfans_trime_core_Rime_dumpAllocStackProbeForDiag(JNIEnv *env,
++                                                           jclass /* thiz */) {
++  // 先关再开：避免报告自身的 std::string/vector/dladdr 分配污染统计
++  bool wasOn = allocprobe::g_enabled.load(std::memory_order_relaxed);
++  allocprobe::g_enabled.store(false, std::memory_order_relaxed);
++  std::string report = allocprobe::report();
++  if (wasOn) allocprobe::g_enabled.store(true, std::memory_order_relaxed);
++  return env->NewStringUTF(report.c_str());
++}
++
+ extern "C" JNIEXPORT jobjectArray JNICALL
+ Java_com_osfans_trime_core_Rime_getRimeSchemaList(JNIEnv *env,
+                                                   jclass /* thiz */) {
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java
+@@ -803,6 +803,12 @@
+     public static native void setGrowthProbeThresholdForDiag(int thresholdKb);
+     public static native String dumpNativeGrowthProbeForDiag();
+ 
++    // r27.88 / 26号诊断补丁：native 分配栈归因（默认关闭，只读）。
++    // 开启后按调用点 PC 聚合 native 分配量，dump 出 so+偏移，定位持续分配的代码。
++    // thresholdBytes: 只统计 >= 该字节数的分配（默认 256），0 表示保持默认。
++    public static native void setAllocStackProbeForDiag(boolean on, int thresholdBytes);
++    public static native String dumpAllocStackProbeForDiag();
++
+     public static native SchemaItem[] getRimeSchemaList();
+ 
+     public static native String getCurrentRimeSchema();
