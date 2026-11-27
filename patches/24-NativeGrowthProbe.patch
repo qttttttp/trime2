@@ -8,7 +8,7 @@
  
  #include "jni-utils.h"
  #include "objconv.h"
-@@ -301,13 +302,19 @@
+@@ -315,13 +316,19 @@
  extern "C" JNIEXPORT jboolean JNICALL
  Java_com_osfans_trime_core_Rime_processRimeKey(JNIEnv *env, jclass /* thiz */,
                                                 jint keycode, jint mask) {
@@ -30,7 +30,7 @@
  }
  
  extern "C" JNIEXPORT void JNICALL
-@@ -326,9 +333,12 @@
+@@ -340,9 +347,12 @@
  
  extern "C" JNIEXPORT jobject JNICALL
  Java_com_osfans_trime_core_Rime_getRimeContext(JNIEnv *env, jclass /* thiz */) {
@@ -44,7 +44,7 @@
  }
  
  extern "C" JNIEXPORT jobject JNICALL
-@@ -562,6 +572,122 @@
+@@ -599,6 +609,124 @@
  
  }  // namespace memdiag
  
@@ -87,8 +87,10 @@
 +static int ev_head = 0;
 +static int ev_count = 0;
 +
++// 注意：MallocSnap/readMalloc 定义在 memdiag 命名空间，这里必须加前缀，
++// 否则即使补丁贴对位置，growprobe 命名空间内也找不到该类型(NativeGrowth编译失败)。
 +static long long curKb() {
-+  MallocSnap m = memdiag::readMalloc();
++  memdiag::MallocSnap m = memdiag::readMalloc();
 +  return m.ok ? (long long)(m.uordblks / 1024) : 0;
 +}
 +
@@ -164,10 +166,10 @@
 +
 +}  // namespace growprobe
 +
- // r27.66：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
+ // r27.69：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
  // 不修改任何状态、不释放任何内存，可安全重复调用。
  extern "C" JNIEXPORT jstring JNICALL
-@@ -571,6 +697,27 @@
+@@ -608,6 +736,27 @@
    return env->NewStringUTF(report.c_str());
  }
  
@@ -195,7 +197,7 @@
  // r27.63：诊断专用——真正销毁 librime session，返回销毁前的 schema id。
  extern "C" JNIEXPORT jstring JNICALL
  Java_com_osfans_trime_core_Rime_releaseRimeSessionForDiag(JNIEnv *env,
-@@ -602,7 +749,10 @@
+@@ -639,7 +788,10 @@
  extern "C" JNIEXPORT jboolean JNICALL
  Java_com_osfans_trime_core_Rime_selectRimeSchema(JNIEnv *env, jclass /* thiz */,
                                                   jstring schema_id) {
@@ -207,7 +209,7 @@
  }
  
  // testing
-@@ -681,6 +831,9 @@
+@@ -718,6 +870,9 @@
  Java_com_osfans_trime_core_Rime_getRimeCandidates(JNIEnv *env, jclass clazz,
                                                    jint start_index,
                                                    jint limit) {
@@ -220,7 +222,7 @@
  }
 --- a/app/src/main/java/com/osfans/trime/core/Rime.java
 +++ b/app/src/main/java/com/osfans/trime/core/Rime.java
-@@ -752,6 +752,13 @@
+@@ -790,6 +790,13 @@
      // 加 malloc 分配器统计，返回格式化报告。不修改任何状态，可安全重复调用。
      public static native String dumpMemoryAnalysisForDiag();
  
