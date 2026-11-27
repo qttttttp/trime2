@@ -8,7 +8,19 @@
  
  #include "jni-utils.h"
  #include "objconv.h"
-@@ -315,13 +316,19 @@
+@@ -311,17 +312,31 @@
+   return Rime::Instance().sync();
+ }
+ 
++// r27.87：增长探针前向声明（包装点在文件前部，实现体在 memdiag 之后）。
++// 必须先声明，否则 processKey/commitComposition/getContext 等包装点认不出 growprobe。
++namespace growprobe {
++extern bool enabled;
++long long curKb();
++void record(int op, long long before_kb);
++}
++
+ // input
  extern "C" JNIEXPORT jboolean JNICALL
  Java_com_osfans_trime_core_Rime_processRimeKey(JNIEnv *env, jclass /* thiz */,
                                                 jint keycode, jint mask) {
@@ -30,7 +42,7 @@
  }
  
  extern "C" JNIEXPORT void JNICALL
-@@ -340,9 +347,12 @@
+@@ -340,9 +355,12 @@
  
  extern "C" JNIEXPORT jobject JNICALL
  Java_com_osfans_trime_core_Rime_getRimeContext(JNIEnv *env, jclass /* thiz */) {
@@ -44,7 +56,7 @@
  }
  
  extern "C" JNIEXPORT jobject JNICALL
-@@ -599,6 +609,124 @@
+@@ -599,6 +617,124 @@
  
  }  // namespace memdiag
  
@@ -64,7 +76,7 @@
 +  long long maxUp_kb = 0;
 +};
 +
-+static bool enabled = false;
++bool enabled = false;  // r27.87：非 static，与前部前向声明 extern 匹配
 +static long long threshold_kb = 512;
 +static struct timespec t0 = {0, 0};
 +static long long base_kb = 0;
@@ -89,7 +101,7 @@
 +
 +// 注意：MallocSnap/readMalloc 定义在 memdiag 命名空间，这里必须加前缀，
 +// 否则即使补丁贴对位置，growprobe 命名空间内也找不到该类型(NativeGrowth编译失败)。
-+static long long curKb() {
++long long curKb() {  // r27.87：非 static，与前部前向声明匹配
 +  memdiag::MallocSnap m = memdiag::readMalloc();
 +  return m.ok ? (long long)(m.uordblks / 1024) : 0;
 +}
@@ -114,7 +126,7 @@
 +}
 +
 +// 在每个包装点调用：before 为进入前采样值，op 为 stat 索引
-+static void record(int op, long long before_kb) {
++void record(int op, long long before_kb) {  // r27.87：非 static，与前部前向声明匹配
 +  if (!enabled) return;
 +  long long after = curKb();
 +  if (after > peak_kb) peak_kb = after;
@@ -169,7 +181,7 @@
  // r27.69：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
  // 不修改任何状态、不释放任何内存，可安全重复调用。
  extern "C" JNIEXPORT jstring JNICALL
-@@ -608,6 +736,27 @@
+@@ -608,6 +744,27 @@
    return env->NewStringUTF(report.c_str());
  }
  
@@ -197,7 +209,7 @@
  // r27.63：诊断专用——真正销毁 librime session，返回销毁前的 schema id。
  extern "C" JNIEXPORT jstring JNICALL
  Java_com_osfans_trime_core_Rime_releaseRimeSessionForDiag(JNIEnv *env,
-@@ -639,7 +788,10 @@
+@@ -639,7 +796,10 @@
  extern "C" JNIEXPORT jboolean JNICALL
  Java_com_osfans_trime_core_Rime_selectRimeSchema(JNIEnv *env, jclass /* thiz */,
                                                   jstring schema_id) {
@@ -209,7 +221,7 @@
  }
  
  // testing
-@@ -718,6 +870,9 @@
+@@ -718,6 +878,9 @@
  Java_com_osfans_trime_core_Rime_getRimeCandidates(JNIEnv *env, jclass clazz,
                                                    jint start_index,
                                                    jint limit) {

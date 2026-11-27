@@ -14,7 +14,7 @@
   private:
    RimeApi *rime;
    std::shared_ptr<SessionHolder> session_;
-@@ -773,6 +780,47 @@
+@@ -781,6 +788,47 @@
    return ok ? JNI_TRUE : JNI_FALSE;
  }
  
