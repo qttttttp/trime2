@@ -188,7 +188,9 @@ jobs:
               echo "git apply 失败,尝试三方合并"
               if ! git apply --3way "$p"; then
                 echo "三方合并失败,尝试 patch --fuzz"
-                patch -p1 --fuzz=3 --forward < "$p"
+                # --no-backup-if-mismatch：fuzz 匹配时不留 .orig/.rej 备份，
+                # 否则会被下面的干净检查判为残留，导致整次构建失败（r27.84）。
+                patch -p1 --fuzz=3 --no-backup-if-mismatch --forward < "$p"
               fi
             fi
             echo "::endgroup::"
