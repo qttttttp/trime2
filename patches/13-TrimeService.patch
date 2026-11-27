@@ -1,0 +1,27 @@
+diff -ruN --no-dereference a/app/src/main/java/com/osfans/trime/TrimeService.java b/app/src/main/java/com/osfans/trime/TrimeService.java
+--- a/app/src/main/java/com/osfans/trime/TrimeService.java	2026-11-14 13:33:38.545547576 +0800
++++ b/app/src/main/java/com/osfans/trime/TrimeService.java	2026-11-21 17:50:52.092175379 +0800
+@@ -88,6 +88,15 @@
+     private static final String TAG = "TrimeService";
+     private static TrimeService sInstance;
+ 
++    // ===== 主题工作室数据桥接：当前 RootInputView 静态快照（读真机全部 View 文本用） =====
++    // 同进程 tools Lua 通过 ThemeDataBridge.dumpRootTexts() 读取；onCreate 里创建 root 后保存。
++    private static RootInputView sCurrentRootView;
++
++    /** 主题工作室数据桥接：返回当前根 View（含键盘/工具栏/候选栏，可能为空） */
++    public static RootInputView getCurrentRootView() {
++        return sCurrentRootView;
++    }
++
+ 
+     // 成员变量 - 逻辑处理与状态
+     private Rime mRime;
+@@ -139,6 +148,7 @@
+         sInstance = this;
+         ThemeManager.setTheme(Config.getTheme());
+         mRootInputView = new RootInputView(this);
++        sCurrentRootView = mRootInputView;  // 主题工作室数据桥接
+         LuaUtil.rmDir(new File(Config.getDataDir()), "LOCK");
+         mRime = new Rime(new Runnable() {
+             @Override

@@ -1,0 +1,163 @@
+/*
+ * SPDX-FileCopyrightText: 2015 - 2026 Rime community
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.osfans.trime.keyboard;
+
+import android.content.Context;
+import android.os.Build;
+import android.util.Log;
+import android.view.ViewGroup;
+
+import androidx.annotation.NonNull;
+
+import com.google.android.flexbox.AlignItems;
+import com.google.android.flexbox.FlexDirection;
+import com.google.android.flexbox.FlexWrap;
+import com.google.android.flexbox.FlexboxLayout;
+import com.google.android.flexbox.JustifyContent;
+import com.osfans.trime.Key;
+import com.osfans.trime.theme.KeyStyle;
+import com.osfans.trime.theme.Style;
+import com.osfans.trime.theme.ThemeManager;
+
+import org.luaj.Globals;
+import org.luaj.LuaTable;
+import org.luaj.LuaValue;
+
+public class FlexboxKeyboardView extends KeyboardView {
+
+    private final Globals globals;
+
+    public FlexboxKeyboardView(@NonNull Context context, Globals globals) {
+        super(context, globals);
+        this.globals = globals;
+        String style = globals.get("style").optjstring("keyboard");
+        long time = System.currentTimeMillis();
+        setBackground(ThemeManager.getStyle().getStyle(style).getBackground(0xffdddddd));
+        loadRows();
+        Log.w("FlexboxKeyboardView", "init time: " + (System.currentTimeMillis() - time));
+    }
+
+    private void loadRows() {
+        LuaValue flexBoxConfig = globals.get("flex_box");
+        if (!flexBoxConfig.istable()) return;
+
+        FlexboxLayout rootLayout = createFlexContainer(flexBoxConfig.checktable());
+        // 根容器必须填满父类 KeyboardView
+        rootLayout.setLayoutParams(new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        parseRecursive(rootLayout, flexBoxConfig.checktable());
+
+        addView(rootLayout);
+    }
+
+    /**
+     * 递归解析 Lua 结构
+     */
+    private void parseRecursive(FlexboxLayout parent, LuaTable table) {
+        int len = table.length();
+        int parentDirection = parent.getFlexDirection();
+
+        for (int i = 1; i <= len; i++) {
+            LuaValue item = table.get(i);
+            if (!item.istable()) continue;
+
+            // 判断是嵌套容器还是具体的 Key
+            if (item.get("keys").istable() || item.length() > 0) {
+                // 这是一个子容器（行或列）
+                FlexboxLayout childLayout = createFlexContainer(item.checktable());
+                FlexboxLayout.LayoutParams lp = createLayoutParams(parentDirection, item);
+
+                parent.addView(childLayout, lp);
+
+                // 递归处理子容器内部
+                parseRecursive(childLayout, item.checktable());
+
+                // 处理该层级下直接定义的 keys
+                LuaValue keys = item.get("keys");
+                if (keys.istable()) {
+                    parseKeys(childLayout, keys.checktable());
+                }
+            }
+        }
+    }
+
+    private void parseKeys(FlexboxLayout parent, LuaTable keys) {
+        int len = keys.length();
+        int direction = parent.getFlexDirection();
+        for (int i = 1; i <= len; i++) {
+            LuaValue keyConfig = keys.get(i);
+            KeyView keyView = new KeyView(getContext(), new Key(keyConfig));
+            parent.addView(keyView, createLayoutParams(direction, keyConfig));
+        }
+    }
+
+    /**
+     * 根据 Lua 配置创建 FlexboxLayout
+     */
+    private FlexboxLayout createFlexContainer(LuaTable config) {
+        FlexboxLayout layout = new FlexboxLayout(getContext());
+        layout.setClipChildren(false);
+        layout.setClipToPadding(false);
+        LuaValue s = config.get("style");
+        if(s.isstring()) {
+            KeyStyle style = ThemeManager.getStyle().getKeyStyle(s.tojstring());
+            layout.setBackground(style.getBackground(0));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                int dShadowColor = style.getShadowColor();
+                if (dShadowColor != 0) {
+                    layout.setOutlineAmbientShadowColor(dShadowColor);
+                    layout.setOutlineSpotShadowColor(dShadowColor);
+                }
+            }
+            layout.setElevation(style.getElevation());
+        }
+
+        // 解析方向
+        String dir = config.get("direction").optjstring("row");
+        layout.setFlexDirection(dir.equals("column") ? FlexDirection.COLUMN : FlexDirection.ROW);
+
+        // 默认配置
+        layout.setJustifyContent(JustifyContent.FLEX_START);
+        layout.setAlignItems(AlignItems.STRETCH);
+        layout.setFlexWrap(FlexWrap.NOWRAP);
+        return layout;
+    }
+
+    /**
+     * 核心修复：根据父容器方向生成 LayoutParams
+     */
+    private FlexboxLayout.LayoutParams createLayoutParams(int parentDirection, LuaValue config) {
+        // 获取 Lua 中定义的宽和高（假设单位是 dp，实际使用建议转换成 px）
+        int fixWidth = config.get("width").optint(-1);
+        int fixHeight = config.get("height").optint(-1);
+        float grow = (float) config.get("grow").optdouble(1.0f);
+
+        int width, height;
+
+        if (parentDirection == FlexDirection.ROW) {
+            // 横向布局时：如果没设固定宽度，则宽度为0靠权重；高度默认填满
+            width = (fixWidth > 0) ? dp2px(fixWidth) : 0;
+            height = (fixHeight > 0) ? dp2px(fixHeight) : ViewGroup.LayoutParams.MATCH_PARENT;
+            if (fixWidth > 0) grow = 0; // 如果固定了宽度，通常就不再伸展
+        } else {
+            // 纵向布局时：宽度默认填满；如果没设固定高度，则高度为0靠权重
+            width = (fixWidth > 0) ? dp2px(fixWidth) : ViewGroup.LayoutParams.MATCH_PARENT;
+            height = (fixHeight > 0) ? dp2px(fixHeight) : 0;
+            if (fixHeight > 0) grow = 0; // 如果固定了高度，就不再伸展
+        }
+
+        FlexboxLayout.LayoutParams lp = new FlexboxLayout.LayoutParams(width, height);
+        lp.setFlexGrow(grow);
+        lp.setFlexShrink((fixWidth > 0 || fixHeight > 0) ? 0.0f : 1.0f); // 固定尺寸的项目不收缩
+        return lp;
+    }
+
+    // 辅助函数：DP 转 PX
+    private int dp2px(int dp) {
+        return (int) (dp * getContext().getResources().getDisplayMetrics().density);
+    }
+}

@@ -1,0 +1,250 @@
+--- a/app/src/main/jni/librime_jni/rime_jni.cc
++++ b/app/src/main/jni/librime_jni/rime_jni.cc
+@@ -18,6 +18,7 @@
+ #include <cctype>
+ #include <algorithm>
+ #include <malloc.h>
++#include <ctime>
+ 
+ #include "jni-utils.h"
+ #include "objconv.h"
+@@ -311,17 +312,31 @@
+   return Rime::Instance().sync();
+ }
+ 
++// r27.87：增长探针前向声明（包装点在文件前部，实现体在 memdiag 之后）。
++// 必须先声明，否则 processKey/commitComposition/getContext 等包装点认不出 growprobe。
++namespace growprobe {
++extern bool enabled;
++long long curKb();
++void record(int op, long long before_kb);
++}
++
+ // input
+ extern "C" JNIEXPORT jboolean JNICALL
+ Java_com_osfans_trime_core_Rime_processRimeKey(JNIEnv *env, jclass /* thiz */,
+                                                jint keycode, jint mask) {
+-  return Rime::Instance().processKey(keycode, mask);
++  long long _b = growprobe::enabled ? growprobe::curKb() : 0;
++  bool _r = Rime::Instance().processKey(keycode, mask);
++  growprobe::record(0, _b);  // processKey
++  return _r;
+ }
+ 
+ extern "C" JNIEXPORT jboolean JNICALL
+ Java_com_osfans_trime_core_Rime_commitRimeComposition(JNIEnv *env,
+                                                       jclass /* thiz */) {
+-  return Rime::Instance().commitComposition();
++  long long _b = growprobe::enabled ? growprobe::curKb() : 0;
++  bool _r = Rime::Instance().commitComposition();
++  growprobe::record(3, _b);  // commitComposition
++  return _r;
+ }
+ 
+ extern "C" JNIEXPORT void JNICALL
+@@ -340,9 +355,12 @@
+ 
+ extern "C" JNIEXPORT jobject JNICALL
+ Java_com_osfans_trime_core_Rime_getRimeContext(JNIEnv *env, jclass /* thiz */) {
++  long long _b = growprobe::enabled ? growprobe::curKb() : 0;
+   rime::proto::Context context;
+   Rime::Instance().contextProto(reinterpret_cast<uintptr_t>(&context));
+-  return rimeProtoContextToJObject(env, context);
++  jobject _r = rimeProtoContextToJObject(env, context);
++  growprobe::record(2, _b);  // getContext
++  return _r;
+ }
+ 
+ extern "C" JNIEXPORT jobject JNICALL
+@@ -599,6 +617,124 @@
+ 
+ }  // namespace memdiag
+ 
++//============================================================
++// r27.83 / 24号测试补丁：native 增长探针（只读采样，默认关闭）。
++// 包装按键/取候选/取上下文/上屏/切方案五个 native 入口，在每次调用前后
++// 读 mallinfo.uordblks，统计"哪一类操作净增加了多少 native 分配"，
++// 并把单次增量超过阈值的事件写进环形日志，供 dump 报告读取。
++// 全部只读，不改任何状态；未开启时开销仅为一次 bool 判断。
++//============================================================
++namespace growprobe {
++
++struct OpStat {
++  const char* name;
++  long calls = 0;
++  long long delta_kb = 0;
++  long long maxUp_kb = 0;
++};
++
++bool enabled = false;  // r27.87：非 static，与前部前向声明 extern 匹配
++static long long threshold_kb = 512;
++static struct timespec t0 = {0, 0};
++static long long base_kb = 0;
++static long long peak_kb = 0;
++static OpStat stat[5] = {
++    {"processKey", 0, 0, 0},
++    {"getCandidates", 0, 0, 0},
++    {"getContext", 0, 0, 0},
++    {"commitComposition", 0, 0, 0},
++    {"selectSchema", 0, 0, 0},
++};
++
++struct Event {
++  long ms;
++  int op;
++  long long delta_kb;
++  long long uord_kb;
++};
++static Event events[64];
++static int ev_head = 0;
++static int ev_count = 0;
++
++// 注意：MallocSnap/readMalloc 定义在 memdiag 命名空间，这里必须加前缀，
++// 否则即使补丁贴对位置，growprobe 命名空间内也找不到该类型(NativeGrowth编译失败)。
++long long curKb() {  // r27.87：非 static，与前部前向声明匹配
++  memdiag::MallocSnap m = memdiag::readMalloc();
++  return m.ok ? (long long)(m.uordblks / 1024) : 0;
++}
++
++static long elapsedMs() {
++  struct timespec now;
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  if (t0.tv_sec == 0 && t0.tv_nsec == 0) return 0;
++  return (long)((now.tv_sec - t0.tv_sec) * 1000 +
++                (now.tv_nsec - t0.tv_nsec) / 1000000);
++}
++
++static void enable(bool on) {
++  enabled = on;
++  if (on) {
++    clock_gettime(CLOCK_MONOTONIC, &t0);
++    base_kb = curKb();
++    peak_kb = base_kb;
++    for (auto& s : stat) { s.calls = 0; s.delta_kb = 0; s.maxUp_kb = 0; }
++    ev_head = 0; ev_count = 0;
++  }
++}
++
++// 在每个包装点调用：before 为进入前采样值，op 为 stat 索引
++void record(int op, long long before_kb) {  // r27.87：非 static，与前部前向声明匹配
++  if (!enabled) return;
++  long long after = curKb();
++  if (after > peak_kb) peak_kb = after;
++  long long delta = after - before_kb;
++  OpStat& s = stat[op];
++  s.calls += 1;
++  s.delta_kb += delta;
++  if (delta > s.maxUp_kb) s.maxUp_kb = delta;
++  if (delta >= threshold_kb) {
++    events[ev_head] = {elapsedMs(), op, delta, after};
++    ev_head = (ev_head + 1) % 64;
++    if (ev_count < 64) ev_count += 1;
++  }
++}
++
++static std::string report() {
++  char buf[256];
++  std::string out;
++  out.reserve(4096);
++  out += "========== native 增长探针 r27.83 ==========\n";
++  snprintf(buf, sizeof(buf), "状态=%s  阈值=%lldKB  已运行=%lds\n",
++           enabled ? "开启" : "关闭", threshold_kb, elapsedMs() / 1000);
++  out += buf;
++  long long now = curKb();
++  snprintf(buf, sizeof(buf), "uordblks: 起始=%lldMB 当前=%lldMB 峰值=%lldMB 净增=%+lldMB\n",
++           base_kb / 1024, now / 1024, peak_kb / 1024, (now - base_kb) / 1024);
++  out += buf;
++  out += "\n-- 按操作聚合(调用数 / 净增 / 单次最大正增) MB --\n";
++  for (const auto& s : stat) {
++    snprintf(buf, sizeof(buf), "  %-18s %6ld  %+7lldMB  max+%7lldMB\n",
++             s.name, s.calls, s.delta_kb / 1024, s.maxUp_kb / 1024);
++    out += buf;
++  }
++  out += "\n-- 跳涨事件(最近, 单次>=阈值) --\n";
++  if (ev_count == 0) {
++    out += "  (无：没有单次操作超过阈值)\n";
++  } else {
++    int start = (ev_head - ev_count + 64) % 64;
++    for (int i = 0; i < ev_count; ++i) {
++      const Event& e = events[(start + i) % 64];
++      snprintf(buf, sizeof(buf), "  +%6ldms  %-18s %+7lldMB  (uord=%lldMB)\n",
++               e.ms, stat[e.op].name, e.delta_kb / 1024, e.uord_kb / 1024);
++      out += buf;
++    }
++  }
++  out += "\n说明: 净增合计若远小于 uord 净增, 说明增长发生在这些入口之外(其它 native 调用)。\n";
++  return out;
++}
++
++}  // namespace growprobe
++
+ // r27.69：诊断专用——只读采集内存映射分布，返回格式化报告字符串。
+ // 不修改任何状态、不释放任何内存，可安全重复调用。
+ extern "C" JNIEXPORT jstring JNICALL
+@@ -608,6 +744,27 @@
+   return env->NewStringUTF(report.c_str());
+ }
+ 
++// r27.83 / 24号：增长探针控制。开启后按包络统计各 native 入口的分配增量；关闭即停止采样。
++extern "C" JNIEXPORT void JNICALL
++Java_com_osfans_trime_core_Rime_setNativeGrowthProbeForDiag(JNIEnv *env,
++                                                           jclass /* thiz */,
++                                                           jboolean on) {
++  growprobe::enable(on == JNI_TRUE);
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_osfans_trime_core_Rime_setGrowthProbeThresholdForDiag(
++    JNIEnv *env, jclass /* thiz */, jint threshold_kb) {
++  growprobe::threshold_kb = threshold_kb > 0 ? threshold_kb : 512;
++}
++
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_osfans_trime_core_Rime_dumpNativeGrowthProbeForDiag(
++    JNIEnv *env, jclass /* thiz */) {
++  std::string report = growprobe::report();
++  return env->NewStringUTF(report.c_str());
++}
++
+ // r27.63：诊断专用——真正销毁 librime session，返回销毁前的 schema id。
+ extern "C" JNIEXPORT jstring JNICALL
+ Java_com_osfans_trime_core_Rime_releaseRimeSessionForDiag(JNIEnv *env,
+@@ -639,7 +796,10 @@
+ extern "C" JNIEXPORT jboolean JNICALL
+ Java_com_osfans_trime_core_Rime_selectRimeSchema(JNIEnv *env, jclass /* thiz */,
+                                                  jstring schema_id) {
+-  return Rime::Instance().selectSchema(*CString(env, schema_id));
++  long long _b = growprobe::enabled ? growprobe::curKb() : 0;
++  bool _r = Rime::Instance().selectSchema(*CString(env, schema_id));
++  growprobe::record(4, _b);  // selectSchema
++  return _r;
+ }
+ 
+ // testing
+@@ -718,6 +878,9 @@
+ Java_com_osfans_trime_core_Rime_getRimeCandidates(JNIEnv *env, jclass clazz,
+                                                   jint start_index,
+                                                   jint limit) {
+-  return rimeCandidateListToJObjectArray(
++  long long _b = growprobe::enabled ? growprobe::curKb() : 0;
++  jobjectArray _r = rimeCandidateListToJObjectArray(
+       env, Rime::Instance().getCandidates(start_index, limit));
++  growprobe::record(1, _b);  // getCandidates
++  return _r;
+ }
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java
+@@ -790,6 +790,13 @@
+     // 加 malloc 分配器统计，返回格式化报告。不修改任何状态，可安全重复调用。
+     public static native String dumpMemoryAnalysisForDiag();
+ 
++    // r27.83 / 24号测试补丁：native 增长探针（默认关闭，只读）。
++    // 开启后包装按键/取候选/取上下文/上屏/切方案五个入口，统计各自 native 分配增量，
++    // 定位是哪一类操作让 native 一路涨。关闭时零开销。
++    public static native void setNativeGrowthProbeForDiag(boolean on);
++    public static native void setGrowthProbeThresholdForDiag(int thresholdKb);
++    public static native String dumpNativeGrowthProbeForDiag();
++
+     public static native SchemaItem[] getRimeSchemaList();
+ 
+     public static native String getCurrentRimeSchema();

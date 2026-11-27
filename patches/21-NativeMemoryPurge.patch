@@ -1,0 +1,57 @@
+diff --color -ruN --no-dereference base/app/src/main/java/com/osfans/trime/core/Rime.java new/app/src/main/java/com/osfans/trime/core/Rime.java
+--- a/app/src/main/java/com/osfans/trime/core/Rime.java	2026-11-26 08:10:25.233498562 +0800
++++ b/app/src/main/java/com/osfans/trime/core/Rime.java	2026-11-26 08:10:44.876176103 +0800
+@@ -774,6 +774,10 @@
+ 
+     public static native String getRimeProperty(String prop);
+ 
++    // r27.55：归还 native 层已 free 但未还给系统的空闲页（malloc trim）。
++    // 由主题脚本 onWindowHidden 回调调用；内部按 API level 守卫：API 28+ 用 M_PURGE，低版本 no-op。
++    public static native void purgeNativeMemory();
++
+     public static native SchemaItem[] getRimeSchemaList();
+ 
+     public static native String getCurrentRimeSchema();
+diff --color -ruN --no-dereference base/app/src/main/jni/librime_jni/rime_jni.cc new/app/src/main/jni/librime_jni/rime_jni.cc
+--- a/app/src/main/jni/librime_jni/rime_jni.cc	2026-11-26 08:10:25.232498527 +0800
++++ b/app/src/main/jni/librime_jni/rime_jni.cc	2026-11-26 08:11:38.059010557 +0800
+@@ -4,6 +4,10 @@
+ 
+ #include <rime_api.h>
+ 
++// r27.55：native 内存清理（dlsym + API level 守卫）
++#include <dlfcn.h>
++#include <android/api-level.h>
++
+ #include <string>
+ #include <vector>
+ 
+@@ -350,6 +354,28 @@
+   return env->NewStringUTF(value.c_str());
+ }
+ 
++// r27.55：归还 native 层已 free 但未还给内核的空闲页。
++// Android 的 malloc 分配器默认保留空闲页以加速下次分配，长时间输入后
++// 累积显著，表现为 native PSS 一路涨。M_PURGE 强制立即归还，不杀进程、
++// 不影响 Java 对象，执行仅几十毫秒。
++extern "C" JNIEXPORT void JNICALL
++Java_com_osfans_trime_core_Rime_purgeNativeMemory(JNIEnv *env,
++                                                  jclass /* thiz */) {
++#ifdef __ANDROID__
++  // mallopt 符号仅 API 26+ 存在，M_PURGE 仅 API 28+ 有效。项目 minSdk=21，
++  // 若直接调用会让低版本设备加载 so 时因缺符号失败，故用 dlsym 运行时解析。
++  if (android_get_device_api_level() < 28) return;
++  using MalloptFn = int (*)(int, int);
++  static MalloptFn s_mallopt = nullptr;
++  static bool s_resolved = false;
++  if (!s_resolved) {
++    s_mallopt = reinterpret_cast<MalloptFn>(dlsym(RTLD_DEFAULT, "mallopt"));
++    s_resolved = true;
++  }
++  if (s_mallopt) s_mallopt(-101, 0);  // M_PURGE
++#endif
++}
++
+ extern "C" JNIEXPORT jobjectArray JNICALL
+ Java_com_osfans_trime_core_Rime_getRimeSchemaList(JNIEnv *env,
+                                                   jclass /* thiz */) {

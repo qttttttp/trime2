@@ -1,0 +1,16 @@
+--- a/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
++++ b/app/src/main/java/com/osfans/trime/theme/ThemeManager.java
+@@ -282,6 +282,13 @@
+ 
+ 
+     public static LuaValue getPresetKeys() {
++        // Key.<clinit> 的静态字段 presetKeys 可能在本类 mGlobals 赋值之前就被触发：
++        // 主题脚本/配置刷新时 luajava.bindClass("com.osfans.trime.Key") 会 Class.forName(Key)，
++        // 此时 Key 静态初始化直接调用到本方法，mGlobals 仍为 null。
++        // 旧代码在这里 mGlobals.get(...) 抛 NPE → Key 类 ExceptionInInitializerError →
++        // 之后所有 Key 访问都是 NoClassDefFoundError → 整个输入法进程 FATAL。
++        // 兜底返回空表即可：setTheme() 会在 mGlobals 就绪后重新赋值 Key.presetKeys。
++        if (mGlobals == null) return new LuaTable();
+         LuaTable keys = mGlobals.get("preset_keys").opttable(new LuaTable());
+         LuaTable env = new LuaTable();
+         try {
