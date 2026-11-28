@@ -1,0 +1,984 @@
+# SPDX-FileCopyrightText: 2015 - 2024 Rime community
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# 拉取上游主仓库最新代码 → 应用 patches/ 下的补丁 → 用 trime2-100y 签名编译
+name: Build Patched
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游分支或标签"
+        required: false
+        default: "develop"
+  push:
+    branches:
+      - develop
+      - master
+      - main
+    paths:
+      - "patches/**"
+      # 内置工具的脚本/安装器源文件，改动后要重新打包
+      - "builtin-tools/**"
+      - "signing/**"
+      - ".github/workflows/build-patched.yml"
+      # 离线 AAR 生成工具变了要重新构建
+      - "tools/**"
+  schedule:
+    # 每天 UTC 18:00 (北京时间 02:00) 跟随上游自动构建
+    # 定时触发会先比对上游提交,与上次构建记录相同则跳过(见 check job)
+    - cron: "0 18 * * *"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: nirenr/trime2
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'develop' }}
+
+jobs:
+  # 定时触发时先看上游有没有新提交,没有就不浪费一次完整构建
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.compare.outputs.skip }}
+    steps:
+      - name: 比对上游提交
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 只对 schedule 做短路:手动触发和 push 一律构建
+          if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
+            echo "触发方式为 ${GITHUB_EVENT_NAME},直接构建"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 网络抖动时保守处理:拿不到上游 SHA 就照常构建
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" \
+                  "refs/heads/${UPSTREAM_REF}" 2>/dev/null | cut -f1 || true)
+          if [ -z "$SHA" ]; then
+            echo "::warning::无法获取上游 HEAD,继续构建"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "上游 ${UPSTREAM_REPO}@${UPSTREAM_REF} HEAD = ${SHA}"
+          # 上次成功构建的上游提交写在 patched-latest 的 Release 说明里
+          LAST=$(gh release view patched-latest --repo "${GITHUB_REPOSITORY}" \
+                   --json body -q .body 2>/dev/null \
+                 | sed -n 's/.*upstream-sha: *\([0-9a-f]\{40\}\).*/\1/p' \
+                 | head -1 || true)
+          echo "上次构建记录 = ${LAST:-<无>}"
+          if [ -n "$LAST" ] && [ "$SHA" = "$LAST" ]; then
+            echo "上游无新提交,跳过本次构建"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### 上游无新提交,跳过构建"
+              echo ""
+              echo "- 上游: \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`"
+              echo "- 提交: \`${SHA}\`"
+              echo "- 与 \`patched-latest\` 记录的上次构建一致"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "上游有更新或首次构建,开始构建"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    # 上游没变时整个 build job 跳过(手动触发/push 不受影响)
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    # 串行化:避免两次构建同时向 patched-latest 上传资产产生冲突
+    concurrency:
+      group: build-patched
+      cancel-in-progress: false
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 配置 git 身份
+        run: |
+          # 构建脚本会读取 git config user.name / remote,缺失会导致 gradle 配置阶段失败
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: 同步上游主仓库
+        run: |
+          set -e
+          # 网络抖动重试:失败后 10/20 秒再试,最多 4 次
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              if [ $n -ge 4 ]; then echo "命令重试 4 次仍失败"; return 1; fi
+              echo "命令失败,$((n*10)) 秒后第 $n 次重试..."
+              sleep $((n*10))
+            done
+          }
+          # 主仓库自身构建时无需同步
+          if [ "${{ github.repository }}" = "$UPSTREAM_REPO" ]; then
+            echo "当前仓库即主仓库,跳过同步"
+            echo "UPSTREAM_SHA=${GITHUB_SHA}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          retry git fetch --depth=1 upstream "${UPSTREAM_REF}"
+          # 以主仓库代码为基线(丢弃 fork 里的源码差异,补丁另行应用)
+          git reset --hard FETCH_HEAD
+          # 记录实际构建的上游提交,发布时写入 Release 说明供下次比对
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "基线: $(git log --oneline -1)"
+          # 恢复本仓库独有的文件(README 也是 fork 自己的,不在恢复名单会被上游覆盖)
+          # ML Kit 离线 AAR 不再入库:构建时由 tools/make-offline-aar.py 现场生成
+          # (模型也不打包进 APK,4 个模型 zip 由用户放到 lua 脚本目录)
+          for p in patches signing tools builtin-tools README.md .github/workflows/build-patched.yml; do
+            git checkout "$GITHUB_SHA" -- "$p" 2>/dev/null || echo "跳过恢复 $p (仓库中不存在)"
+          done
+          git status --short | head -20
+
+      - name: 应用补丁
+        run: |
+          set -e
+          shopt -s nullglob
+          found=0
+          # 16 号只做接入，工具文件在 builtin-tools/。仓库里没有工具包时
+          # 连 16 号一起跳过，这样没有工具的仓库也能正常出包，不会编译到
+          # ToolActivity 才报 cannot find symbol BuiltinTools。
+          has_tools=0
+          if [ -f builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java ]; then
+            has_tools=1
+          fi
+          for p in patches/*.patch; do
+            name=$(basename "$p")
+            case "$name" in
+              # 安卓 9 专用补丁不参与构建(与新版字体链冲突)
+              *android9*|*安卓9*)
+                echo "跳过 $name (安卓 9 专用)"
+                continue
+                ;;
+              # 15 号（工具栏间距）已废弃：间距直接读 toolbar.elevation。
+              # 仓库里残留这个补丁也不再应用，避免旧包把布局改回去。
+              15-toolbar-margin*)
+                echo "跳过 $name (已废弃，间距用 toolbar.elevation)"
+                continue
+                ;;
+              16-builtin-tools.patch)
+                if [ "$has_tools" -eq 0 ]; then
+                  echo "跳过 $name (没有 builtin-tools/，本次不内置工具)"
+                  continue
+                fi
+                ;;
+            esac
+            found=1
+            echo "::group::应用 $name"
+            # 基线里已经含有该补丁的成品时（例如某模块先被并进别的补丁），
+            # 正向应用必然失败、反向校验却能过；这种情况直接跳过，别让整次构建挂掉。
+            if git apply --reverse --check "$p" >/dev/null 2>&1; then
+              echo "内容已在基线中（反向校验通过），跳过"
+              echo "::endgroup::"
+              continue
+            fi
+            if ! git apply -v "$p"; then
+              echo "git apply 失败,尝试三方合并"
+              if ! git apply --3way "$p"; then
+                echo "三方合并失败,尝试 patch --fuzz"
+                # --no-backup-if-mismatch：fuzz 匹配时不留 .orig/.rej 备份，
+                # 否则会被下面的干净检查判为残留，导致整次构建失败（r27.84）。
+                patch -p1 --fuzz=3 --no-backup-if-mismatch --forward < "$p"
+              fi
+            fi
+            echo "::endgroup::"
+          done
+          if [ $found -eq 0 ]; then
+            echo "::warning::patches/ 下没有找到可应用的补丁"
+          fi
+          git status --short | head -30
+
+      # 内置工具的脚本和安装器不写进补丁：补丁只留接入改动，文件按
+      # app/src/main 的结构放在 builtin-tools/ 下。这里自动扫工具目录，
+      # 新增一个含 main.lua 的目录就会被复制进包，不用改 workflow 或清单。
+      - name: 铺设内置工具（有工具包才复制，新增目录自动加入）
+        run: |
+          set -e
+          SRC=builtin-tools/app
+          LIST=/tmp/builtin-tools-installed.txt
+          : > "$LIST"
+          JAVA="$SRC/src/main/java/com/osfans/trime/BuiltinTools.java"
+          if [ ! -f "$JAVA" ]; then
+            echo "::notice::没有 $JAVA，跳过内置工具；本次构建不含「一键更新」「主题工作室」"
+            exit 0
+          fi
+          # 白名单：只允许安装器 Java 与 assets/tools 下的工具文件，
+          # 防止有人顺手把别的源码塞进来，覆盖掉上游文件还没人发现。
+          BAD=$(cd "$SRC" && find . -type f \
+                  ! -path './src/main/assets/tools/*' \
+                  ! -path './src/main/java/com/osfans/trime/BuiltinTools.java' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::builtin-tools/app 下有不在白名单内的文件："
+            echo "$BAD"
+            exit 1
+          fi
+          mkdir -p app/src/main/java/com/osfans/trime
+          cp -a "$JAVA" app/src/main/java/com/osfans/trime/
+          A="$SRC/src/main/assets/tools"
+          if [ -d "$A" ]; then
+            mkdir -p app/src/main/assets/tools
+            if [ -f "$A/manifest.txt" ]; then
+              cp -a "$A/manifest.txt" app/src/main/assets/tools/
+            fi
+            echo "=== 检测到的工具包 ==="
+            for d in "$A"/*/; do
+              [ -d "$d" ] || continue
+              name=$(basename "$d")
+              if [ ! -f "$d/main.lua" ]; then
+                echo "::warning::跳过 $name：根级没有 main.lua"
+                continue
+              fi
+              if [ -d "app/src/main/assets/tools/$name" ]; then
+                echo "  更新 $name"
+              else
+                echo "  新增 $name"
+              fi
+              mkdir -p "app/src/main/assets/tools/$name"
+              cp -a "$d". "app/src/main/assets/tools/$name/"
+              echo "$name" >> "$LIST"
+            done
+          fi
+          echo "=== 已落地 ==="
+          cat "$LIST"
+
+      - name: 补丁落地自检（每个补丁必须真正生效）
+        run: |
+          set -e
+          # 1) 不允许出现被拒绝的 hunk 残留（patch --fuzz 失败时会留 .rej）
+          REJ=$(find . -path ./.git -prune -o \( -name '*.rej' -o -name '*.orig' \) -print)
+          if [ -n "$REJ" ]; then
+            echo "::error::存在 .rej/.orig，补丁未干净应用"
+            echo "$REJ"
+            exit 1
+          fi
+          # 2) 抽查每个补丁的标志物，防止「apply 报成功但内容没进去」
+          check() {
+            local file="$1" needle="$2" label="$3"
+            if grep -qF "$needle" "$file"; then
+              echo "OK: $label"
+              return 0
+            fi
+            # 标志物不在源码里：先分清是「补丁没生效」还是「自检项本身已过期」。
+            # 后者很常见——workflow 和 patches/ 不是同一批更新，旧标签会误杀构建。
+            if grep -rqF -- "$needle" patches/ 2>/dev/null; then
+              echo "::error::$label 未生效：$file 中找不到 '$needle'（patches/ 里存在该标志物）"
+              exit 1
+            fi
+            echo "::warning::$label 的检查项已过期：patches/ 中已无 '$needle'，跳过该条；请同步 workflow"
+          }
+          check app/src/main/jni/cmake/Boost.cmake "vmd" "07 boost vmd"
+          check build-logic/convention/src/main/kotlin/OpenCCDataPlugin.kt \
+                "Skip missing OpenCC dictionary" "08 opencc 缺字典跳过"
+          check app/src/main/java/com/osfans/trime/TrimeService.java \
+                "MlkitModelInstaller" "06 mlkit installer"
+          check app/proguard-rules.pro "mlkit_vision_digital_ink" "06 proguard keep"
+          check app/src/main/java/com/androlua/Http.java "putFile" "04 http 流式上传"
+          check app/src/main/jni/CMakeLists.txt "_FILE_OFFSET_BITS=0" "05 file offset 兼容"
+          check app/src/main/java/com/osfans/trime/InputView.java \
+                "sLoadedKeyboard" "14 键盘解析保护"
+          check app/src/main/java/com/osfans/trime/dialog/KeyboardDialog.java \
+                "readKeyboardName" "14 对话框不执行键盘脚本"
+          # 16 号只在有工具包时应用；没有工具包时相关自检整体跳过。
+          if [ -f builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java ]; then
+            check app/src/main/java/com/osfans/trime/BuiltinTools.java \
+                  "ensureInstalled" "16 内置工具安装器"
+            check app/src/main/java/com/osfans/trime/BuiltinTools.java \
+                  "collectTargets" "16 新工具自动发现"
+            check app/src/main/AndroidManifest.xml \
+                  "REQUEST_INSTALL_PACKAGES" "16 安装权限"
+            # 16 号补丁只留接入改动；工具文件应来自 builtin-tools/，
+            # 若补丁里又出现 main.lua，说明有人把脚本塞回去了，补丁会重新膨胀。
+            if grep -q 'assets/tools/.*\.lua' patches/16-builtin-tools.patch 2>/dev/null; then
+              echo "::error::16 号补丁里又内嵌了 Lua 脚本，请改放到 builtin-tools/app/src/main/assets/tools/"
+              exit 1
+            fi
+            echo "OK: 16 号补丁未内嵌工具脚本"
+          else
+            echo "跳过 16 自检（本次没有内置工具包）"
+          fi
+
+      - name: 工具版本自检（防止仓库里只更新了一半）
+        run: |
+          set -e
+          # 踩过两次的坑：workflow 更新了、tools/ 没同步，构建到中途才报
+          # "unrecognized arguments"，日志里看不出是哪个文件旧了。
+          need() {
+            local f="$1" needle="$2" label="$3"
+            if [ ! -f "$f" ]; then
+              echo "::error::$label 缺失：$f"
+              exit 1
+            fi
+            if ! grep -qF -- "$needle" "$f"; then
+              echo "::error::$label 版本过旧：$f 中找不到 '$needle'"
+              echo "  该文件需与 workflow 同批更新（交付包里的 $f 直接覆盖即可）"
+              exit 1
+            fi
+            echo "OK: $label"
+          }
+          need tools/make-offline-aar.py "--local-first" "make-offline-aar 支持本地优先"
+          need tools/patch-dex-https.py "is not secure" "dex https 补丁"
+          need tools/postprocess-apk.sh "patch-dex-https.py" "postprocess 串联 patch"
+          # 内置工具源文件 → app/ 必须逐字节一致：复制路径写错时不会报错，
+          # 只会把旧脚本打进包，装到手机上才发现没更新。
+          if [ -f builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java ]; then
+            if ! cmp -s builtin-tools/app/src/main/java/com/osfans/trime/BuiltinTools.java \
+                        app/src/main/java/com/osfans/trime/BuiltinTools.java; then
+              echo "::error::BuiltinTools.java 复制后内容不一致"
+              exit 1
+            fi
+            if [ -s /tmp/builtin-tools-installed.txt ]; then
+              while IFS= read -r name; do
+                [ -n "$name" ] || continue
+                if ! diff -r "builtin-tools/app/src/main/assets/tools/$name" \
+                            "app/src/main/assets/tools/$name" >/dev/null; then
+                  echo "::error::工具包 $name 复制后内容不一致"
+                  exit 1
+                fi
+              done < /tmp/builtin-tools-installed.txt
+            fi
+            echo "OK: 内置工具复制一致"
+          else
+            echo "跳过内置工具比对（本次没有工具包）"
+          fi
+          for p in patches/07-boost-vmd.patch patches/08-opencc-missing-dict.patch; do
+            if [ ! -f "$p" ]; then
+              echo "::error::缺少补丁 $p"
+              exit 1
+            fi
+            echo "OK: $p"
+          done
+          # 语法级校验：参数名对不上时这里就会暴露，而不是等到 argparse 报 usage
+          python3 - <<'PYEOF'
+          import subprocess, sys
+          out = subprocess.run([sys.executable, "tools/make-offline-aar.py", "--help"],
+                               capture_output=True, text=True)
+          if out.returncode != 0:
+              sys.exit("make-offline-aar.py --help 执行失败:\n" + out.stderr)
+          text = out.stdout + out.stderr
+          for flag in ("--local-first", "--url-prefix", "--online-first"):
+              if flag not in text:
+                  sys.exit("make-offline-aar.py 不支持 %s，请更新 tools/ 下该文件" % flag)
+          print("OK: make-offline-aar.py 参数完整")
+          PYEOF
+
+      - name: 生成 ML Kit 离线 AAR（本地 127.0.0.1 优先，在线 https 兜底）
+        run: |
+          set -e
+          # 从 Google Maven 拉原版 AAR（Apache-2.0 公开依赖），sha1 校验防供应链篡改
+          # 注意文件名必须是 digital-ink-recognition-19.0.0.aar：
+          # make-offline-aar.py 按「输入文件名 + -offline」命名输出 AAR，
+          # 后面的断言和 cp 步骤都按 digital-ink-recognition-19.0.0-offline.aar 找文件
+          curl -fsSL -o digital-ink-recognition-19.0.0.aar \
+            https://dl.google.com/android/maven2/com/google/mlkit/digital-ink-recognition/19.0.0/digital-ink-recognition-19.0.0.aar
+          echo "2f4ebc121902df17a0304a6d1ac576dc8a60d9b0  digital-ink-recognition-19.0.0.aar" | sha1sum -c -
+          # 改写 manifest：双地址模式 —— 127.0.0.1:18080 优先，官方 https 兜底
+          # 本地有 zip 就走回环（毫秒级、不碰网络）；本地 404 才由下载器改试 Google。
+          # dl.google.com 在国内时通时不通，所以不能把在线放第一条。
+          # 仓库中不存放 AAR，构建期现场生成
+          python3 tools/make-offline-aar.py \
+            --aar digital-ink-recognition-19.0.0.aar \
+            --pkg com.nirenr.trime \
+            --langs zh-Hani,zh-Hani-CN \
+            --url-prefix "http://127.0.0.1:18080" \
+            --local-first \
+            --out ./offline-aar
+          # 断言改写成功（防止静默产出地址没改的坏 AAR，到设备上才暴露）
+          python3 - <<'PYEOF'
+          import zipfile, json
+          with zipfile.ZipFile("offline-aar/digital-ink-recognition-19.0.0-offline.aar") as z:
+              m = json.loads(z.read("assets/manifest.json"))
+          both = [p for p in m["packs"]
+                  if any("127.0.0.1" in u for u in p.get("download_urls", []))]
+          assert len(both) == 4, "双地址 pack 数应为 4，实际 %d" % len(both)
+          for p in both:
+              us = p["download_urls"]
+              assert len(us) == 2, "%s 地址数应为 2，实际 %d" % (p["name"], len(us))
+              assert "127.0.0.1:18080" in us[0], "%s 第一条不是本地服务" % p["name"]
+              assert us[1].startswith("https://dl.google.com/"), "%s 第二条不是官方 https" % p["name"]
+          print("OK: 4 个 pack 均为 [本地 127.0.0.1, 官方 https]")
+          PYEOF
+          mkdir -p app/libs
+          cp -f offline-aar/digital-ink-recognition-19.0.0-offline.aar app/libs/
+          # 模型不进包：APK 只带 AAR 与 installer 逻辑，4 个 zip 由使用者放到
+          # 手写面板脚本所在目录（本地模型服务根目录就是脚本目录）。
+          # assets/mlkit-offline 留空时，MlkitModelInstaller 静默跳过，不报错。
+          rm -rf app/src/main/assets/mlkit-offline
+          mkdir -p app/src/main/assets/mlkit-offline
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          # 与定版构建环境一致（定版在 JDK 20 下编译并通过真机验证）
+          java-version: 20
+          cache: "gradle"
+
+      - name: 安装 SDK 组件
+        run: |
+          # GitHub runner 镜像已预装 Android SDK(ANDROID_HOME 已设置),
+          # 不需要 android-actions/setup-android(其内部的 sdkmanager tools 在
+          # 新镜像 cmdline-tools 16.0 上已失效:Failed to find package 'tools')
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              if [ $n -ge 4 ]; then echo "命令重试 4 次仍失败"; return 1; fi
+              echo "命令失败,$((n*10)) 秒后第 $n 次重试..."
+              sleep $((n*10))
+            done
+          }
+          # runner 镜像的 cmdline-tools 目录名是版本号(如 16.0),不在 PATH 里,
+          # 自动定位 sdkmanager 可执行文件
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          retry "$SDKMANAGER" --install "cmake;3.31.6"
+
+      - name: 配置签名与构建参数
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          set -e
+          KEYSTORE="$GITHUB_WORKSPACE/trime2-100y.keystore"
+          if [ -f "signing/trime2-100y.keystore" ]; then
+            cp "signing/trime2-100y.keystore" "$KEYSTORE"
+            echo "使用仓库内 signing/trime2-100y.keystore"
+          elif [ -n "$SIGNING_KEY" ]; then
+            echo "$SIGNING_KEY" | base64 -d > "$KEYSTORE"
+            echo "使用 secret SIGNING_KEY 解码的 keystore"
+          else
+            echo "::error::未找到签名文件:请提交 signing/trime2-100y.keystore 或配置 secret SIGNING_KEY"
+            exit 1
+          fi
+
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8' \
+            'org.gradle.parallel=true' \
+            'org.gradle.caching=true' \
+            'android.useAndroidX=true' \
+            'API_KEY=""' \
+            'API_ID=""' \
+            "signKeyFile=$KEYSTORE" \
+            "signKeyStorePwd=${{ secrets.KEY_STORE_PASSWORD }}" \
+            "signKeyAlias=${{ secrets.ALIAS }}" \
+            "signKeyPwd=${{ secrets.KEY_PASSWORD }}" \
+            > gradle.properties
+          cat gradle.properties
+
+          # 校验签名配置能被 gradle 读到
+          keytool -list -keystore "$KEYSTORE" \
+            -storepass "${{ secrets.KEY_STORE_PASSWORD }}" \
+            -alias "${{ secrets.ALIAS }}" | tail -3
+
+      - name: 拉取子模块
+        run: |
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              if [ $n -ge 4 ]; then echo "命令重试 4 次仍失败"; return 1; fi
+              echo "命令失败,$((n*10)) 秒后第 $n 次重试..."
+              sleep $((n*10))
+            done
+          }
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          retry git submodule update --init --recursive
+
+          # 锁定到定版（唯一真机验证可下载模型）编译时使用的子模块版本。
+          # 上游 0.8.5 的 gitlink 更旧,librime_jni.so / opencc 数据 / 词典都会不同。
+          pin() {
+            local path="$1" sha="$2"
+            git -C "$path" checkout -q "$sha" 2>/dev/null || {
+              git -C "$path" fetch -q origin
+              git -C "$path" checkout -q "$sha"
+            }
+            test "$(git -C "$path" rev-parse HEAD)" = "$sha" \
+              || { echo "::error::子模块 $path 无法锁定到 $sha"; exit 1; }
+            echo "锁定 $path -> ${sha:0:7}"
+          }
+          pin app/src/main/jni/librime           56737cd29a4d393a104a2098ece3697aa2810465
+          pin app/src/main/jni/OpenCC            025f371dc76b598d77384fbdab90c937471844d8
+          pin app/src/main/jni/librime-octagram  57d18b9f58e5284bd891d559f6bdd16cf60341e9
+          pin app/src/main/jni/librime-predict   920bd41ebf6f9bf6855d14fbe80212e54e749791
+          pin app/src/main/jni/snappy            946606459314e55d029c85f9a8c46f8809467f0f
+          pin app/src/main/jni/librime-lua       6da5d6cedb853380ed1b5b9b6979cb1a9c028353
+          pin app/src/main/jni/librime-lua-deps  9e5bb71db1544913f8005dadc3df8439c00d08b7
+          pin app/data/rime/essay                054920de4f54c9e5994276a96a4fc2a35cb51aa3
+
+      - name: 计算 JNI 缓存 key
+        id: cache-hash
+        run: |
+          ./gradlew :app:calculateNativeCacheHash
+
+      - name: 复用 JNI 编译缓存
+        uses: actions/cache@v4
+        id: jni-cache
+        with:
+          path: "app/prebuilt"
+          # v2：子模块已锁定到定版版本,旧缓存里的 .so 是别的子模块编出来的,必须弃用
+          key: ${{ runner.os }}-trime-jni-patched-v2-${{ steps.cache-hash.outputs.native-cache-hash }}
+
+      - name: 构建 Release APK
+        run: |
+          # 依赖下载偶发超时,失败后复用缓存重跑一次
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace \
+            || { echo "首次构建失败,60 秒后重试一次"; sleep 60; ./gradlew :app:assembleRelease --no-daemon --stacktrace; }
+
+      - name: 回写 JNI 缓存
+        if: ${{ !steps.jni-cache.outputs.cache-hit }}
+        run: cp -R app/build/intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib app/prebuilt
+
+      - name: 修正 ML Kit https 校验分支并重签
+        run: |
+          set -e
+          APK=$(ls app/build/outputs/apk/release/*arm64-v8a*.apk | head -1)
+          chmod +x tools/postprocess-apk.sh tools/patch-dex-https.py
+          bash tools/postprocess-apk.sh "$APK" \
+            "$GITHUB_WORKSPACE/trime2-100y.keystore" \
+            "${{ secrets.KEY_STORE_PASSWORD }}" \
+            "${{ secrets.ALIAS }}" \
+            "${{ secrets.KEY_PASSWORD }}"
+
+      - name: 校验签名
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*arm64-v8a*.apk | head -1)
+          echo "APK: $APK"
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" | head -6
+
+      - name: 产物自检（只查功能必需项，不追定版字节）
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*arm64-v8a*.apk | head -1)
+          echo "=== 关键条目 ==="
+          unzip -l "$APK" | grep -E "librime_jni\.so|libdigitalink\.so|assets/manifest\.json" \
+            | awk '{printf "  %10d  %s\n", $1, $4}'
+          # 模型必须不在包里：出现任一 assets/mlkit-offline/*.zip 就是打包逻辑跑偏了
+          # grep -c 无匹配时退出码为 1，配合 set -e 会让脚本静默退出（不打印任何 error）
+          PACKED=$(unzip -l "$APK" | grep -c 'assets/mlkit-offline/.*\.zip' || true)
+          SIZE_MB=$(( $(stat -c%s "$APK") / 1048576 ))
+          echo "  APK 体积 ${SIZE_MB} MB，包内模型 zip ${PACKED} 个"
+          if [ "$PACKED" -ne 0 ]; then
+            echo "::error::APK 里打进了 $PACKED 个模型 zip，模型应只随脚本目录分发"
+            unzip -l "$APK" | grep 'assets/mlkit-offline/' | awk '{print "    " $1, $4}'
+            exit 1
+          fi
+          if [ "$SIZE_MB" -gt 40 ]; then
+            echo "::warning::APK ${SIZE_MB} MB 偏大，确认没有别的资源被误打包"
+          fi
+          OPENCC_N=$(unzip -l "$APK" | grep -c 'assets/shared/opencc/' || true)
+          echo "  shared/opencc 条目数  $OPENCC_N"
+          # 定版 30 条目里含 s2seal/t2seal/seal2t 三个文言配置，
+          # 而 pin 的 OpenCC(025f371) 的 data/config 已不含它们——定版那 3 个是旧构建残留。
+          # 所以这里只判「任务是否真的跑过」，不拿 30 当基准。
+          if [ "$OPENCC_N" -lt 24 ]; then
+            echo "::error::opencc 条目数 $OPENCC_N 明显偏少，installOpenCCData 可能没跑或 08 补丁未生效"
+            unzip -l "$APK" | grep 'assets/shared/opencc/' | awk '{print "    " $4}'
+            exit 1
+          fi
+          if ! unzip -l "$APK" | grep -q 'shared/opencc/JPShinjitaiCharacters.txt'; then
+            echo "::error::opencc 缺少 JPShinjitaiCharacters.txt，08 补丁的字典映射未生效"
+            exit 1
+          fi
+          if ! unzip -l "$APK" | grep -q 'shared/opencc/t2s.json'; then
+            echo "::error::opencc 缺少 t2s.json，配置拷贝环节异常"
+            exit 1
+          fi
+          echo "::notice::librime_jni.so 大小仅记录不比较：子模块已 pin 一致，剩余差异来自 CI 工具链，与下载链路无关"
+          echo "=== 内置工具自检（按实际铺设清单）==="
+          if [ -s /tmp/builtin-tools-installed.txt ]; then
+            if ! unzip -l "$APK" | grep -qF "assets/tools/manifest.txt"; then
+              echo "::error::APK 里缺少 assets/tools/manifest.txt"
+              exit 1
+            fi
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              if unzip -l "$APK" | grep -qF "assets/tools/$name/main.lua"; then
+                echo "  OK assets/tools/$name"
+              else
+                echo "::error::APK 里缺少 assets/tools/$name/main.lua，工具包 $name 未打进包"
+                exit 1
+              fi
+            done < /tmp/builtin-tools-installed.txt
+          else
+            echo "  本次没有内置工具，跳过"
+          fi
+          echo "=== manifest 地址自检（4 个 pack × [本地, 官方 https]）==="
+          APK="$APK" python3 - <<'PYEOF'
+          import zipfile, json, os, sys
+          apk = os.environ["APK"]
+          with zipfile.ZipFile(apk) as z:
+              m = json.loads(z.read("assets/manifest.json"))
+          both = [p for p in m["packs"]
+                  if any("127.0.0.1" in u for u in p.get("download_urls", []))]
+          bad = [p["name"] for p in both
+                 if len(p["download_urls"]) != 2
+                 or "127.0.0.1:18080" not in p["download_urls"][0]
+                 or not p["download_urls"][1].startswith("https://dl.google.com/")]
+          if len(both) != 4 or bad:
+              sys.exit("地址结构异常: pack 数=%d, 不合格=%s" % (len(both), bad))
+          for p in both:
+              print("  %-52s local + https" % p["name"])
+          PYEOF
+          echo "=== https 校验分支状态（必须是 goto，否则构建失败）==="
+          DEXDUMP=$(ls -d "$ANDROID_HOME"/build-tools/*/dexdump | sort -V | tail -1)
+          unzip -p "$APK" classes.dex > /tmp/check.dex
+          "$DEXDUMP" -d /tmp/check.dex 2>/dev/null | grep -B3 "is not secure" | head -4
+          if ! "$DEXDUMP" -d /tmp/check.dex 2>/dev/null | grep -B3 "is not secure" | grep -q "goto"; then
+            echo "::error::https 校验分支未被修正为 goto，此包无法下载本地模型"
+            exit 1
+          fi
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: trime-patched-${{ github.run_number }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 90
+
+      # 让 GitHub 自动生成的 Source code 包包含「全部」源码（含子模块、补丁、工具、AAR）。
+      # 原理：自动归档 = git archive(tag 指向 commit 的 tree)；子模块在 tree 里是
+      # gitlink(160000)，归档只有空目录。所以这里在发布前构造一个「扁平化」commit：
+      # 把整个工作区(已打补丁/铺工具/pin 子模块/生成离线 AAR)复制成干净树，
+      # 剥离所有 .git 元数据让子模块内容变普通文件，排除敏感文件与构建产物，
+      # 提交成一个新 commit 并让 patched-latest 指向它。GitHub 归档这个 commit 即可得到完整源码。
+      - name: 生成完整源码快照并指向 patched-latest
+        if: startsWith(github.ref, 'refs/tags/') == false
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/src-snapshot"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          # 只复制源码相关文件：排除 .git 元数据、构建产物、Gradle 缓存，
+          # 以及所有含签名密钥/密码的敏感文件。
+          tar --exclude-vcs \
+              --exclude='.git' --exclude='*/.git' --exclude='*/.git/*' \
+              --exclude='*/build' --exclude='*/.cxx' --exclude='.gradle' \
+              --exclude='*.keystore' --exclude='gradle.properties' \
+              --exclude='local.properties' --exclude='app/prebuilt' \
+              --exclude='offline-aar' --exclude='digital-ink-recognition-19.0.0.aar' \
+              --exclude='release-body.md' --exclude='.gitmodules' \
+              -cf - . | (cd "$STAGE" && tar -xf -)
+
+          # 安全兜底：敏感文件绝不能进快照
+          LEAK=$(cd "$STAGE" && find . \( -name '*.keystore' -o -name 'gradle.properties' \
+                   -o -name 'local.properties' \) -print)
+          if [ -n "$LEAK" ]; then
+            echo "::error::源码快照里出现敏感文件，终止发布"; echo "$LEAK"; exit 1
+          fi
+          # 完整性兜底：源码主体 + 补丁 + 子模块内容 + 内置工具必须在
+          for must in app/src/main/ patches/16-builtin-tools.patch \
+                      app/src/main/jni/librime/CMakeLists.txt; do
+            [ -e "$STAGE/$must" ] || { echo "::error::源码快照缺少 $must"; exit 1; }
+          done
+          if [ -d "$STAGE/builtin-tools/app/src/main/assets/tools/theme-studio" ]; then
+            echo "OK: 含内置工具 theme-studio"
+          fi
+
+          # 在临时树里提交：子模块内容已是普通文件，tree 里不再有 gitlink
+          git -C "$STAGE" init -q
+          git -C "$STAGE" config user.name "github-actions[bot]"
+          git -C "$STAGE" config user.email "github-actions[bot]@users.noreply.github.com"
+          # -f 强制加入被 .gitignore 忽略但编译必需的文件(如 app/libs/*.aar)
+          git -C "$STAGE" add -A -f
+          git -C "$STAGE" commit -qm "完整源码快照 r${GITHUB_RUN_NUMBER} (上游 ${UPSTREAM_SHA:0:7})"
+          GITLINK=$(git -C "$STAGE" ls-tree -r HEAD | grep -c '^160000' || true)
+          [ "$GITLINK" -eq 0 ] || { echo "::error::快照里仍有 $GITLINK 个 gitlink 子模块"; exit 1; }
+          echo "快照文件数: $(git -C "$STAGE" ls-tree -r HEAD | wc -l), gitlink: $GITLINK"
+
+          # 把快照 commit 作为一个对象推到本仓库(用一个专用 ref 保存)，
+          # 再让 patched-latest 指向它 —— GitHub 归档该 tag 即得到完整源码。
+          SNAP_SHA=$(git -C "$STAGE" rev-parse HEAD)
+          REMOTE="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$STAGE" remote add origin "$REMOTE"
+          git -C "$STAGE" push -q --force origin "$SNAP_SHA:refs/heads/patched-src"
+          git -C "$STAGE" push -q --force origin "$SNAP_SHA:refs/tags/patched-latest"
+          echo "patched-latest -> $SNAP_SHA (完整源码快照)"
+
+          # 历史 Release 的 tag：日期 + 上游短 sha，让每次构建都能在发布页留下一条。
+          # 也指向同一份扁平化快照，因此每条历史 Release 的自动源码包同样完整。
+          HIST_TAG="patched-$(TZ=Asia/Shanghai date +%Y%m%d)-${UPSTREAM_SHA:0:7}"
+          if git -C "$STAGE" ls-remote --exit-code --tags origin "refs/tags/$HIST_TAG" >/dev/null 2>&1; then
+            HIST_TAG="${HIST_TAG}-r${GITHUB_RUN_NUMBER}"
+          fi
+          git -C "$STAGE" push -q --force origin "$SNAP_SHA:refs/tags/$HIST_TAG"
+          echo "HIST_TAG=$HIST_TAG" >> "$GITHUB_ENV"
+          echo "历史 Release tag -> $HIST_TAG (同样指向完整源码快照)"
+
+      # Release 页面的「更新记录」：每个功能写一句「改了什么」，并链到对应补丁，
+      # 完整清单折叠起来。只给名字看不出做了什么，容易误解。
+      # 机器可读字段放在 HTML 注释里：页面不显示，但 check job 仍能解析。
+      - name: 生成更新记录
+        if: startsWith(github.ref, 'refs/tags/') == false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BODY=release-body.md
+          PREV=$(gh release view patched-latest --repo "$GITHUB_REPOSITORY" \
+                   --json body -q .body 2>/dev/null || true)
+          PREV_FORK=$(printf '%s\n' "$PREV" \
+                        | sed -n 's/.*fork-sha: *\([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+          CUR="$GITHUB_SHA"
+          APK=$(ls app/build/outputs/apk/release/*arm64-v8a*.apk | head -1)
+          SIZE_MB=$(( $(stat -c%s "$APK") / 1048576 ))
+          UP_SUBJECT=$(git log -1 --format='%s' "$UPSTREAM_SHA" 2>/dev/null || true)
+          UP_LINK="[\`${UPSTREAM_SHA:0:7}\`](${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA})"
+          BLOB="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${CUR}/patches"
+
+          # 补丁文件名 -> 功能名|一句话改进（只写这一版实际做的事，不写空话）
+          describe() {
+            case "$1" in
+              01-asr-engine*)         echo "语音引擎|保留两套 AI 语音引擎选项；切换引擎立即生效，主题热改 asr_config 也能识别" ;;
+              03-clipboard-broadcast*) echo "剪贴板广播|剪贴板变化改发轻量广播，不再把全文塞进 Intent（已从 1 号补丁拆出独立应用）" ;;
+              02-font-system-first*)  echo "字体加载|优先使用系统已装字体，缺失时才回落到随包字体" ;;
+              04-http-stream*)        echo "HTTP 流式请求|下载改为边收边写盘，大响应不再整块读进内存" ;;
+              05-file-offset*)        echo "大文件兼容|修正 32 位环境的文件偏移，读取大文件不再截断" ;;
+              06-mlkit-offline*)      echo "离线手写识别|首次启动自动安装手写识别模型，离线可用；同步补上混淆保留规则" ;;
+              07-boost-vmd*)          echo "Boost 兼容|补齐 boost vmd 依赖，NDK 构建不再缺头文件" ;;
+              08-opencc*)             echo "OpenCC 容错|字典缺失时跳过转换，而不是整个构建失败" ;;
+              09-runtime-property*)   echo "运行时属性通道|补齐 JNI 的运行时属性读写，配置能正确下发" ;;
+              10-ThemeDataBridge*)    echo "主题工作室桥接|新增主题数据桥接类，供主题工作室读写配置" ;;
+              11-ThemeManager*)       echo "主题配色接口|主题可指定配色，跟随系统深浅色切换" ;;
+              12-InputView*)          echo "键盘快照|记住已加载的键盘，schema 未就绪时不再回落 36 键" ;;
+              13-TrimeService*)       echo "根视图快照|根视图重建时保留键盘状态" ;;
+              14-KeyboardDefaultFix*) echo "默认键盘与按键滑动|打开「默认键盘」不再改动当前键盘、不再让按键滑动失效；解析顺序改为 偏好 → 方案同名 → 主题 → qwerty36" ;;
+              16-builtin-tools*)     echo "内置工具|「一键更新」「主题工作室」随 APK 分发，装完在「工具」里直接可用；工具脚本改为从仓库 builtin-tools/ 直接复制（不再塞进补丁），补丁只保留接入改动。并补上安装权限，一键更新可直接拉起安装器" ;;
+              *)                      echo "${1%.patch}|" ;;
+            esac
+          }
+
+          # 一行一个功能：**功能名**：改了什么 · [补丁文件](链接)
+          item() {
+            local name="$1" info title desc
+            info=$(describe "$name")
+            title="${info%%|*}"
+            desc="${info#*|}"
+            if [ -n "$desc" ] && [ "$desc" != "$info" ]; then
+              echo "- **${title}**：${desc} · [\`${name}\`](${BLOB}/${name})"
+            else
+              echo "- **${title}** · [\`${name}\`](${BLOB}/${name})"
+            fi
+          }
+
+          # 折叠区里只留名字，避免整段太长
+          item_short() {
+            local name="$1" title
+            title="$(describe "$name")"
+            echo "- ${title%%|*} · [\`${name}\`](${BLOB}/${name})"
+          }
+
+          {
+            echo "## 更新记录"
+            echo
+
+            if [ -n "$PREV_FORK" ] && git cat-file -e "${PREV_FORK}^{commit}" 2>/dev/null; then
+              CHANGED=$(git diff --name-only --diff-filter=AM "${PREV_FORK}..${CUR}" -- patches 2>/dev/null \
+                          | grep '\.patch$' | grep -v '15-toolbar-margin' || true)
+              # 只改脚本（builtin-tools/）时补丁文件没变，也要算作 16 号有更新
+              if [ -n "$(git diff --name-only --diff-filter=AM "${PREV_FORK}..${CUR}" -- builtin-tools 2>/dev/null)" ]; then
+                if ! printf '%s\n' "$CHANGED" | grep -q '16-builtin-tools'; then
+                  CHANGED=$(printf '%s\n%s\n' "$CHANGED" "patches/16-builtin-tools.patch" | sed '/^$/d')
+                fi
+              fi
+            else
+              CHANGED=""
+            fi
+
+            if [ -n "$CHANGED" ]; then
+              COUNT=$(printf '%s\n' "$CHANGED" | sed '/^$/d' | wc -l | tr -d ' ')
+              echo "本次更新 ${COUNT} 个功能："
+              echo
+              for p in $CHANGED; do
+                [ -f "$p" ] || continue
+                item "$(basename "$p")"
+              done
+            elif [ -n "$PREV_FORK" ] && [ "$PREV_FORK" = "$CUR" ]; then
+              echo "补丁无改动，本次为跟随上游重新构建（\`${CUR:0:7}\`）。"
+            else
+              echo "首次构建（或无法对比上次提交），全部补丁均已应用。"
+            fi
+            echo
+
+            TOTAL=$(find patches -maxdepth 1 -name '*.patch' \
+                      ! -name '15-toolbar-margin*' | wc -l | tr -d ' ')
+            echo "<details><summary>构建内含全部补丁（${TOTAL} 个）</summary>"
+            echo
+            for p in patches/*.patch; do
+              [ -f "$p" ] || continue
+              case "$(basename "$p")" in 15-toolbar-margin*) continue;; esac
+              item_short "$(basename "$p")"
+            done
+            echo
+            echo "</details>"
+            echo
+
+            echo "---"
+            echo
+            echo "### 源码"
+            echo
+            echo "- **完整源码**：本页 GitHub 自动生成的 \`Source code (zip/tar.gz)\` 已是最新完整快照——含全部补丁、内置工具、定版子模块源码与离线 AAR，解压即可离线编译。"
+            echo "- 子模块已扁平化为普通目录（不再是空指针），因此归档里可直接拿到 librime / OpenCC / 词库等全部源码。"
+            echo
+            echo "### 发布历史"
+            echo
+            echo "- ** Latest**：本仓库的 \`patched-latest\` 固定在发布页顶部，只保留最新一次构建的 APK（每次发布前自动清理旧资产；清理失败不影响发布），下载链接长期不变。"
+            echo "- **历史版本**：按上游版本保留——上游有更新才新增一条以 \`patched-日期-上游短sha\` 命名的正式 Release；同一上游版本的重复构建只保留最后一条。在 [发布列表](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases) 里可下载各版本的 APK 与对应完整源码。"
+            echo
+            echo "上游 ${UP_LINK} ${UP_SUBJECT} ｜ 构建 [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) ｜ arm64-v8a ${SIZE_MB} MB"
+            echo
+            echo "<!-- 以下字段供 CI 比对，页面不显示 -->"
+            echo "<!-- upstream-sha: ${UPSTREAM_SHA} -->"
+            echo "<!-- fork-sha: ${CUR} -->"
+          } > "$BODY"
+
+          echo "===== $BODY ====="
+          cat "$BODY"
+          cat "$BODY" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      # patched-latest 只保留最新一次构建的 APK：历史构建已在各条
+      # patched-日期-sha 历史 Release 里完整留存，Latest 上再堆旧资产只会让
+      # "最新发布"里混进一串历史包，下载者容易拿错。这里先清空 Latest 上手动
+      # 上传的旧资产（GitHub 自动生成的 Source code 包不在 assets 列表里，不受
+      # 影响），下一步再上传本次 APK。release 本体和 body 保留，因为 check job
+      # 与"生成更新记录"都要从 body 里读 upstream-sha / fork-sha。
+      # 清理缓存属辅助操作，绝不能因 GitHub API 偶发 500 / 竞态 404 阻断发布：
+      # 每条资产单独重试，最终失败仅告警；continue-on-error 作最后兜底。
+      - name: 清空 Latest 旧资产（只留最新构建）
+        if: startsWith(github.ref, 'refs/tags/') == false
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          OLD=$(gh release view patched-latest --repo "$GITHUB_REPOSITORY" \
+                  --json assets -q '.assets[].name' 2>/dev/null || true)
+          if [ -z "$OLD" ]; then
+            echo "patched-latest 无旧资产（或该 Release 尚不存在），无需清理"
+            exit 0
+          fi
+          fail=0
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            ok=0
+            for attempt in 1 2 3; do
+              if gh release delete-asset patched-latest "$name" \
+                   --repo "$GITHUB_REPOSITORY" --yes 2>&1; then
+                echo "删除 patched-latest 旧资产: $name（第 $attempt 次成功）"
+                ok=1
+                break
+              fi
+              echo "删除 $name 第 $attempt 次失败，等待重试..."
+              sleep 3
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::warning::无法删除 patched-latest 旧资产 $name（GitHub API 可能 500/404），跳过；不影响本次发布"
+              fail=1
+            fi
+          done <<< "$OLD"
+          if [ "$fail" -ne 0 ]; then
+            echo "部分旧资产未清理干净，Latest 可能残留旧包；本次 APK 仍会照常上传"
+          else
+            echo "已清空 patched-latest 旧资产，下一步上传本次构建 APK"
+          fi
+
+      # 每次构建前删掉 patched-latest 这条 Release 再重建，让发布页显示的日期
+      # (published_at) 刷新为本次构建时间。GitHub 的 published_at 只在 Release
+      # 首次创建时写入，更新正文或替换 APK 都不会刷新，只能删了重建。
+      # 关键：不能加 --cleanup-tag。patched-latest 这个 tag 已在"生成完整源码快照"
+      # 步骤强制指向扁平化快照 commit，删 tag 再建 Release 会让自动源码包缺失子模块。
+      # 只删 Release、保留 tag，重建时 action-gh-release 沿用现有 tag，源码包仍完整。
+      # 删除失败不阻断发布（此时退化为更新现有 Release，只是日期不刷新）。
+      - name: 删除 patched-latest 旧 Release（刷新发布日期）
+        if: startsWith(github.ref, 'refs/tags/') == false
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if gh release view patched-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "删除 patched-latest 旧 Release（保留 tag）"
+            gh release delete patched-latest --repo "$GITHUB_REPOSITORY" --yes
+            echo "已删除，下一步重建"
+          else
+            echo "patched-latest 尚不存在，无需删除"
+          fi
+
+      # 固定 tag 的 rolling Release:链接永久固定、公开仓库任何人无需登录即可下载、
+      # 不受 artifact 90 天过期影响。设为正式发布并置顶为 Latest,
+      # 这样仓库主页和 /releases 页顶部直接显示"最新发布",不再藏在 tag 里。
+      - name: 发布 Latest(patched-latest)
+        if: startsWith(github.ref, 'refs/tags/') == false
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: patched-latest
+          name: "跟随上游最新构建（Latest）"
+          body_path: release-body.md
+          files: app/build/outputs/apk/release/*.apk
+          prerelease: false
+          make_latest: true
+
+      # 发布页历史构建去重：按上游版本保留，每个上游版本只留最后一条。
+      # - 上游有更新：历史里没有同 sha 的 Release，本次直接新增一条；
+      # - 上游没更新（例如仅改补丁/脚本触发的重建）：删掉同 sha 的旧 Release 再发本次，
+      #   于是同一上游版本永远只留最后构建的那条，不会在发布页堆一串重复条目。
+      # 版本身份用 body 里的 upstream-sha 识别（tag 名含日期与运行号，不能直接比）。
+      # 清理属辅助操作，任何 GitHub API 抖动都不能阻断发布，故 continue-on-error + 逐条容错。
+      - name: 历史构建去重（同上游版本只留最后一条）
+        if: startsWith(github.ref, 'refs/tags/') == false
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          echo "本次 upstream-sha = ${UPSTREAM_SHA}"
+          TAGS=$(gh release list --repo "$GITHUB_REPOSITORY" --json tagName -q '.[].tagName' 2>/dev/null || true)
+          n=0
+          for tag in $TAGS; do
+            [ "$tag" = "patched-latest" ] && continue
+            case "$tag" in patched-*) ;; *) continue ;; esac
+            body=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+            sha=$(printf '%s\n' "$body" | sed -n 's/.*upstream-sha: *\([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+            if [ -n "$sha" ] && [ "$sha" = "$UPSTREAM_SHA" ]; then
+              echo "删除同版本旧历史 Release: $tag (upstream-sha=${sha:0:7})"
+              if ! gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>&1; then
+                # 旧版 gh 不支持 --cleanup-tag：删 Release 后手动删 tag
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes 2>&1 || true
+                git push --delete origin "refs/tags/$tag" 2>&1 || true
+              fi
+              n=$((n+1))
+            fi
+          done
+          echo "已清理 $n 条同上游版本的旧历史 Release"
+
+      # 每次构建再发一条独立 Release(日期+上游短sha 的 tag),在发布页按时间累积成历史。
+      # make_latest:false 保证它不会抢走 patched-latest 的 Latest 标记；
+      # 历史 tag 已在"生成完整源码快照"步骤指向扁平化快照,故其自动源码包同样完整。
+      - name: 发布历史 Release
+        if: startsWith(github.ref, 'refs/tags/') == false && env.HIST_TAG != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.HIST_TAG }}
+          name: "构建快照 ${{ env.HIST_TAG }}"
+          body_path: release-body.md
+          files: app/build/outputs/apk/release/*.apk
+          prerelease: false
+          make_latest: false
+
+      - name: 发布 Release(打 tag 时)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true

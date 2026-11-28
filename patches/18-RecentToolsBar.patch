@@ -1,0 +1,460 @@
+diff --git a/app/src/main/java/com/osfans/trime/PrefLauncher.java b/app/src/main/java/com/osfans/trime/PrefLauncher.java
+index ed678a7..0bd4c40 100644
+--- a/app/src/main/java/com/osfans/trime/PrefLauncher.java
++++ b/app/src/main/java/com/osfans/trime/PrefLauncher.java
+@@ -70,6 +70,7 @@ public class PrefLauncher extends Activity {
+     private TextView statusTitle, statusDetail, statusAction;
+     private ImageView statusIcon;
+     private HomeCardView theme, palette, keyboard, group, schema;
++    private RecentToolsBar recentTools; // r27.46/0.9.1：最近使用工具快捷栏
+     private boolean enabled;
+     private final ThreadPoolExecutor nameWorker=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>());
+     private final HomeConfigNames configNames=new HomeConfigNames(PrefLauncher::nameGlobals);
+@@ -230,6 +231,9 @@ public class PrefLauncher extends Activity {
+         content=vertical(); content.setPadding(dp(16),dp(4),dp(16),dp(16));
+         scroll.addView(content,new ScrollView.LayoutParams(-1,-2)); root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+         buildStatus();
++        // r27.68/0.9.1：最近使用工具快捷栏，移到“切换输入法”状态卡片下方（标题已移入组件内部）
++        recentTools=new RecentToolsBar(this,a);
++        content.addView(recentTools,new LinearLayout.LayoutParams(-1,-2));
+         boolean narrow=getResources().getConfiguration().screenWidthDp<360 || getResources().getConfiguration().fontScale>1.2f;
+         boolean compact=getResources().getConfiguration().fontScale>1.1f;
+         section("外观配置");
+@@ -353,7 +357,7 @@ public class PrefLauncher extends Activity {
+     }
+     @Override public void onConfigurationChanged(Configuration config) {super.onConfigurationChanged(config);buildHome();}
+     @Override public void onWindowFocusChanged(boolean focus) {super.onWindowFocusChanged(focus);if(focus)refreshStatus();}
+-    @Override protected void onResume(){super.onResume();LuaUtil.checkStorage(this);refreshStatus();}
++    @Override protected void onResume(){super.onResume();LuaUtil.checkStorage(this);refreshStatus();if(recentTools!=null)recentTools.refresh();}
+     @Override protected void onStart(){super.onStart();mToken=getWindow().getDecorView().getWindowToken();
+         getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.DEFAULT_INPUT_METHOD),false,imeObserver);
+         getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ENABLED_INPUT_METHODS),false,imeObserver);
+diff --git a/app/src/main/java/com/osfans/trime/RecentToolsBar.java b/app/src/main/java/com/osfans/trime/RecentToolsBar.java
+new file mode 100644
+index 0000000..ea6e276
+--- /dev/null
++++ b/app/src/main/java/com/osfans/trime/RecentToolsBar.java
+@@ -0,0 +1,139 @@
++/*
++ * r27.69：设置页「切换输入法」状态卡片下方的工具快捷栏（独立文件，不触碰上游代码）。
++ * 2 列 × 2 行共 4 个按钮，样式与设置页其它卡片一致（HomeCardView）。
++ * 标题「常用工具」右侧带三点(⋮)入口，点击打开工具管理页(ToolActivity)。
++ * 四个按钮图标统一用工具箱(ic_iconpark_toolkit_24)，三点入口仍用 home_more。
++ * 取值：init.lua 里 show=true 的固定显示；有最近使用时 show 最多 3 个、留 1 位给最近使用；
++ * 都没有则按目录顺序补足；一个工具都没有时整栏隐藏。
++ * 只做纯文本读取与脚本启动，绝不执行工具里的 Lua 代码。
++ */
++package com.osfans.trime;
++
++import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
++import android.os.Build;
++import android.view.Gravity;
++import android.view.View;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import com.androlua.LuaActivity;
++import com.androlua.LuaApplication;
++import com.osfans.trime.ui.HomeAppearance;
++import com.osfans.trime.ui.HomeCardView;
++
++import java.io.File;
++import java.util.List;
++
++public class RecentToolsBar extends LinearLayout {
++
++    private static final int BUTTON_COUNT = 4;
++    private final Context mContext;
++    private final HomeAppearance a;
++    private String mToolsDir;
++
++    public RecentToolsBar(Context context) {
++        this(context, new HomeAppearance(context, false));
++    }
++
++    /** 0.9.1 卡片式设置页专用构造：复用 HomeAppearance 的视觉令牌，与下方卡片一致。 */
++    public RecentToolsBar(Context context, HomeAppearance a) {
++        super(context);
++        mContext = context;
++        this.a = a;
++        setOrientation(LinearLayout.VERTICAL);
++        try {
++            mToolsDir = LuaApplication.getInstance().getLuaExtDir("tools");
++        } catch (Throwable e) {
++            mToolsDir = null;
++        }
++        refresh();
++    }
++
++    /** 重新读取 show / 历史并重建按钮；由 PrefLauncher.onResume 调用。 */
++    public void refresh() {
++        removeAllViews();
++        List<String> tools = ToolHistory.resolveGrid(mToolsDir, BUTTON_COUNT);
++        if (tools.isEmpty()) {
++            // 没有任何工具：整栏（含标题）不显示
++            setVisibility(View.GONE);
++            return;
++        }
++        setVisibility(View.VISIBLE);
++
++        // 标题行：左侧「常用工具」标题 + 右侧三点(⋮)管理入口，样式与 PrefLauncher.section() 保持一致
++        LinearLayout titleRow = new LinearLayout(mContext);
++        titleRow.setOrientation(LinearLayout.HORIZONTAL);
++        titleRow.setGravity(Gravity.CENTER_VERTICAL);
++        TextView title = a.text("常用工具", 17, a.ink, true);
++        titleRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
++        if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
++
++        // 三点按钮：点击打开工具管理页（与主页右上角「工具管理」同一入口）
++        android.widget.ImageView more = HomeCardView.icon(mContext, R.drawable.home_more, a.muted);
++        more.setContentDescription("工具管理");
++        more.setPadding(a.dp(8), a.dp(6), 0, a.dp(6));
++        a.clickable(more, a.surface, 12, 0, v -> openToolManager());
++        titleRow.addView(more, new LinearLayout.LayoutParams(a.dp(28), a.dp(28)));
++
++        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, -2);
++        tp.topMargin = a.dp(18);
++        tp.bottomMargin = a.dp(10);
++        addView(titleRow, tp);
++
++        // 两列两行：每两个按钮一行，各占 1 份宽度
++        for (int i = 0; i < tools.size(); i += 2) {
++            LinearLayout row = new LinearLayout(mContext);
++            row.setOrientation(LinearLayout.HORIZONTAL);
++            row.setGravity(Gravity.TOP);
++            row.setBaselineAligned(false);
++            for (int j = 0; j < 2 && i + j < tools.size(); j++) {
++                final String name = tools.get(i + j);
++                String label = ToolHistory.displayName(mToolsDir, name);
++                HomeCardView card = new HomeCardView(mContext, a,
++                        R.drawable.ic_iconpark_toolkit_24, a.accent, label, false, null,
++                        v -> openTool(name));
++                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1);
++                if (j > 0) lp.setMarginStart(a.dp(8));
++                row.addView(card, lp);
++            }
++            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-1, -2);
++            rp.bottomMargin = a.dp(8);
++            addView(row, rp);
++        }
++    }
++
++    /** 三点按钮：打开工具管理页（ToolActivity），与主页右上角「工具管理」入口一致。 */
++    private void openToolManager() {
++        try {
++            mContext.startActivity(new Intent(mContext, ToolActivity.class));
++        } catch (Exception e) {
++            Toast.makeText(mContext, "打开工具管理失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
++        }
++    }
++
++    private void openTool(String name) {
++        File main = new File(new File(mToolsDir, name), "main.lua");
++        if (!main.isFile()) {
++            Toast.makeText(mContext, "工具不存在：" + name, Toast.LENGTH_SHORT).show();
++            return;
++        }
++        // 从快捷栏打开也算一次使用，置顶历史
++        ToolHistory.record(mToolsDir, name);
++        Intent intent = new Intent(mContext, LuaActivity.class);
++        intent.setData(Uri.parse(main.getAbsolutePath()));
++        // 设置页是普通 Activity：以 NEW_TASK 启动独立文档，行为与「工具」里一致
++        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
++            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT);
++            intent.addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
++        }
++        try {
++            mContext.startActivity(intent);
++        } catch (Exception e) {
++            Toast.makeText(mContext, "启动工具失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
++        }
++    }
++}
+diff --git a/app/src/main/java/com/osfans/trime/ToolActivity.java b/app/src/main/java/com/osfans/trime/ToolActivity.java
+index abc073b..a522999 100644
+--- a/app/src/main/java/com/osfans/trime/ToolActivity.java
++++ b/app/src/main/java/com/osfans/trime/ToolActivity.java
+@@ -183,6 +183,7 @@ public class ToolActivity extends ListActivity implements AdapterView.OnItemLong
+             mHistory.remove(text);
+         mHistory.add(0, text);
+         //ClipboardUtil.saveToolHistory(mHistory);
++        ToolHistory.record(mDir, text); // r27.45：记录最近使用（供设置页快捷栏读取）
+         Intent intent = new Intent(this, LuaActivity.class);
+         intent.setData(Uri.parse(mDir + text + "/main.lua"));
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+diff --git a/app/src/main/java/com/osfans/trime/ToolHistory.java b/app/src/main/java/com/osfans/trime/ToolHistory.java
+new file mode 100644
+index 0000000..ac7ca4e
+--- /dev/null
++++ b/app/src/main/java/com/osfans/trime/ToolHistory.java
+@@ -0,0 +1,266 @@
++/*
++ * r27.45：最近使用工具的历史（独立文件，不触碰上游代码）。
++ * 历史存在 rime/tools/.recent_tools，每行一个工具目录名（UTF-8）。
++ * 只做纯文件读写 + 过滤，不执行任何工具脚本。
++ */
++package com.osfans.trime;
++
++import android.util.Log;
++
++import java.io.BufferedReader;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStreamWriter;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++
++public final class ToolHistory {
++
++    private static final String TAG = "ToolHistory";
++    /** 历史文件名，放在 tools 目录下（隐藏文件，不出现在工具列表里）。 */
++    public static final String HISTORY_FILE = ".recent_tools";
++    /** 最多保留的历史条数；显示只取前 N 个，多留一些以便过滤后仍有候选。 */
++    private static final int MAX_HISTORY = 12;
++
++    private ToolHistory() {
++    }
++
++    /**
++     * 记录一次工具使用：去重置顶，超过上限截断。
++     * name 必须是 tools 下的目录名；含路径分隔符或空串一律忽略（安全）。
++     */
++    public static void record(String toolsDir, String name) {
++        if (toolsDir == null || name == null) return;
++        name = name.trim();
++        if (name.isEmpty() || name.contains("/") || name.contains("\\")
++                || name.equals(".") || name.equals("..")) return;
++        File file = new File(toolsDir, HISTORY_FILE);
++        List<String> list = readRaw(file);
++        list.remove(name);
++        list.add(0, name);
++        if (list.size() > MAX_HISTORY) {
++            list = new ArrayList<>(list.subList(0, MAX_HISTORY));
++        }
++        try {
++            File parent = file.getParentFile();
++            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) return;
++            BufferedWriter w = new BufferedWriter(
++                    new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8));
++            try {
++                for (String s : list) {
++                    w.write(s);
++                    w.newLine();
++                }
++            } finally {
++                w.close();
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "记录工具历史失败: " + e.getMessage());
++        }
++    }
++
++    /** 读取历史，过滤掉已经不存在（没有 main.lua）的工具，保持顺序。 */
++    public static List<String> load(String toolsDir) {
++        List<String> out = new ArrayList<>();
++        if (toolsDir == null) return out;
++        for (String s : readRaw(new File(toolsDir, HISTORY_FILE))) {
++            if (isTool(toolsDir, s)) out.add(s);
++        }
++        return out;
++    }
++
++    /** 扫描 tools 目录，返回所有带 main.lua 的工具目录名（排序）。 */
++    public static List<String> listTools(String toolsDir) {
++        List<String> out = new ArrayList<>();
++        if (toolsDir == null) return out;
++        String[] names = new File(toolsDir).list();
++        if (names == null) return out;
++        Arrays.sort(names);
++        for (String n : names) {
++            if (isTool(toolsDir, n)) out.add(n);
++        }
++        return out;
++    }
++
++    /**
++     * 决定工具条最终显示的 N 个按钮：
++     * 历史（已过滤）优先 → 默认内置工具补足 → 其余工具补足。
++     */
++    public static List<String> resolve(String toolsDir, String[] defaults, int n) {
++        List<String> picked = new ArrayList<>();
++        Set<String> seen = new LinkedHashSet<>();
++        for (String s : load(toolsDir)) {
++            if (seen.add(s)) picked.add(s);
++            if (picked.size() >= n) return picked;
++        }
++        if (defaults != null) {
++            for (String d : defaults) {
++                if (!isTool(toolsDir, d)) continue;
++                if (seen.add(d)) picked.add(d);
++                if (picked.size() >= n) return picked;
++            }
++        }
++        for (String t : listTools(toolsDir)) {
++            if (seen.add(t)) picked.add(t);
++            if (picked.size() >= n) break;
++        }
++        return picked;
++    }
++
++    //========== r27.68：show 字段 / 显示名 / 2×2 按钮取值 ==========
++
++    /**
++     * 纯文本读取工具目录下 init.lua 的 show 字段（绝不执行 Lua）。
++     * 识别 show=true / show = true / show="true" / show = "true"（大小写不敏感），
++     * 并跳过以 -- 开头的注释行与行尾 -- 注释。值为 true 表示「固定显示在工具条」。
++     */
++    public static boolean isShown(String toolsDir, String name) {
++        if (toolsDir == null || name == null) return false;
++        File init = new File(new File(toolsDir, name), "init.lua");
++        if (!init.isFile()) return false;
++        BufferedReader r = null;
++        try {
++            r = new BufferedReader(
++                    new InputStreamReader(new FileInputStream(init), StandardCharsets.UTF_8));
++            String line;
++            while ((line = r.readLine()) != null) {
++                String s = line;
++                // 去掉行尾 Lua 注释（只认 --，init.lua 里字符串不含长注释）
++                int dash = s.indexOf("--");
++                if (dash >= 0) s = s.substring(0, dash);
++                s = s.trim();
++                if (!s.startsWith("show")) continue;
++                // 必须是 show 这个标识符，后面跟 =（容忍 show=true 与 show = true）
++                String rest = s.substring(4).trim();
++                if (!rest.startsWith("=")) continue;
++                String val = rest.substring(1).trim();
++                val = val.replace("\"", "").replace("'", "");
++                if ("true".equalsIgnoreCase(val)) return true;
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "读取 show 字段失败: " + name + " " + e.getMessage());
++        } finally {
++            if (r != null) {
++                try { r.close(); } catch (Exception ignored) {}
++            }
++        }
++        return false;
++    }
++
++    /**
++     * 读取工具显示名：优先 init.lua 的 appname（纯文本，不执行 Lua），否则用目录名。
++     * 只识别形如 appname="xxx" / appname = 'xxx' 的单行赋值。
++     */
++    public static String displayName(String toolsDir, String name) {
++        if (name == null) return "";
++        if (toolsDir != null) {
++            File init = new File(new File(toolsDir, name), "init.lua");
++            BufferedReader r = null;
++            try {
++                if (init.isFile()) {
++                    r = new BufferedReader(
++                            new InputStreamReader(new FileInputStream(init), StandardCharsets.UTF_8));
++                    String line;
++                    while ((line = r.readLine()) != null) {
++                        String s = line;
++                        int dash = s.indexOf("--");
++                        if (dash >= 0) s = s.substring(0, dash);
++                        s = s.trim();
++                        if (!s.startsWith("appname")) continue;
++                        String rest = s.substring(7).trim();
++                        if (!rest.startsWith("=")) continue;
++                        String val = rest.substring(1).trim();
++                        // 去掉成对引号
++                        if (val.length() >= 2 &&
++                                ((val.charAt(0) == '"' && val.charAt(val.length() - 1) == '"')
++                                        || (val.charAt(0) == '\'' && val.charAt(val.length() - 1) == '\''))) {
++                            val = val.substring(1, val.length() - 1);
++                        }
++                        val = val.trim();
++                        if (!val.isEmpty()) return val;
++                    }
++                }
++            } catch (Exception e) {
++                Log.w(TAG, "读取 appname 失败: " + name + " " + e.getMessage());
++            } finally {
++                if (r != null) {
++                    try { r.close(); } catch (Exception ignored) {}
++                }
++            }
++        }
++        return name;
++    }
++
++    /**
++     * r27.68：决定工具条 2×2 共 n 个按钮的取值：
++     * 1) 有 show=true 的工具 → 固定显示；有最近使用时最多 n-1 个（留最后 1 位给最近使用），
++     *    没有最近使用时可占满 n 个；
++     * 2) 没有 show → 用最近使用补足；
++     * 3) 最近使用也不足 → 按目录顺序补足；
++     * 4) 完全没有工具 → 返回空（整栏隐藏）。
++     * 全程去重且保持 show / 最近 / 顺序的相对优先级。
++     */
++    public static List<String> resolveGrid(String toolsDir, int n) {
++        List<String> picked = new ArrayList<>();
++        if (toolsDir == null) return picked;
++        List<String> all = listTools(toolsDir);
++        if (all.isEmpty()) return picked;
++        List<String> recent = load(toolsDir);
++
++        Set<String> seen = new LinkedHashSet<>();
++        // 1) show=true 的工具，按目录顺序
++        int showLimit = recent.isEmpty() ? n : (n - 1); // 有最近使用时留 1 位
++        for (String t : all) {
++            if (picked.size() >= showLimit) break;
++            if (isShown(toolsDir, t) && seen.add(t)) picked.add(t);
++        }
++        // 2) 最近使用补足
++        for (String r : recent) {
++            if (picked.size() >= n) break;
++            if (seen.add(r)) picked.add(r);
++        }
++        // 3) 顺序补足
++        for (String t : all) {
++            if (picked.size() >= n) break;
++            if (seen.add(t)) picked.add(t);
++        }
++        return picked;
++    }
++
++    private static boolean isTool(String toolsDir, String name) {
++        if (name == null || name.isEmpty()) return false;
++        return new File(new File(toolsDir, name), "main.lua").isFile();
++    }
++
++    private static List<String> readRaw(File file) {
++        List<String> out = new ArrayList<>();
++        if (file == null || !file.isFile()) return out;
++        BufferedReader r = null;
++        try {
++            r = new BufferedReader(
++                    new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8));
++            String line;
++            while ((line = r.readLine()) != null) {
++                String s = line.trim();
++                if (!s.isEmpty() && !s.startsWith("#")) out.add(s);
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "读取工具历史失败: " + e.getMessage());
++        } finally {
++            if (r != null) {
++                try {
++                    r.close();
++                } catch (Exception ignored) {
++                }
++            }
++        }
++        return out;
++    }
++}
