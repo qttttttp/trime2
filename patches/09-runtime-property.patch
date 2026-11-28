@@ -91,9 +91,9 @@ diff -ruN --no-dereference a/app/src/main/jni/librime_jni/rime_jni.cc b/app/src/
 +// runtime properties：Java ↔ librime ↔ librime-lua 传字符串数据
 +extern "C" JNIEXPORT void JNICALL Java_com_osfans_trime_core_Rime_setRimeProperty(
 +    JNIEnv *env, jclass /* thiz */, jstring prop, jstring value) {
-+  const char *key = *CString(env, prop);
-+  const char *val = *CString(env, value);
-+  Rime::Instance().setProperty(key, val);
++  CString key(env, prop);
++  CString val(env, value);
++  Rime::Instance().setProperty(*key, *val);
 +}
 +
 +extern "C" JNIEXPORT jstring JNICALL
